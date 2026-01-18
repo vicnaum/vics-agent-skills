@@ -1,0 +1,2125 @@
+This file is a merged representation of a subset of the codebase, containing files not matching ignore patterns, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of a subset of the repository's contents that is considered the most important context.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching these patterns are excluded: **/*.svg, **/*.css, **/LICENSE
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+.claude/
+  hooks/
+    session-start.sh
+  settings.json
+docs/
+  images/
+    logos/
+      goose/
+        goose-logo-black.png
+        goose-logo-white.png
+  snippets/
+    LogoCarousel.jsx
+  CLAUDE.md
+  docs.json
+  home.mdx
+  integrate-skills.mdx
+  README.md
+  specification.mdx
+  what-are-skills.mdx
+skills-ref/
+  src/
+    skills_ref/
+      __init__.py
+      cli.py
+      errors.py
+      models.py
+      parser.py
+      prompt.py
+      validator.py
+  tests/
+    __init__.py
+    test_parser.py
+    test_prompt.py
+    test_validator.py
+  .gitignore
+  CLAUDE.md
+  pyproject.toml
+  README.md
+.gitignore
+README.md
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path=".claude/hooks/session-start.sh">
+#!/usr/bin/env bash
+# Session start hook for agentskills documentation project
+echo '{"async":true,"asyncTimeout":15000}'
+
+# Check if Mintlify CLI is installed
+if ! command -v mint &> /dev/null; then
+  echo "Mintlify CLI not installed. Install with: npm i -g mint"
+fi
+</file>
+
+<file path=".claude/settings.json">
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/session-start.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+</file>
+
+<file path="docs/snippets/LogoCarousel.jsx">
+{/*
+  LogoCarousel component for the Agent Skills documentation.
+  Shuffles logos on each page load for fair exposure.
+
+  To add a new logo:
+  1. Add logo files to /images/logos/[logo-name]/
+  2. Add entry to the logos array below
+*/}
+export const LogoCarousel = () => {
+  const logos = [
+    { name: "Gemini CLI", url: "https://geminicli.com", lightSrc: "/images/logos/gemini-cli/gemini-cli-logo_light.svg", darkSrc: "/images/logos/gemini-cli/gemini-cli-logo_dark.svg" },
+    { name: "OpenCode", url: "https://opencode.ai/", lightSrc: "/images/logos/opencode/opencode-wordmark-light.svg", darkSrc: "/images/logos/opencode/opencode-wordmark-dark.svg" },
+    { name: "Cursor", url: "https://cursor.com/", lightSrc: "/images/logos/cursor/LOCKUP_HORIZONTAL_2D_LIGHT.svg", darkSrc: "/images/logos/cursor/LOCKUP_HORIZONTAL_2D_DARK.svg" },
+    { name: "Amp", url: "https://ampcode.com/", lightSrc: "/images/logos/amp/amp-logo-light.svg", darkSrc: "/images/logos/amp/amp-logo-dark.svg", width: "120px" },
+    { name: "Letta", url: "https://www.letta.com/", lightSrc: "/images/logos/letta/Letta-logo-RGB_OffBlackonTransparent.svg", darkSrc: "/images/logos/letta/Letta-logo-RGB_GreyonTransparent.svg" },
+    { name: "Goose", url: "https://block.github.io/goose/", lightSrc: "/images/logos/goose/goose-logo-black.png", darkSrc: "/images/logos/goose/goose-logo-white.png" },
+    { name: "GitHub", url: "https://github.com/", lightSrc: "/images/logos/github/GitHub_Lockup_Dark.svg", darkSrc: "/images/logos/github/GitHub_Lockup_Light.svg" },
+    { name: "VS Code", url: "https://code.visualstudio.com/", lightSrc: "/images/logos/vscode/vscode.svg", darkSrc: "/images/logos/vscode/vscode-alt.svg" },
+    { name: "Claude Code", url: "https://claude.ai/code", lightSrc: "/images/logos/claude-code/Claude-Code-logo-Slate.svg", darkSrc: "/images/logos/claude-code/Claude-Code-logo-Ivory.svg" },
+    { name: "Claude", url: "https://claude.ai/", lightSrc: "/images/logos/claude-ai/Claude-logo-Slate.svg", darkSrc: "/images/logos/claude-ai/Claude-logo-Ivory.svg" },
+    { name: "OpenAI Codex", url: "https://developers.openai.com/codex", lightSrc: "/images/logos/oai-codex/OAI_Codex-Lockup_400px.svg", darkSrc: "/images/logos/oai-codex/OAI_Codex-Lockup_400px_Darkmode.svg" },
+    { name: "Factory", url: "https://factory.ai/", lightSrc: "/images/logos/factory/factory-logo-light.svg", darkSrc: "/images/logos/factory/factory-logo-dark.svg" },
+  ];
+
+  /* Shuffle logos on component mount */
+  const [shuffled, setShuffled] = useState(logos);
+
+  useEffect(() => {
+    const shuffle = (items) => {
+      const copy = [...items];
+      for (let i = copy.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [copy[i], copy[j]] = [copy[j], copy[i]];
+      }
+      return copy;
+    };
+    setShuffled(shuffle(logos));
+  }, []);
+
+  const row1 = shuffled.filter((_, i) => i % 2 === 0);
+  const row2 = shuffled.filter((_, i) => i % 2 === 1);
+  const row1Doubled = [...row1, ...row1];
+  const row2Doubled = [...row2, ...row2];
+
+  return (
+    <>
+      <div className="logo-carousel">
+        <div className="logo-carousel-track" style={{ animation: 'logo-scroll 50s linear infinite' }}>
+          {row1Doubled.map((logo, i) => (
+            <a key={`${logo.name}-${i}`} href={logo.url} style={{ textDecoration: 'none', border: 'none' }}>
+              <img className="block dark:hidden object-contain" style={{ width: logo.width || '150px', maxWidth: '100%' }} src={logo.lightSrc} alt={logo.name} />
+              <img className="hidden dark:block object-contain" style={{ width: logo.width || '150px', maxWidth: '100%' }} src={logo.darkSrc} alt={logo.name} />
+            </a>
+          ))}
+        </div>
+      </div>
+      <div className="logo-carousel">
+        <div className="logo-carousel-track" style={{ animation: 'logo-scroll 60s linear infinite reverse' }}>
+          {row2Doubled.map((logo, i) => (
+            <a key={`${logo.name}-${i}`} href={logo.url} style={{ textDecoration: 'none', border: 'none' }}>
+              <img className="block dark:hidden object-contain" style={{ width: logo.width || '150px', maxWidth: '100%' }} src={logo.lightSrc} alt={logo.name} />
+              <img className="hidden dark:block object-contain" style={{ width: logo.width || '150px', maxWidth: '100%' }} src={logo.darkSrc} alt={logo.name} />
+            </a>
+          ))}
+        </div>
+      </div>
+    </>
+  );
+};
+</file>
+
+<file path="docs/CLAUDE.md">
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository. The project defines an open format for teaching AI agents specialized workflows through SKILL.md files.
+
+## Documentation
+
+The Agent Skills documentation site, defined in the `docs/` directory, is built with [Mintlify](https://mintlify.com). 
+
+### Quick Start Commands
+
+```bash
+# Install Mintlify CLI (required for local development)
+npm i -g mint
+
+# Run local development server (run from /docs directory)
+cd docs && mint dev
+
+# Update Mintlify CLI if dev server issues occur
+mint update
+```
+
+Local preview available at `http://localhost:3000`
+
+### Development Notes
+
+- **Navigation**: Defined in `docs/docs.json` under `navigation.pages` array
+- **Adding pages**: Create new `.mdx` file in `/docs`, add filename (without extension) to navigation
+- **Deployment**: Automatic on push to `main` branch
+- **Troubleshooting**: If page shows 404, ensure you're running `mint dev` from directory containing `docs.json`
+</file>
+
+<file path="docs/docs.json">
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Agent Skills",
+  "colors": {
+    "primary": "#7f7f7f",
+    "light": "#bfbfbf",
+    "dark": "#404040"
+  },
+  "favicon": "/favicon.svg",
+  "navbar": {
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/agentskills/agentskills"
+    }
+  },
+  "navigation": {
+    "pages": [
+      "home",
+      "what-are-skills",
+      "specification",
+      "integrate-skills"
+    ]
+  },
+  "contextual": {
+    "options": [
+      "copy",
+      "view",
+      "chatgpt",
+      "claude",
+      "perplexity",
+      "mcp",
+      "cursor",
+      "vscode"
+    ]
+  }
+}
+</file>
+
+<file path="docs/home.mdx">
+---
+title: "Overview"
+description: "A simple, open format for giving agents new capabilities and expertise."
+---
+
+import { LogoCarousel } from '/snippets/LogoCarousel.jsx';
+
+Agent Skills are folders of instructions, scripts, and resources that agents can discover and use to do things more accurately and efficiently.
+
+## Why Agent Skills?
+
+Agents are increasingly capable, but often don't have the context they need to do real work reliably. Skills solve this by giving agents access to procedural knowledge and company-, team-, and user-specific context they can load on demand. Agents with access to a set of skills can extend their capabilities based on the task they're working on.
+
+**For skill authors**: Build capabilities once and deploy them across multiple agent products.
+
+**For compatible agents**: Support for skills lets end users give agents new capabilities out of the box.
+
+**For teams and enterprises**: Capture organizational knowledge in portable, version-controlled packages.
+
+## What can Agent Skills enable?
+
+- **Domain expertise**: Package specialized knowledge into reusable instructions, from legal review processes to data analysis pipelines.
+- **New capabilities**: Give agents new capabilities (e.g. creating presentations, building MCP servers, analyzing datasets).
+- **Repeatable workflows**: Turn multi-step tasks into consistent and auditable workflows.
+- **Interoperability**: Reuse the same skill across different skills-compatible agent products.
+
+## Adoption
+
+Agent Skills are supported by leading AI development tools.
+
+<LogoCarousel />
+
+## Open development
+
+The Agent Skills format was originally developed by [Anthropic](https://www.anthropic.com/), released as an open standard, and has been adopted by a growing number of agent products. The standard is open to contributions from the broader ecosystem.
+
+[View on GitHub](https://github.com/agentskills/agentskills)
+
+## Get started
+
+<CardGroup cols={3}>
+  <Card
+    title="What are skills?"
+    icon="lightbulb"
+    href="/what-are-skills"
+  >
+    Learn about skills, how they work, and why they matter.
+  </Card>
+  <Card
+    title="Specification"
+    icon="file-code"
+    href="/specification"
+  >
+    The complete format specification for SKILL.md files.
+  </Card>
+  <Card
+    title="Integrate skills"
+    icon="gear"
+    href="/integrate-skills"
+  >
+    Add skills support to your agent or tool.
+  </Card>
+  <Card
+    title="Example skills"
+    icon="code"
+    href="https://github.com/anthropics/skills"
+  >
+    Browse example skills on GitHub.
+  </Card>
+  <Card
+    title="Reference library"
+    icon="wrench"
+    href="https://github.com/agentskills/agentskills/tree/main/skills-ref"
+  >
+    Validate skills and generate prompt XML.
+  </Card>
+</CardGroup>
+</file>
+
+<file path="docs/integrate-skills.mdx">
+---
+title: "Integrate skills into your agent"
+sidebarTitle: "Integrate skills"
+description: "How to add Agent Skills support to your agent or tool."
+---
+
+This guide explains how to add skills support to an AI agent or development tool.
+
+## Integration approaches
+
+The two main approaches to integrating skills are:
+
+**Filesystem-based agents** operate within a computer environment (bash/unix) and represent the most capable option. Skills are activated when models issue shell commands like `cat /path/to/my-skill/SKILL.md`. Bundled resources are accessed through shell commands.
+
+**Tool-based agents** function without a dedicated computer environment. Instead, they implement tools allowing models to trigger skills and access bundled assets. The specific tool implementation is up to the developer.
+
+## Overview
+
+A skills-compatible agent needs to:
+
+1. **Discover** skills in configured directories
+2. **Load metadata** (name and description) at startup
+3. **Match** user tasks to relevant skills
+4. **Activate** skills by loading full instructions
+5. **Execute** scripts and access resources as needed
+
+## Skill discovery
+
+Skills are folders containing a `SKILL.md` file. Your agent should scan configured directories for valid skills.
+
+## Loading metadata
+
+At startup, parse only the frontmatter of each `SKILL.md` file. This keeps initial context usage low.
+
+### Parsing frontmatter
+
+```
+function parseMetadata(skillPath):
+    content = readFile(skillPath + "/SKILL.md")
+    frontmatter = extractYAMLFrontmatter(content)
+
+    return {
+        name: frontmatter.name,
+        description: frontmatter.description,
+        path: skillPath
+    }
+```
+
+### Injecting into context
+
+Include skill metadata in the system prompt so the model knows what skills are available. 
+
+Follow your platform's guidance for system prompt updates. For example, for Claude models, the recommended format uses XML:
+
+```xml
+<available_skills>
+  <skill>
+    <name>pdf-processing</name>
+    <description>Extracts text and tables from PDF files, fills forms, merges documents.</description>
+    <location>/path/to/skills/pdf-processing/SKILL.md</location>
+  </skill>
+  <skill>
+    <name>data-analysis</name>
+    <description>Analyzes datasets, generates charts, and creates summary reports.</description>
+    <location>/path/to/skills/data-analysis/SKILL.md</location>
+  </skill>
+</available_skills>
+```
+
+For filesystem-based agents, include the `location` field with the absolute path to the SKILL.md file. For tool-based agents, the location can be omitted.
+
+Keep metadata concise. Each skill should add roughly 50-100 tokens to the context.
+
+## Security considerations
+
+Script execution introduces security risks. Consider:
+
+- **Sandboxing**: Run scripts in isolated environments
+- **Allowlisting**: Only execute scripts from trusted skills
+- **Confirmation**: Ask users before running potentially dangerous operations
+- **Logging**: Record all script executions for auditing
+
+## Reference implementation
+
+The [skills-ref](https://github.com/agentskills/agentskills/tree/main/skills-ref) library provides Python utilities and a CLI for working with skills.
+
+For example:
+
+**Validate a skill directory:** 
+```
+skills-ref validate <path>
+```
+
+**Generate `<available_skills>` XML for agent prompts:**
+```
+skills-ref to-prompt <path>...
+```
+
+Use the library source code as a reference implementation.
+</file>
+
+<file path="docs/README.md">
+# Agent Skills Documentation
+
+This directory contains the source code for the Agent Skills documentation site, which is built using [Mintlify](https://mintlify.com).
+
+## Development
+
+Install the [Mintlify CLI](https://www.npmjs.com/package/mint) to preview your documentation changes locally. To install, use the following command:
+
+```
+npm i -g mint
+```
+
+Run the following command at the root of your documentation, where your `docs.json` is located:
+
+```
+mint dev
+```
+
+View your local preview at `http://localhost:3000`.
+
+## Publishing changes
+
+Changes are deployed to production automatically after pushing to the default branch.
+
+## Need help?
+
+### Troubleshooting
+
+- If your dev environment isn't running: Run `mint update` to ensure you have the most recent version of the CLI.
+- If a page loads as a 404: Make sure you are running in a folder with a valid `docs.json`.
+
+### Resources
+- [Mintlify documentation](https://mintlify.com/docs)
+</file>
+
+<file path="docs/specification.mdx">
+---
+title: "Specification"
+description: "The complete format specification for Agent Skills."
+---
+
+This document defines the Agent Skills format.
+
+## Directory structure
+
+A skill is a directory containing at minimum a `SKILL.md` file:
+
+```
+skill-name/
+└── SKILL.md          # Required
+```
+
+<Tip>
+You can optionally include [additional directories](#optional-directories) such as `scripts/`, `references/`, and `assets/` to support your skill.
+</Tip>
+
+## SKILL.md format
+
+The `SKILL.md` file must contain YAML frontmatter followed by Markdown content.
+
+### Frontmatter (required)
+
+```yaml
+---
+name: skill-name
+description: A description of what this skill does and when to use it.
+---
+```
+
+With optional fields:
+
+```yaml
+---
+name: pdf-processing
+description: Extract text and tables from PDF files, fill forms, merge documents.
+license: Apache-2.0
+metadata:
+  author: example-org
+  version: "1.0"
+---
+```
+
+| Field | Required | Constraints |
+|-------|----------|-------------|
+| `name` | Yes | Max 64 characters. Lowercase letters, numbers, and hyphens only. Must not start or end with a hyphen. |
+| `description` | Yes | Max 1024 characters. Non-empty. Describes what the skill does and when to use it. |
+| `license` | No | License name or reference to a bundled license file. |
+| `compatibility` | No | Max 500 characters. Indicates environment requirements (intended product, system packages, network access, etc.). |
+| `metadata` | No | Arbitrary key-value mapping for additional metadata. |
+| `allowed-tools` | No | Space-delimited list of pre-approved tools the skill may use. (Experimental) |
+
+#### `name` field
+
+The required `name` field:
+- Must be 1-64 characters
+- May only contain unicode lowercase alphanumeric characters and hyphens (`a-z` and `-`)
+- Must not start or end with `-`
+- Must not contain consecutive hyphens (`--`)
+- Must match the parent directory name
+
+Valid examples:
+```yaml
+name: pdf-processing
+```
+```yaml
+name: data-analysis
+```
+```yaml
+name: code-review
+```
+
+Invalid examples:
+```yaml
+name: PDF-Processing  # uppercase not allowed
+```
+```yaml
+name: -pdf  # cannot start with hyphen
+```
+```yaml
+name: pdf--processing  # consecutive hyphens not allowed
+```
+
+#### `description` field
+
+The required `description` field:
+- Must be 1-1024 characters
+- Should describe both what the skill does and when to use it
+- Should include specific keywords that help agents identify relevant tasks
+
+Good example:
+```yaml
+description: Extracts text and tables from PDF files, fills PDF forms, and merges multiple PDFs. Use when working with PDF documents or when the user mentions PDFs, forms, or document extraction.
+```
+
+Poor example:
+```yaml
+description: Helps with PDFs.
+```
+
+#### `license` field
+
+The optional `license` field:
+- Specifies the license applied to the skill
+- We recommend keeping it short (either the name of a license or the name of a bundled license file)
+
+Example:
+```yaml
+license: Proprietary. LICENSE.txt has complete terms
+```
+
+#### `compatibility` field
+
+The optional `compatibility` field:
+- Must be 1-500 characters if provided
+- Should only be included if your skill has specific environment requirements
+- Can indicate intended product, required system packages, network access needs, etc.
+
+Examples:
+```yaml
+compatibility: Designed for Claude Code (or similar products)
+```
+```yaml
+compatibility: Requires git, docker, jq, and access to the internet
+```
+
+<Note>
+Most skills do not need the `compatibility` field.
+</Note>
+
+#### `metadata` field
+
+The optional `metadata` field:
+- A map from string keys to string values
+- Clients can use this to store additional properties not defined by the Agent Skills spec
+- We recommend making your key names reasonably unique to avoid accidental conflicts
+
+Example:
+```yaml
+metadata:
+  author: example-org
+  version: "1.0"
+```
+
+#### `allowed-tools` field
+
+The optional `allowed-tools` field:
+- A space-delimited list of tools that are pre-approved to run
+- Experimental. Support for this field may vary between agent implementations
+
+Example:
+```yaml
+allowed-tools: Bash(git:*) Bash(jq:*) Read
+```
+
+### Body content
+
+The Markdown body after the frontmatter contains the skill instructions. There are no format restrictions. Write whatever helps agents perform the task effectively.
+
+Recommended sections:
+- Step-by-step instructions
+- Examples of inputs and outputs
+- Common edge cases
+
+Note that the agent will load this entire file once it's decided to activate a skill. Consider splitting longer `SKILL.md` content into referenced files.
+
+## Optional directories
+
+### scripts/
+
+Contains executable code that agents can run. Scripts should:
+- Be self-contained or clearly document dependencies
+- Include helpful error messages
+- Handle edge cases gracefully
+
+Supported languages depend on the agent implementation. Common options include Python, Bash, and JavaScript.
+
+### references/
+
+Contains additional documentation that agents can read when needed:
+- `REFERENCE.md` - Detailed technical reference
+- `FORMS.md` - Form templates or structured data formats
+- Domain-specific files (`finance.md`, `legal.md`, etc.)
+
+Keep individual [reference files](#file-references) focused. Agents load these on demand, so smaller files mean less use of context.
+
+### assets/
+
+Contains static resources:
+- Templates (document templates, configuration templates)
+- Images (diagrams, examples)
+- Data files (lookup tables, schemas)
+
+## Progressive disclosure
+
+Skills should be structured for efficient use of context:
+
+1. **Metadata** (~100 tokens): The `name` and `description` fields are loaded at startup for all skills
+2. **Instructions** (< 5000 tokens recommended): The full `SKILL.md` body is loaded when the skill is activated
+3. **Resources** (as needed): Files (e.g. those in `scripts/`, `references/`, or `assets/`) are loaded only when required
+
+Keep your main `SKILL.md` under 500 lines. Move detailed reference material to separate files.
+
+## File references
+
+When referencing other files in your skill, use relative paths from the skill root:
+
+```markdown
+See [the reference guide](references/REFERENCE.md) for details.
+
+Run the extraction script:
+scripts/extract.py
+```
+
+Keep file references one level deep from `SKILL.md`. Avoid deeply nested reference chains.
+
+## Validation
+
+Use the [skills-ref](https://github.com/agentskills/agentskills/tree/main/skills-ref) reference library to validate your skills:
+
+```bash
+skills-ref validate ./my-skill
+```
+
+This checks that your `SKILL.md` frontmatter is valid and follows all naming conventions.
+</file>
+
+<file path="docs/what-are-skills.mdx">
+---
+title: "What are skills?"
+description: "Agent Skills are a lightweight, open format for extending AI agent capabilities with specialized knowledge and workflows."
+---
+
+At its core, a skill is a folder containing a `SKILL.md` file. This file includes metadata (`name` and `description`, at minimum) and instructions that tell an agent how to perform a specific task. Skills can also bundle scripts, templates, and reference materials.
+
+```directory
+my-skill/
+├── SKILL.md          # Required: instructions + metadata
+├── scripts/          # Optional: executable code
+├── references/       # Optional: documentation
+└── assets/           # Optional: templates, resources
+```
+
+## How skills work
+
+Skills use **progressive disclosure** to manage context efficiently:
+
+1. **Discovery**: At startup, agents load only the name and description of each available skill, just enough to know when it might be relevant.  
+     
+2. **Activation**: When a task matches a skill's description, the agent reads the full `SKILL.md` instructions into context.  
+     
+3. **Execution**: The agent follows the instructions, optionally loading referenced files or executing bundled code as needed.
+
+This approach keeps agents fast while giving them access to more context on demand.
+
+## The SKILL.md file
+
+Every skill starts with a `SKILL.md` file containing YAML frontmatter and Markdown instructions:
+
+```mdx
+---
+name: pdf-processing
+description: Extract text and tables from PDF files, fill forms, merge documents.
+---
+
+# PDF Processing
+
+## When to use this skill
+Use this skill when the user needs to work with PDF files...
+
+## How to extract text
+1. Use pdfplumber for text extraction...
+
+## How to fill forms
+...
+```
+
+The following frontmatter is required at the top of `SKILL.md`:
+
+- `name`: A short identifier 
+- `description`: When to use this skill
+
+The Markdown body contains the actual instructions and has no specific restrictions on structure or content.
+
+This simple format has some key advantages:
+
+- **Self-documenting**: A skill author or user can read a `SKILL.md` and understand what it does, making skills easy to audit and improve.
+
+- **Extensible**: Skills can range in complexity from just text instructions to executable code, assets, and templates.
+
+- **Portable**: Skills are just files, so they're easy to edit, version, and share.
+
+## Next steps
+
+- [View the specification](/specification) to understand the full format.
+- [Add skills support to your agent](/integrate-skills) to build a compatible client.
+- [See example skills](https://github.com/anthropics/skills) on GitHub.
+- [Read authoring best practices](https://platform.claude.com/docs/en/agents-and-tools/agent-skills/best-practices) for writing effective skills.
+- [Use the reference library](https://github.com/agentskills/agentskills/tree/main/skills-ref) to validate skills and generate prompt XML.
+</file>
+
+<file path="skills-ref/src/skills_ref/__init__.py">
+"""Reference library for Agent Skills."""
+
+from .errors import ParseError, SkillError, ValidationError
+from .models import SkillProperties
+from .parser import find_skill_md, read_properties
+from .prompt import to_prompt
+from .validator import validate
+
+__all__ = [
+    "SkillError",
+    "ParseError",
+    "ValidationError",
+    "SkillProperties",
+    "find_skill_md",
+    "validate",
+    "read_properties",
+    "to_prompt",
+]
+
+__version__ = "0.1.0"
+</file>
+
+<file path="skills-ref/src/skills_ref/cli.py">
+"""CLI for skills-ref library."""
+
+import json
+import sys
+from pathlib import Path
+
+import click
+
+from .errors import SkillError
+from .parser import read_properties
+from .prompt import to_prompt
+from .validator import validate
+
+
+def _is_skill_md_file(path: Path) -> bool:
+    """Check if path points directly to a SKILL.md or skill.md file."""
+    return path.is_file() and path.name.lower() == "skill.md"
+
+
+@click.group()
+@click.version_option()
+def main():
+    """Reference library for Agent Skills."""
+    pass
+
+
+@main.command("validate")
+@click.argument("skill_path", type=click.Path(exists=True, path_type=Path))
+def validate_cmd(skill_path: Path):
+    """Validate a skill directory.
+
+    Checks that the skill has a valid SKILL.md with proper frontmatter,
+    correct naming conventions, and required fields.
+
+    Exit codes:
+        0: Valid skill
+        1: Validation errors found
+    """
+    if _is_skill_md_file(skill_path):
+        skill_path = skill_path.parent
+
+    errors = validate(skill_path)
+
+    if errors:
+        click.echo(f"Validation failed for {skill_path}:", err=True)
+        for error in errors:
+            click.echo(f"  - {error}", err=True)
+        sys.exit(1)
+    else:
+        click.echo(f"Valid skill: {skill_path}")
+
+
+@main.command("read-properties")
+@click.argument("skill_path", type=click.Path(exists=True, path_type=Path))
+def read_properties_cmd(skill_path: Path):
+    """Read and print skill properties as JSON.
+
+    Parses the YAML frontmatter from SKILL.md and outputs the
+    properties as JSON.
+
+    Exit codes:
+        0: Success
+        1: Parse error
+    """
+    try:
+        if _is_skill_md_file(skill_path):
+            skill_path = skill_path.parent
+
+        props = read_properties(skill_path)
+        click.echo(json.dumps(props.to_dict(), indent=2))
+    except SkillError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+
+@main.command("to-prompt")
+@click.argument(
+    "skill_paths", type=click.Path(exists=True, path_type=Path), nargs=-1, required=True
+)
+def to_prompt_cmd(skill_paths: tuple[Path, ...]):
+    """Generate <available_skills> XML for agent prompts.
+
+    Accepts one or more skill directories.
+
+    Exit codes:
+        0: Success
+        1: Error
+    """
+    try:
+        resolved_paths = []
+        for skill_path in skill_paths:
+            if _is_skill_md_file(skill_path):
+                resolved_paths.append(skill_path.parent)
+            else:
+                resolved_paths.append(skill_path)
+
+        output = to_prompt(resolved_paths)
+        click.echo(output)
+    except SkillError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="skills-ref/src/skills_ref/errors.py">
+"""Skill-related exceptions."""
+
+
+class SkillError(Exception):
+    """Base exception for all skill-related errors."""
+
+    pass
+
+
+class ParseError(SkillError):
+    """Raised when SKILL.md parsing fails."""
+
+    pass
+
+
+class ValidationError(SkillError):
+    """Raised when skill properties are invalid.
+
+    Attributes:
+        errors: List of validation error messages (may contain just one)
+    """
+
+    def __init__(self, message: str, errors: list[str] | None = None):
+        super().__init__(message)
+        self.errors = errors if errors is not None else [message]
+</file>
+
+<file path="skills-ref/src/skills_ref/models.py">
+"""Data models for Agent Skills."""
+
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+@dataclass
+class SkillProperties:
+    """Properties parsed from a skill's SKILL.md frontmatter.
+
+    Attributes:
+        name: Skill name in kebab-case (required)
+        description: What the skill does and when the model should use it (required)
+        license: License for the skill (optional)
+        compatibility: Compatibility information for the skill (optional)
+        allowed_tools: Tool patterns the skill requires (optional, experimental)
+        metadata: Key-value pairs for client-specific properties (defaults to
+            empty dict; omitted from to_dict() output when empty)
+    """
+
+    name: str
+    description: str
+    license: Optional[str] = None
+    compatibility: Optional[str] = None
+    allowed_tools: Optional[str] = None
+    metadata: dict[str, str] = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary, excluding None values."""
+        result = {"name": self.name, "description": self.description}
+        if self.license is not None:
+            result["license"] = self.license
+        if self.compatibility is not None:
+            result["compatibility"] = self.compatibility
+        if self.allowed_tools is not None:
+            result["allowed-tools"] = self.allowed_tools
+        if self.metadata:
+            result["metadata"] = self.metadata
+        return result
+</file>
+
+<file path="skills-ref/src/skills_ref/parser.py">
+"""YAML frontmatter parsing for SKILL.md files."""
+
+from pathlib import Path
+from typing import Optional
+
+import strictyaml
+
+from .errors import ParseError, ValidationError
+from .models import SkillProperties
+
+
+def find_skill_md(skill_dir: Path) -> Optional[Path]:
+    """Find the SKILL.md file in a skill directory.
+
+    Prefers SKILL.md (uppercase) but accepts skill.md (lowercase).
+
+    Args:
+        skill_dir: Path to the skill directory
+
+    Returns:
+        Path to the SKILL.md file, or None if not found
+    """
+    for name in ("SKILL.md", "skill.md"):
+        path = skill_dir / name
+        if path.exists():
+            return path
+    return None
+
+
+def parse_frontmatter(content: str) -> tuple[dict, str]:
+    """Parse YAML frontmatter from SKILL.md content.
+
+    Args:
+        content: Raw content of SKILL.md file
+
+    Returns:
+        Tuple of (metadata dict, markdown body)
+
+    Raises:
+        ParseError: If frontmatter is missing or invalid
+    """
+    if not content.startswith("---"):
+        raise ParseError("SKILL.md must start with YAML frontmatter (---)")
+
+    parts = content.split("---", 2)
+    if len(parts) < 3:
+        raise ParseError("SKILL.md frontmatter not properly closed with ---")
+
+    frontmatter_str = parts[1]
+    body = parts[2].strip()
+
+    try:
+        parsed = strictyaml.load(frontmatter_str)
+        metadata = parsed.data
+    except strictyaml.YAMLError as e:
+        raise ParseError(f"Invalid YAML in frontmatter: {e}")
+
+    if not isinstance(metadata, dict):
+        raise ParseError("SKILL.md frontmatter must be a YAML mapping")
+
+    if "metadata" in metadata and isinstance(metadata["metadata"], dict):
+        metadata["metadata"] = {str(k): str(v) for k, v in metadata["metadata"].items()}
+
+    return metadata, body
+
+
+def read_properties(skill_dir: Path) -> SkillProperties:
+    """Read skill properties from SKILL.md frontmatter.
+
+    This function parses the frontmatter and returns properties.
+    It does NOT perform full validation. Use validate() for that.
+
+    Args:
+        skill_dir: Path to the skill directory
+
+    Returns:
+        SkillProperties with parsed metadata
+
+    Raises:
+        ParseError: If SKILL.md is missing or has invalid YAML
+        ValidationError: If required fields (name, description) are missing
+    """
+    skill_dir = Path(skill_dir)
+    skill_md = find_skill_md(skill_dir)
+
+    if skill_md is None:
+        raise ParseError(f"SKILL.md not found in {skill_dir}")
+
+    content = skill_md.read_text()
+    metadata, _ = parse_frontmatter(content)
+
+    if "name" not in metadata:
+        raise ValidationError("Missing required field in frontmatter: name")
+    if "description" not in metadata:
+        raise ValidationError("Missing required field in frontmatter: description")
+
+    name = metadata["name"]
+    description = metadata["description"]
+
+    if not isinstance(name, str) or not name.strip():
+        raise ValidationError("Field 'name' must be a non-empty string")
+    if not isinstance(description, str) or not description.strip():
+        raise ValidationError("Field 'description' must be a non-empty string")
+
+    return SkillProperties(
+        name=name.strip(),
+        description=description.strip(),
+        license=metadata.get("license"),
+        compatibility=metadata.get("compatibility"),
+        allowed_tools=metadata.get("allowed-tools"),
+        metadata=metadata.get("metadata"),
+    )
+</file>
+
+<file path="skills-ref/src/skills_ref/prompt.py">
+"""Generate <available_skills> XML prompt block for agent system prompts."""
+
+import html
+from pathlib import Path
+
+from .parser import find_skill_md, read_properties
+
+
+def to_prompt(skill_dirs: list[Path]) -> str:
+    """Generate the <available_skills> XML block for inclusion in agent prompts.
+
+    This XML format is what Anthropic uses and recommends for Claude models.
+    Skill Clients may format skill information differently to suit their
+    models or preferences.
+
+    Args:
+        skill_dirs: List of paths to skill directories
+
+    Returns:
+        XML string with <available_skills> block containing each skill's
+        name, description, and location.
+
+    Example output:
+        <available_skills>
+        <skill>
+        <name>pdf-reader</name>
+        <description>Read and extract text from PDF files</description>
+        <location>/path/to/pdf-reader/SKILL.md</location>
+        </skill>
+        </available_skills>
+    """
+    if not skill_dirs:
+        return "<available_skills>\n</available_skills>"
+
+    lines = ["<available_skills>"]
+
+    for skill_dir in skill_dirs:
+        skill_dir = Path(skill_dir).resolve()
+        props = read_properties(skill_dir)
+
+        lines.append("<skill>")
+        lines.append("<name>")
+        lines.append(html.escape(props.name))
+        lines.append("</name>")
+        lines.append("<description>")
+        lines.append(html.escape(props.description))
+        lines.append("</description>")
+
+        skill_md_path = find_skill_md(skill_dir)
+        lines.append("<location>")
+        lines.append(str(skill_md_path))
+        lines.append("</location>")
+
+        lines.append("</skill>")
+
+    lines.append("</available_skills>")
+
+    return "\n".join(lines)
+</file>
+
+<file path="skills-ref/src/skills_ref/validator.py">
+"""Skill validation logic."""
+
+import unicodedata
+from pathlib import Path
+from typing import Optional
+
+from .errors import ParseError
+from .parser import find_skill_md, parse_frontmatter
+
+MAX_SKILL_NAME_LENGTH = 64
+MAX_DESCRIPTION_LENGTH = 1024
+MAX_COMPATIBILITY_LENGTH = 500
+
+# Allowed frontmatter fields per Agent Skills Spec
+ALLOWED_FIELDS = {
+    "name",
+    "description",
+    "license",
+    "allowed-tools",
+    "metadata",
+    "compatibility",
+}
+
+
+def _validate_name(name: str, skill_dir: Path) -> list[str]:
+    """Validate skill name format and directory match.
+
+    Skill names support i18n characters (Unicode letters) plus hyphens.
+    Names must be lowercase and cannot start/end with hyphens.
+    """
+    errors = []
+
+    if not name or not isinstance(name, str) or not name.strip():
+        errors.append("Field 'name' must be a non-empty string")
+        return errors
+
+    name = unicodedata.normalize("NFKC", name.strip())
+
+    if len(name) > MAX_SKILL_NAME_LENGTH:
+        errors.append(
+            f"Skill name '{name}' exceeds {MAX_SKILL_NAME_LENGTH} character limit "
+            f"({len(name)} chars)"
+        )
+
+    if name != name.lower():
+        errors.append(f"Skill name '{name}' must be lowercase")
+
+    if name.startswith("-") or name.endswith("-"):
+        errors.append("Skill name cannot start or end with a hyphen")
+
+    if "--" in name:
+        errors.append("Skill name cannot contain consecutive hyphens")
+
+    if not all(c.isalnum() or c == "-" for c in name):
+        errors.append(
+            f"Skill name '{name}' contains invalid characters. "
+            "Only letters, digits, and hyphens are allowed."
+        )
+
+    if skill_dir:
+        dir_name = unicodedata.normalize("NFKC", skill_dir.name)
+        if dir_name != name:
+            errors.append(
+                f"Directory name '{skill_dir.name}' must match skill name '{name}'"
+            )
+
+    return errors
+
+
+def _validate_description(description: str) -> list[str]:
+    """Validate description format."""
+    errors = []
+
+    if not description or not isinstance(description, str) or not description.strip():
+        errors.append("Field 'description' must be a non-empty string")
+        return errors
+
+    if len(description) > MAX_DESCRIPTION_LENGTH:
+        errors.append(
+            f"Description exceeds {MAX_DESCRIPTION_LENGTH} character limit "
+            f"({len(description)} chars)"
+        )
+
+    return errors
+
+
+def _validate_compatibility(compatibility: str) -> list[str]:
+    """Validate compatibility format."""
+    errors = []
+
+    if not isinstance(compatibility, str):
+        errors.append("Field 'compatibility' must be a string")
+        return errors
+
+    if len(compatibility) > MAX_COMPATIBILITY_LENGTH:
+        errors.append(
+            f"Compatibility exceeds {MAX_COMPATIBILITY_LENGTH} character limit "
+            f"({len(compatibility)} chars)"
+        )
+
+    return errors
+
+
+def _validate_metadata_fields(metadata: dict) -> list[str]:
+    """Validate that only allowed fields are present."""
+    errors = []
+
+    extra_fields = set(metadata.keys()) - ALLOWED_FIELDS
+    if extra_fields:
+        errors.append(
+            f"Unexpected fields in frontmatter: {', '.join(sorted(extra_fields))}. "
+            f"Only {sorted(ALLOWED_FIELDS)} are allowed."
+        )
+
+    return errors
+
+
+def validate_metadata(metadata: dict, skill_dir: Optional[Path] = None) -> list[str]:
+    """Validate parsed skill metadata.
+
+    This is the core validation function that works on already-parsed metadata,
+    avoiding duplicate file I/O when called from the parser.
+
+    Args:
+        metadata: Parsed YAML frontmatter dictionary
+        skill_dir: Optional path to skill directory (for name-directory match check)
+
+    Returns:
+        List of validation error messages. Empty list means valid.
+    """
+    errors = []
+    errors.extend(_validate_metadata_fields(metadata))
+
+    if "name" not in metadata:
+        errors.append("Missing required field in frontmatter: name")
+    else:
+        errors.extend(_validate_name(metadata["name"], skill_dir))
+
+    if "description" not in metadata:
+        errors.append("Missing required field in frontmatter: description")
+    else:
+        errors.extend(_validate_description(metadata["description"]))
+
+    if "compatibility" in metadata:
+        errors.extend(_validate_compatibility(metadata["compatibility"]))
+
+    return errors
+
+
+def validate(skill_dir: Path) -> list[str]:
+    """Validate a skill directory.
+
+    Args:
+        skill_dir: Path to the skill directory
+
+    Returns:
+        List of validation error messages. Empty list means valid.
+    """
+    skill_dir = Path(skill_dir)
+
+    if not skill_dir.exists():
+        return [f"Path does not exist: {skill_dir}"]
+
+    if not skill_dir.is_dir():
+        return [f"Not a directory: {skill_dir}"]
+
+    skill_md = find_skill_md(skill_dir)
+    if skill_md is None:
+        return ["Missing required file: SKILL.md"]
+
+    try:
+        content = skill_md.read_text()
+        metadata, _ = parse_frontmatter(content)
+    except ParseError as e:
+        return [str(e)]
+
+    return validate_metadata(metadata, skill_dir)
+</file>
+
+<file path="skills-ref/tests/__init__.py">
+"""Tests for skills-ref library."""
+</file>
+
+<file path="skills-ref/tests/test_parser.py">
+"""Tests for parser module."""
+
+import pytest
+
+from skills_ref.parser import (
+    ParseError,
+    ValidationError,
+    find_skill_md,
+    parse_frontmatter,
+    read_properties,
+)
+
+
+def test_valid_frontmatter():
+    content = """---
+name: my-skill
+description: A test skill
+---
+# My Skill
+
+Instructions here.
+"""
+    metadata, body = parse_frontmatter(content)
+    assert metadata["name"] == "my-skill"
+    assert metadata["description"] == "A test skill"
+    assert "# My Skill" in body
+
+
+def test_missing_frontmatter():
+    content = "# No frontmatter here"
+    with pytest.raises(ParseError, match="must start with YAML frontmatter"):
+        parse_frontmatter(content)
+
+
+def test_unclosed_frontmatter():
+    content = """---
+name: my-skill
+description: A test skill
+"""
+    with pytest.raises(ParseError, match="not properly closed"):
+        parse_frontmatter(content)
+
+
+def test_invalid_yaml():
+    content = """---
+name: [invalid
+description: broken
+---
+Body here
+"""
+    with pytest.raises(ParseError, match="Invalid YAML"):
+        parse_frontmatter(content)
+
+
+def test_non_dict_frontmatter():
+    content = """---
+- just
+- a
+- list
+---
+Body
+"""
+    with pytest.raises(ParseError, match="must be a YAML mapping"):
+        parse_frontmatter(content)
+
+
+def test_read_valid_skill(tmp_path):
+    skill_dir = tmp_path / "my-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("""---
+name: my-skill
+description: A test skill
+license: MIT
+---
+# My Skill
+""")
+    props = read_properties(skill_dir)
+    assert props.name == "my-skill"
+    assert props.description == "A test skill"
+    assert props.license == "MIT"
+
+
+def test_read_with_metadata(tmp_path):
+    skill_dir = tmp_path / "my-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("""---
+name: my-skill
+description: A test skill
+metadata:
+  author: Test Author
+  version: 1.0
+---
+Body
+""")
+    props = read_properties(skill_dir)
+    assert props.metadata == {"author": "Test Author", "version": "1.0"}
+
+
+def test_missing_skill_md(tmp_path):
+    with pytest.raises(ParseError, match="SKILL.md not found"):
+        read_properties(tmp_path)
+
+
+def test_missing_name(tmp_path):
+    skill_dir = tmp_path / "my-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("""---
+description: A test skill
+---
+Body
+""")
+    with pytest.raises(ValidationError, match="Missing required field.*name"):
+        read_properties(skill_dir)
+
+
+def test_missing_description(tmp_path):
+    skill_dir = tmp_path / "my-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("""---
+name: my-skill
+---
+Body
+""")
+    with pytest.raises(ValidationError, match="Missing required field.*description"):
+        read_properties(skill_dir)
+
+
+def test_find_skill_md_prefers_uppercase(tmp_path):
+    """SKILL.md should be preferred over skill.md when both exist."""
+    skill_dir = tmp_path / "my-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("uppercase")
+    (skill_dir / "skill.md").write_text("lowercase")
+    result = find_skill_md(skill_dir)
+    assert result is not None
+    assert result.name == "SKILL.md"
+
+
+def test_find_skill_md_accepts_lowercase(tmp_path):
+    """skill.md should be accepted when SKILL.md doesn't exist."""
+    skill_dir = tmp_path / "my-skill"
+    skill_dir.mkdir()
+    (skill_dir / "skill.md").write_text("lowercase")
+    result = find_skill_md(skill_dir)
+    assert result is not None
+    # Check case-insensitively since some filesystems are case-insensitive
+    assert result.name.lower() == "skill.md"
+
+
+def test_find_skill_md_returns_none_when_missing(tmp_path):
+    """find_skill_md should return None when no skill.md exists."""
+    skill_dir = tmp_path / "my-skill"
+    skill_dir.mkdir()
+    result = find_skill_md(skill_dir)
+    assert result is None
+
+
+def test_read_properties_with_lowercase_skill_md(tmp_path):
+    """read_properties should work with lowercase skill.md."""
+    skill_dir = tmp_path / "my-skill"
+    skill_dir.mkdir()
+    (skill_dir / "skill.md").write_text("""---
+name: my-skill
+description: A test skill
+---
+# My Skill
+""")
+    props = read_properties(skill_dir)
+    assert props.name == "my-skill"
+    assert props.description == "A test skill"
+
+
+def test_read_with_allowed_tools(tmp_path):
+    """allowed-tools should be parsed into SkillProperties."""
+    skill_dir = tmp_path / "my-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("""---
+name: my-skill
+description: A test skill
+allowed-tools: Bash(jq:*) Bash(git:*)
+---
+Body
+""")
+    props = read_properties(skill_dir)
+    assert props.allowed_tools == "Bash(jq:*) Bash(git:*)"
+    # Verify to_dict outputs as "allowed-tools" (hyphenated)
+    d = props.to_dict()
+    assert d["allowed-tools"] == "Bash(jq:*) Bash(git:*)"
+</file>
+
+<file path="skills-ref/tests/test_prompt.py">
+"""Tests for prompt module."""
+
+from skills_ref.prompt import to_prompt
+
+
+def test_empty_list():
+    result = to_prompt([])
+    assert result == "<available_skills>\n</available_skills>"
+
+
+def test_single_skill(tmp_path):
+    skill_dir = tmp_path / "my-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("""---
+name: my-skill
+description: A test skill
+---
+Body
+""")
+    result = to_prompt([skill_dir])
+    assert "<available_skills>" in result
+    assert "</available_skills>" in result
+    assert "<name>\nmy-skill\n</name>" in result
+    assert "<description>\nA test skill\n</description>" in result
+    assert "<location>" in result
+    assert "SKILL.md" in result
+
+
+def test_multiple_skills(tmp_path):
+    skill_a = tmp_path / "skill-a"
+    skill_a.mkdir()
+    (skill_a / "SKILL.md").write_text("""---
+name: skill-a
+description: First skill
+---
+Body
+""")
+
+    skill_b = tmp_path / "skill-b"
+    skill_b.mkdir()
+    (skill_b / "SKILL.md").write_text("""---
+name: skill-b
+description: Second skill
+---
+Body
+""")
+
+    result = to_prompt([skill_a, skill_b])
+    assert result.count("<skill>") == 2
+    assert result.count("</skill>") == 2
+    assert "skill-a" in result
+    assert "skill-b" in result
+
+
+def test_special_characters_escaped(tmp_path):
+    """XML special characters in description are escaped."""
+    skill_dir = tmp_path / "special-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("""---
+name: special-skill
+description: Use <foo> & <bar> tags
+---
+Body
+""")
+    result = to_prompt([skill_dir])
+    assert "&lt;foo&gt;" in result
+    assert "&amp;" in result
+    assert "&lt;bar&gt;" in result
+    assert "<foo>" not in result
+    assert "<bar>" not in result
+</file>
+
+<file path="skills-ref/tests/test_validator.py">
+"""Tests for validator module."""
+
+from skills_ref.validator import validate
+
+
+def test_valid_skill(tmp_path):
+    skill_dir = tmp_path / "my-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("""---
+name: my-skill
+description: A test skill
+---
+# My Skill
+""")
+    errors = validate(skill_dir)
+    assert errors == []
+
+
+def test_nonexistent_path(tmp_path):
+    errors = validate(tmp_path / "nonexistent")
+    assert len(errors) == 1
+    assert "does not exist" in errors[0]
+
+
+def test_not_a_directory(tmp_path):
+    file_path = tmp_path / "file.txt"
+    file_path.write_text("test")
+    errors = validate(file_path)
+    assert len(errors) == 1
+    assert "Not a directory" in errors[0]
+
+
+def test_missing_skill_md(tmp_path):
+    skill_dir = tmp_path / "my-skill"
+    skill_dir.mkdir()
+    errors = validate(skill_dir)
+    assert len(errors) == 1
+    assert "Missing required file: SKILL.md" in errors[0]
+
+
+def test_invalid_name_uppercase(tmp_path):
+    skill_dir = tmp_path / "MySkill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("""---
+name: MySkill
+description: A test skill
+---
+Body
+""")
+    errors = validate(skill_dir)
+    assert any("lowercase" in e for e in errors)
+
+
+def test_name_too_long(tmp_path):
+    long_name = "a" * 70  # Exceeds 64 char limit
+    skill_dir = tmp_path / long_name
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(f"""---
+name: {long_name}
+description: A test skill
+---
+Body
+""")
+    errors = validate(skill_dir)
+    assert any("exceeds" in e and "character limit" in e for e in errors)
+
+
+def test_name_leading_hyphen(tmp_path):
+    skill_dir = tmp_path / "-my-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("""---
+name: -my-skill
+description: A test skill
+---
+Body
+""")
+    errors = validate(skill_dir)
+    assert any("cannot start or end with a hyphen" in e for e in errors)
+
+
+def test_name_consecutive_hyphens(tmp_path):
+    skill_dir = tmp_path / "my--skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("""---
+name: my--skill
+description: A test skill
+---
+Body
+""")
+    errors = validate(skill_dir)
+    assert any("consecutive hyphens" in e for e in errors)
+
+
+def test_name_invalid_characters(tmp_path):
+    skill_dir = tmp_path / "my_skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("""---
+name: my_skill
+description: A test skill
+---
+Body
+""")
+    errors = validate(skill_dir)
+    assert any("invalid characters" in e for e in errors)
+
+
+def test_name_directory_mismatch(tmp_path):
+    skill_dir = tmp_path / "wrong-name"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("""---
+name: correct-name
+description: A test skill
+---
+Body
+""")
+    errors = validate(skill_dir)
+    assert any("must match skill name" in e for e in errors)
+
+
+def test_unexpected_fields(tmp_path):
+    skill_dir = tmp_path / "my-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("""---
+name: my-skill
+description: A test skill
+unknown_field: should not be here
+---
+Body
+""")
+    errors = validate(skill_dir)
+    assert any("Unexpected fields" in e for e in errors)
+
+
+def test_valid_with_all_fields(tmp_path):
+    skill_dir = tmp_path / "my-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("""---
+name: my-skill
+description: A test skill
+license: MIT
+metadata:
+  author: Test
+---
+Body
+""")
+    errors = validate(skill_dir)
+    assert errors == []
+
+
+def test_allowed_tools_accepted(tmp_path):
+    """allowed-tools is accepted (experimental feature)."""
+    skill_dir = tmp_path / "my-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("""---
+name: my-skill
+description: A test skill
+allowed-tools: Bash(jq:*) Bash(git:*)
+---
+Body
+""")
+    errors = validate(skill_dir)
+    assert errors == []
+
+
+def test_i18n_chinese_name(tmp_path):
+    """Chinese characters are allowed in skill names."""
+    skill_dir = tmp_path / "技能"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("""---
+name: 技能
+description: A skill with Chinese name
+---
+Body
+""")
+    errors = validate(skill_dir)
+    assert errors == []
+
+
+def test_i18n_russian_name_with_hyphens(tmp_path):
+    """Russian names with hyphens are allowed."""
+    skill_dir = tmp_path / "мой-навык"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("""---
+name: мой-навык
+description: A skill with Russian name
+---
+Body
+""")
+    errors = validate(skill_dir)
+    assert errors == []
+
+
+def test_i18n_russian_lowercase_valid(tmp_path):
+    """Russian lowercase names should be accepted."""
+    skill_dir = tmp_path / "навык"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("""---
+name: навык
+description: A skill with Russian lowercase name
+---
+Body
+""")
+    errors = validate(skill_dir)
+    assert errors == []
+
+
+def test_i18n_russian_uppercase_rejected(tmp_path):
+    """Russian uppercase names should be rejected."""
+    skill_dir = tmp_path / "НАВЫК"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("""---
+name: НАВЫК
+description: A skill with Russian uppercase name
+---
+Body
+""")
+    errors = validate(skill_dir)
+    assert any("lowercase" in e for e in errors)
+
+
+def test_description_too_long(tmp_path):
+    """Description exceeding 1024 chars should fail."""
+    skill_dir = tmp_path / "my-skill"
+    skill_dir.mkdir()
+    long_desc = "x" * 1100
+    (skill_dir / "SKILL.md").write_text(f"""---
+name: my-skill
+description: {long_desc}
+---
+Body
+""")
+    errors = validate(skill_dir)
+    assert any("exceeds" in e and "1024" in e for e in errors)
+
+
+def test_valid_compatibility(tmp_path):
+    """Valid compatibility field should be accepted."""
+    skill_dir = tmp_path / "my-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("""---
+name: my-skill
+description: A test skill
+compatibility: Requires Python 3.11+
+---
+Body
+""")
+    errors = validate(skill_dir)
+    assert errors == []
+
+
+def test_compatibility_too_long(tmp_path):
+    """Compatibility exceeding 500 chars should fail."""
+    skill_dir = tmp_path / "my-skill"
+    skill_dir.mkdir()
+    long_compat = "x" * 550
+    (skill_dir / "SKILL.md").write_text(f"""---
+name: my-skill
+description: A test skill
+compatibility: {long_compat}
+---
+Body
+""")
+    errors = validate(skill_dir)
+    assert any("exceeds" in e and "500" in e for e in errors)
+
+
+def test_nfkc_normalization(tmp_path):
+    """Skill names are NFKC normalized before validation.
+
+    The name 'café' can be represented two ways:
+    - Precomposed: 'café' (4 chars, 'é' is U+00E9)
+    - Decomposed: 'café' (5 chars, 'e' + combining acute U+0301)
+
+    NFKC normalizes both to the precomposed form.
+    """
+    # Use decomposed form: 'cafe' + combining acute accent (U+0301)
+    decomposed_name = "cafe\u0301"  # 'café' with combining accent
+    composed_name = "café"  # precomposed form
+
+    # Directory uses composed form, SKILL.md uses decomposed - should match after normalization
+    skill_dir = tmp_path / composed_name
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(f"""---
+name: {decomposed_name}
+description: A test skill
+---
+Body
+""")
+    errors = validate(skill_dir)
+    assert errors == [], f"Expected no errors, got: {errors}"
+</file>
+
+<file path="skills-ref/.gitignore">
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Type checking
+.mypy_cache/
+
+# Linting
+.ruff_cache/
+</file>
+
+<file path="skills-ref/CLAUDE.md">
+# Development
+
+## Code Quality
+
+Format and lint with ruff:
+
+```bash
+uv run ruff format .
+uv run ruff check --fix .
+```
+
+## Testing
+
+Run tests with pytest:
+
+```bash
+uv run pytest
+```
+</file>
+
+<file path="skills-ref/pyproject.toml">
+[project]
+name = "skills-ref"
+version = "0.1.0"
+description = "Reference library for Agent Skills"
+license = "Apache-2.0"
+readme = "README.md"
+authors = [
+    { name = "Keith Lazuka", email = "klazuka@anthropic.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "click>=8.0",
+    "strictyaml>=1.7.3",
+]
+
+[project.scripts]
+skills-ref = "skills_ref.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/skills_ref"]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.8.0",
+]
+</file>
+
+<file path="skills-ref/README.md">
+# skills-ref
+
+Reference library for Agent Skills.
+
+> **Note:** This library is intended for demonstration purposes only. It is not meant to be used in production.
+
+## Installation
+
+### macOS / Linux
+
+Using pip:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e .
+```
+
+Or using [uv](https://docs.astral.sh/uv/):
+
+```bash
+uv sync
+source .venv/bin/activate
+```
+
+### Windows
+
+Using pip (PowerShell):
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -e .
+```
+
+Using pip (Command Prompt):
+
+```cmd
+python -m venv .venv
+.venv\Scripts\activate.bat
+pip install -e .
+```
+
+Or using [uv](https://docs.astral.sh/uv/):
+
+```powershell
+uv sync
+.venv\Scripts\Activate.ps1
+```
+
+After installation, the `skills-ref` executable will be available on your `PATH` (within the activated virtual environment).
+
+## Usage
+
+### CLI
+
+```bash
+# Validate a skill
+skills-ref validate path/to/skill
+
+# Read skill properties (outputs JSON)
+skills-ref read-properties path/to/skill
+
+# Generate <available_skills> XML for agent prompts
+skills-ref to-prompt path/to/skill-a path/to/skill-b
+```
+
+### Python API
+
+```python
+from pathlib import Path
+from skills_ref import validate, read_properties, to_prompt
+
+# Validate a skill directory
+problems = validate(Path("my-skill"))
+if problems:
+    print("Validation errors:", problems)
+
+# Read skill properties
+props = read_properties(Path("my-skill"))
+print(f"Skill: {props.name} - {props.description}")
+
+# Generate prompt for available skills
+prompt = to_prompt([Path("skill-a"), Path("skill-b")])
+print(prompt)
+```
+
+## Agent Prompt Integration
+
+Use `to-prompt` to generate the suggested `<available_skills>` XML block for your agent's system prompt. This format is recommended for Anthropic's models, but Skill Clients may choose to format it differently based on the model being used.
+
+```xml
+<available_skills>
+<skill>
+<name>
+my-skill
+</name>
+<description>
+What this skill does and when to use it
+</description>
+<location>
+/path/to/my-skill/SKILL.md
+</location>
+</skill>
+</available_skills>
+```
+
+The `<location>` element tells the agent where to find the full skill instructions.
+
+## License
+
+Apache 2.0
+</file>
+
+<file path=".gitignore">
+# macOS
+.DS_Store
+
+# IDEs
+.idea/
+.vscode/
+</file>
+
+<file path="README.md">
+# Agent Skills
+
+[Agent Skills](https://agentskills.io) are a simple, open format for giving agents new capabilities and expertise.
+
+Skills are folders of instructions, scripts, and resources that agents can discover and use to perform better at specific tasks. Write once, use everywhere.
+
+## Getting Started
+
+- [Documentation](https://agentskills.io) - Guides and tutorials
+- [Specification](https://agentskills.io/specification) - Format details
+- [Example Skills](https://github.com/anthropics/skills) - See what's possible
+
+This repo contains the specification, documentation, and reference SDK. Also see a list of example skills [here](https://github.com/anthropics/skills).
+
+## About
+
+Agent Skills is an open format maintained by [Anthropic](https://anthropic.com) and open to contributions from the community.
+</file>
+
+</files>
