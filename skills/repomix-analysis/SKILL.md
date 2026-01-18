@@ -20,10 +20,10 @@ Default behavior: **broad strokes first**. Do a quick whole-repo measurement pas
 ## Workflow
 
 1. Define the analysis question.
-2. First pass (measurement): generate a **whole-repo** pack (default to XML) and measure tokens (`--top-files-len`, `--token-count-tree`). Treat this pack as **measurement-only**; you usually won’t upload it to Gemini.
+2. First pass (measurement): generate a **whole-repo** pack (default to XML) and measure tokens (`--top-files-len`, `--token-count-tree`). Treat this pack as **measurement-only**; you usually won’t upload it to Gemini. Delete it after you’ve captured token stats (keep only final Gemini pack(s)).
 3. Define an **initial “obvious noise” filter** (file types + folders) from the token stats (no content inspection; use only paths).
 4. Second pass (filtered whole repo): re-pack the **whole repo** with that initial filter applied. If the filtered pack is **less than 1,000,000 tokens**, **stop here** and **handoff to Gemini** (upload the **filtered** pack). Do **not** spend time “curating” code files (unless there are clearly some auxiliary non-code artifacts that must be excluded anyway).
-5. If still over budget, widen exclusions in this order (re-pack and re-check after each): **other non-essential** → **tests** → **examples**.
+5. If still over budget, widen exclusions in this order (re-pack and re-check after each): **other non-essential** → **tests** → **examples** → drop either **docs** or **code** based on the question.
 6. If still over budget after that, reduce scope at **folder granularity** based on the question + token tree (avoid file-by-file selection). Prefer docs for usage questions; prefer code for implementation questions. Use `--include-full-directory-structure` so Gemini still sees the full tree.
 7. If needed, create a small number of **semantic packs by subsystem/folder** (e.g. 2–5 packs), not a pile of single-file packs (user will run the prompt once per pack, sequentially).
 8. Handoff pack(s) to Gemini. If Gemini’s answer is vague/weird but points at relevant areas, do a **second pass**: re-pack focusing on those folders and ask again with a narrower question.
@@ -97,7 +97,7 @@ repomix source_directory --style xml -o repomix-output.your-file-name.xml --incl
 
 ## Scope / filtering heuristics (practical)
 
-- Default: pack the **whole repo first** to get token stats. Apply an initial “obvious noise” filter (non-code/unrelated folders + file types), then re-pack. If still over budget, widen exclusions (**other non-essential** → **tests** → **examples** → **docs**). Only then exclude code/docs by relevance (prefer folders/modules).
+- Default: pack the **whole repo first** to get token stats. Apply an initial “obvious noise” filter (non-code/unrelated folders + file types), then re-pack. If still over budget, widen exclusions (**other non-essential** → **tests** → **examples** → drop either **docs** or **code** based on the question). Only then exclude code/docs by relevance (prefer folders/modules).
 - Keep: entrypoints, core source (`src/`), configuration, schemas/migrations, key docs (`README`, `SPEC`, ADRs), and tests that define behavior.
 - Exclude first: build outputs (`dist/`, `build/`, `target/`), caches, coverage, vendored deps, large assets, huge fixtures/dumps, generated code blobs, and large repo-meta (e.g. changelogs/release notes) unless directly relevant.
 - Use `.repomixignore` for repeated iterations; use `--ignore` for one-offs.
