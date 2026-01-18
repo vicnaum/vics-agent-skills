@@ -11,6 +11,8 @@ The agent starts from the deepest folders, summarizing files, then goes up - sum
 
 This helps agents working on a big repo to better understand where to look for things.
 
+> Best used if you install `tree` locally with `brew install tree`
+
 #### Example ask
 
 ```
