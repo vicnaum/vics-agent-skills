@@ -56,6 +56,8 @@ Ask your repo things for free and with huge context. This skill uses Repomix to 
 
 To the contrary of modern agents that read files L1-200 lines at a time, this helps if you want to investigate huge repos, find dependencies, see the architecture at a whole, or just ask "how does this thing work in this repo?" without missing anything important.
 
+> Best used if you install Repomix locally with `brew install repomix`.
+
 #### Example ask:
 ```
 How does peer persistence work (disk format + lifecycle) in reth? I want how peer records are stored, loaded on startup, updated during runtime, and any pruning/expiration behavior. Use repomix-analysis skill for this and verify its claims manually later.
