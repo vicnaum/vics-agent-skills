@@ -14,16 +14,18 @@ Default behavior: **broad strokes first**. Do a quick whole-repo measurement pas
 - Treat Repomix output files as **read-only artifacts**. Make changes only in the original repo files.
 - Keep Repomix security checks enabled by default. Use `--no-security-check` only if the user explicitly requests it and confirms the output is safe to share externally.
 - If packing a remote repo is required but network/git access is blocked by the sandbox, ask the user to run outside the sandbox.
+- Do **not** open/search the Repomix output (XML) before Gemini handoff. Decide what to exclude using only token stats + folder/filename paths.
+- Exception: only do a targeted search when the user explicitly asks to find a specific known identifier.
 
 ## Workflow
 
 1. Define the analysis question.
 2. First pass (measurement): generate a **whole-repo** pack (default to XML) and measure tokens (`--top-files-len`, `--token-count-tree`). Treat this pack as **measurement-only**; you usually won’t upload it to Gemini.
-3. Define an **initial “obvious noise” filter** (file types + folders) from the token stats (assets like images, build outputs, vendor/deps, dumps, binaries, generated blobs, etc.).
+3. Define an **initial “obvious noise” filter** (file types + folders) from the token stats (no content inspection; use only paths).
 4. Second pass (filtered whole repo): re-pack the **whole repo** with that initial filter applied. If the filtered pack is **less than 1,000,000 tokens**, **stop here** and **handoff to Gemini** (upload the **filtered** pack). Do **not** spend time “curating” code files (unless there are clearly some auxiliary non-code artifacts that must be excluded anyway).
-5. If still over budget, try low-risk token reductions (e.g. ignore patterns, empty-line removal, base64 truncation, compression), then re-pack and re-check.
-6. If still over budget, reduce scope at **folder granularity** based on the question + token tree (avoid file-by-file selection). Use `--include-full-directory-structure` so Gemini still sees the full tree.
-7. If needed, create a small number of **semantic packs by subsystem/folder** (e.g. 2–5 packs), not a pile of single-file packs.
+5. If still over budget, widen exclusions in this order (re-pack and re-check after each): **other non-essential** → **tests** → **examples**.
+6. If still over budget after that, reduce scope at **folder granularity** based on the question + token tree (avoid file-by-file selection). Prefer docs for usage questions; prefer code for implementation questions. Use `--include-full-directory-structure` so Gemini still sees the full tree.
+7. If needed, create a small number of **semantic packs by subsystem/folder** (e.g. 2–5 packs), not a pile of single-file packs (user will run the prompt once per pack, sequentially).
 8. Handoff pack(s) to Gemini. If Gemini’s answer is vague/weird but points at relevant areas, do a **second pass**: re-pack focusing on those folders and ask again with a narrower question.
 
 ## Command templates (copy/paste)
@@ -95,9 +97,9 @@ repomix source_directory --style xml -o repomix-output.your-file-name.xml --incl
 
 ## Scope / filtering heuristics (practical)
 
-- Default: pack the **whole repo first** to get token stats. Apply an initial “obvious noise” filter (non-code/unrelated folders + file types), then re-pack. Only if you’re still over the ~1M token budget after that should you start excluding **code** by relevance (prefer folders/modules).
+- Default: pack the **whole repo first** to get token stats. Apply an initial “obvious noise” filter (non-code/unrelated folders + file types), then re-pack. If still over budget, widen exclusions (**other non-essential** → **tests** → **examples** → **docs**). Only then exclude code/docs by relevance (prefer folders/modules).
 - Keep: entrypoints, core source (`src/`), configuration, schemas/migrations, key docs (`README`, `SPEC`, ADRs), and tests that define behavior.
-- Exclude first: build outputs (`dist/`, `build/`, `target/`), caches, coverage, vendored deps, large assets, huge fixtures/dumps, generated code blobs (unless directly relevant).
+- Exclude first: build outputs (`dist/`, `build/`, `target/`), caches, coverage, vendored deps, large assets, huge fixtures/dumps, generated code blobs, and large repo-meta (e.g. changelogs/release notes) unless directly relevant.
 - Use `.repomixignore` for repeated iterations; use `--ignore` for one-offs.
 - Use `--include-full-directory-structure` when you pack only a subset but still want the model to see the full repo tree.
 - Prefer **folder-level** `--include`/`--ignore` patterns (and a few key docs/config files) over curating individual files.
