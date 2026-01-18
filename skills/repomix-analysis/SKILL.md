@@ -1,11 +1,13 @@
 ---
 name: repomix-analysis
-description: Pack local or remote repositories with Repomix for whole-codebase, cross-file analysis. Use when you need more context than incremental file reading provides (architecture mapping, hidden couplings, security review, multi-file bug tracing). Manage context size with --top-files-len, --token-count-tree, include/ignore filtering, comment/whitespace removal, --compress, and semantic or --split-output splitting; then hand off the Repomix output + a ready-to-paste Gemini prompt to the user.
+description: Pack repositories with Repomix for whole-codebase, cross-file analysis. Default to a whole-repo measurement pass, then a filtered whole-repo pack; if it fits under ~1M tokens, stop and hand off to Gemini. Only if it doesn’t fit after the initial noise filter, reduce scope at folder granularity (avoid file-by-file selection), then iterate based on Gemini feedback.
 ---
 
 # Repomix Code Analysis
 
-Use Repomix to pack a repository (or a carefully chosen subset) into a single AI-friendly file (usually XML), optimize the pack to fit a target context budget, then ask the user to run the analysis in a large-context model (Gemini) and paste back the result.
+Use Repomix to pack a repository into a single AI-friendly file (usually XML), then ask the user to run the analysis in a large-context model (Gemini) and paste back the result.
+
+Default behavior: **broad strokes first**. Do a quick whole-repo measurement pass, then re-pack with obvious non-code/unrelated noise excluded. If that filtered whole-repo pack fits within ~**1,000,000 tokens**, do not over-optimize—hand it off to Gemini.
 
 ## Non-negotiables
 
@@ -15,12 +17,14 @@ Use Repomix to pack a repository (or a carefully chosen subset) into a single AI
 
 ## Workflow
 
-1. Define the analysis question and scope (whole repo vs subset vs multiple semantic packs).
-2. Generate an initial pack (default to XML).
-3. Measure size and find the true token hogs (`--top-files-len`, `--token-count-tree`).
-4. Reduce/trim noise (ignore patterns, comment/whitespace removal, compression, base64 truncation).
-5. Split if needed (prefer semantic splitting. Don't use `--split-output`).
-6. Hand off the final pack(s) to the user with a single ready-to-paste Gemini prompt; ingest the response and continue.
+1. Define the analysis question.
+2. First pass (measurement): generate a **whole-repo** pack (default to XML) and measure tokens (`--top-files-len`, `--token-count-tree`). Treat this pack as **measurement-only**; you usually won’t upload it to Gemini.
+3. Define an **initial “obvious noise” filter** (file types + folders) from the token stats (assets like images, build outputs, vendor/deps, dumps, binaries, generated blobs, etc.).
+4. Second pass (filtered whole repo): re-pack the **whole repo** with that initial filter applied. If the filtered pack is **less than 1,000,000 tokens**, **stop here** and **handoff to Gemini** (upload the **filtered** pack). Do **not** spend time “curating” code files (unless there are clearly some auxiliary non-code artifacts that must be excluded anyway).
+5. If still over budget, try low-risk token reductions (e.g. ignore patterns, empty-line removal, base64 truncation, compression), then re-pack and re-check.
+6. If still over budget, reduce scope at **folder granularity** based on the question + token tree (avoid file-by-file selection). Use `--include-full-directory-structure` so Gemini still sees the full tree.
+7. If needed, create a small number of **semantic packs by subsystem/folder** (e.g. 2–5 packs), not a pile of single-file packs.
+8. Handoff pack(s) to Gemini. If Gemini’s answer is vague/weird but points at relevant areas, do a **second pass**: re-pack focusing on those folders and ask again with a narrower question.
 
 ## Command templates (copy/paste)
 
@@ -32,10 +36,20 @@ repomix --version
 
 If `repomix` is not on `PATH`, replace `repomix` below with `pnpm dlx repomix@latest` (or `npx repomix@latest`).
 
-### Local repo (local directory) → XML pack + token stats
+### Local repo (first pass / measurement) → XML pack + token stats
 
 ```bash
 repomix source_directory --style xml -o repomix-output.your-file-name.xml --top-files-len 100 --token-count-tree
+```
+
+### Local repo (second pass / filtered whole repo) → XML pack + token stats
+
+Start with a small “obvious noise” ignore list and adjust it based on the first pass token stats.
+
+```bash
+repomix source_directory --style xml -o repomix-output.filtered.xml --top-files-len 100 --token-count-tree \
+  --ignore "**/dist/**,**/build/**,**/target/**,**/coverage/**,**/node_modules/**,**/*.svg,**/*.png,**/*.jpg,**/*.jpeg,**/*.gif,**/*.pdf,**/*.zip" \
+  --remove-empty-lines --truncate-base64
 ```
 
 ### Focused pack (semantic split) with full tree context
@@ -81,10 +95,12 @@ repomix source_directory --style xml -o repomix-output.your-file-name.xml --incl
 
 ## Scope / filtering heuristics (practical)
 
+- Default: pack the **whole repo first** to get token stats. Apply an initial “obvious noise” filter (non-code/unrelated folders + file types), then re-pack. Only if you’re still over the ~1M token budget after that should you start excluding **code** by relevance (prefer folders/modules).
 - Keep: entrypoints, core source (`src/`), configuration, schemas/migrations, key docs (`README`, `SPEC`, ADRs), and tests that define behavior.
 - Exclude first: build outputs (`dist/`, `build/`, `target/`), caches, coverage, vendored deps, large assets, huge fixtures/dumps, generated code blobs (unless directly relevant).
 - Use `.repomixignore` for repeated iterations; use `--ignore` for one-offs.
 - Use `--include-full-directory-structure` when you pack only a subset but still want the model to see the full repo tree.
+- Prefer **folder-level** `--include`/`--ignore` patterns (and a few key docs/config files) over curating individual files.
 
 ## Include vs ignore (priority rules)
 
