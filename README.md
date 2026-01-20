@@ -4,7 +4,7 @@ My small collection of **Agent Skills** for AI coding agents.
 
 ## Skills
 
-### [layered-summary](`skills/layered-summary/`)
+### [layered-summary](skills/layered-summary/SKILL.md)
 
 Summarizes the whole repo to get a layered overview - each folder will have it's own `AGENTS.md` file that will describe what's contained.
 The agent starts from the deepest folders, summarizing files, then goes up - summarizing the summaries. This is why it's called "layered" - `AGENTS.md` are layered summaries across a subtree (deep dirs are detailed; parents roll up children).
@@ -52,7 +52,7 @@ Top-level engine subsystem directory: contains the crates that implement reth’
 - **Design intent**: keep Engine API responsiveness high by minimizing DB writes on the critical path and delegating persistence/pruning to background workers.
 ````
 
-### [repomix-analysis](`skills/repomix-analysis/`)
+### [repomix-analysis](skills/repomix-analysis/SKILL.md)
 
 Ask your repo things for free and with huge context. This skill uses Repomix to pack a repo or a subset of interest into an AI-friendly file for whole-codebase, cross-file analysis. After packing, the agent gives you a question-prompt that you can paste to a free Gemini 3 Pro Playground along with the packed context file (Gemini 3 Pro supports up to 1 Million tokens context and is 100% free from the web Playground).
 
