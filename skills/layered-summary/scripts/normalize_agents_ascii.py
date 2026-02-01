@@ -5,7 +5,7 @@ Normalize non-ASCII characters in AGENTS.md files to ASCII equivalents.
 Default behavior is a dry-run. Use --write to modify files in-place.
 
 Example:
-  python3 normalize_agents_ascii.py --root reth --write
+  python3 scripts/normalize_agents_ascii.py --root reth --write
 """
 
 from __future__ import annotations
@@ -15,6 +15,8 @@ import sys
 import unicodedata
 from collections import Counter
 from pathlib import Path
+
+from agents_lib import compile_globs_csv, matches_any
 
 
 REPLACEMENTS: dict[str, str] = {
@@ -36,6 +38,17 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("reth"),
         help="Root directory to scan (default: reth).",
+    )
+    p.add_argument(
+        "--include",
+        default=None,
+        help='Include only paths matching these glob patterns (comma-separated, e.g., "src/**/AGENTS.md,AGENTS.md").',
+    )
+    p.add_argument(
+        "-i",
+        "--ignore",
+        default=None,
+        help='Additional patterns to exclude (comma-separated, e.g., "**/target/**,**/node_modules/**").',
     )
     p.add_argument(
         "--write",
@@ -62,11 +75,22 @@ def main() -> int:
     args = _parse_args()
     root = args.root.resolve()
 
+    include = compile_globs_csv(args.include)
+    ignore = compile_globs_csv(args.ignore)
+
     if not root.exists() or not root.is_dir():
         print(f"ERROR: --root must be an existing directory: {root}", file=sys.stderr)
         return 2
 
-    agents = sorted(root.rglob("AGENTS.md"))
+    all_agents = sorted(root.rglob("AGENTS.md"))
+    agents: list[Path] = []
+    for path in all_agents:
+        rel_posix = path.relative_to(root).as_posix()
+        if ignore and matches_any(rel_posix, ignore):
+            continue
+        if include and not matches_any(rel_posix, include):
+            continue
+        agents.append(path)
     if not agents:
         print(f"ERROR: no AGENTS.md files found under {root}", file=sys.stderr)
         return 1

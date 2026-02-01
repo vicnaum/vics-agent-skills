@@ -7,7 +7,7 @@ Export-only utility: copy AGENTS.md files from a subtree into a standalone folde
 - Does NOT modify the source repo
 
 Example:
-  python3 export_agents_md.py --src reth --out agents-export/reth
+  python3 scripts/export_agents_md.py --src reth --out agents-export/reth
 """
 
 from __future__ import annotations
@@ -16,6 +16,8 @@ import argparse
 import shutil
 import sys
 from pathlib import Path
+
+from agents_lib import compile_globs_csv, matches_any
 
 
 def _parse_args() -> argparse.Namespace:
@@ -33,6 +35,17 @@ def _parse_args() -> argparse.Namespace:
         help="Output directory to write exported AGENTS.md into.",
     )
     p.add_argument(
+        "--include",
+        default=None,
+        help='Include only paths matching these glob patterns (comma-separated, e.g., "src/**/AGENTS.md,AGENTS.md").',
+    )
+    p.add_argument(
+        "-i",
+        "--ignore",
+        default=None,
+        help='Additional patterns to exclude (comma-separated, e.g., "**/target/**,**/node_modules/**").',
+    )
+    p.add_argument(
         "--overwrite",
         action="store_true",
         help="Allow writing into an existing output directory.",
@@ -45,6 +58,9 @@ def main() -> int:
 
     src = args.src.resolve()
     out = args.out.resolve()
+
+    include = compile_globs_csv(args.include)
+    ignore = compile_globs_csv(args.ignore)
 
     if not src.exists() or not src.is_dir():
         print(f"ERROR: --src must be an existing directory: {src}", file=sys.stderr)
@@ -60,7 +76,16 @@ def main() -> int:
 
     out.mkdir(parents=True, exist_ok=True)
 
-    agents = sorted(src.rglob("AGENTS.md"))
+    all_agents = sorted(src.rglob("AGENTS.md"))
+    agents: list[Path] = []
+    for path in all_agents:
+        rel_posix = path.relative_to(src).as_posix()
+        if ignore and matches_any(rel_posix, ignore):
+            continue
+        if include and not matches_any(rel_posix, include):
+            continue
+        agents.append(path)
+
     if not agents:
         print(f"ERROR: no AGENTS.md files found under {src}", file=sys.stderr)
         return 1
