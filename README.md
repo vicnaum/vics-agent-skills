@@ -98,6 +98,28 @@ Once you paste the Gemini output, I’ll manually verify the claims in the codeb
 
 Then just copy the prompt into a big model and get the answer back to the Agent for verification.
 
+### [ai-conversation-extractor](skills/ai-conversation-extractor/SKILL.md)
+
+Convert Claude Code conversation JSONL transcripts (from `~/.claude/projects/`) to clean, readable Markdown. Strips binary blobs (base64 images, PDFs — typically 95%+ of file size) while preserving the full human-readable conversation: user messages, assistant text, thinking, tool calls, and tool results.
+
+Includes a detailed [JSONL format reference](skills/ai-conversation-extractor/scripts/README.md) documenting all Claude Code record types, content blocks, and the `~/.claude/` folder structure.
+
+> No external dependencies — uses only Python 3.12+ stdlib.
+
+#### Example ask
+
+```
+Convert my Claude Code conversations in docs/conversations/ to readable Markdown
+```
+
+#### Example usage
+
+```bash
+python3 <skill-dir>/scripts/extract.py docs/conversations/ --recursive
+```
+
+Converts a 34MB JSONL transcript to ~670KB of readable Markdown (1.7% of original).
+
 ## Install / use
 
 ### Cursor
