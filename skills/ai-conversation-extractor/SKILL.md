@@ -45,10 +45,14 @@ No external dependencies — uses only Python 3.12+ stdlib (`json`, `re`, `pathl
 - Assistant text responses (full)
 - Assistant thinking blocks (truncated at 3000 chars, in `<details>` tags)
 - Tool calls (name + JSON input, truncated at 4000 chars)
-- Tool results (text content, truncated at 6000 chars)
+- Tool results (text content, full; no truncation)
 - Image/document placeholders (e.g., `*[attached document: application/pdf]*`)
 - Error results from rejected tool uses
+- Per-message timestamps (Claude Code format only)
+- Source file metadata (YAML frontmatter) and filesystem mtime (output .md matches source .jsonl mtime for natural sort-by-date)
 
 ## Output Format
 
-Markdown with `## User` / `## Assistant` headings separated by `---`. Tool calls formatted as `**Tool: \`Name\`**` with JSON code blocks. Tool results as `**Result** (\`id\`):` with code blocks.
+- **YAML frontmatter**: `source`, `modified` (ISO 8601) for parseable metadata
+- **Filesystem**: Output .md file's modification time is set to match the source .jsonl, so `ls -t` or Finder sort-by-date preserves conversation order
+- Markdown with `## User` / `## Assistant` headings separated by `---`. Per-message timestamps shown as `*2026-02-09T23:51:07Z*` when available (Claude Code format). Tool calls formatted as `**Tool: \`Name\`**` with JSON code blocks. Tool results as `**Result** (\`id\`):` with code blocks.

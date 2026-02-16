@@ -19,6 +19,7 @@ import json
 import os
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -63,12 +64,12 @@ def truncate(text: str, max_len: int = 4000, label: str = "text") -> str:
 # ---------------------------------------------------------------------------
 
 
-def process_claude_code(lines: list[str]) -> tuple[str | None, list[tuple[str, str]]]:
+def process_claude_code(lines: list[str]) -> tuple[str | None, list[tuple[str, str, str | None]]]:
     """Parse Claude Code JSONL (envelope with type/message/toolUseResult).
 
-    Returns (summary_title, conversation) where summary_title may be None.
+    Returns (summary_title, conversation) where conversation is (role, text, timestamp).
     """
-    conversation: list[tuple[str, str]] = []  # (role, markdown_text)
+    conversation: list[tuple[str, str, str | None]] = []
     summary_title: str | None = None
 
     for raw in lines:
@@ -100,6 +101,7 @@ def process_claude_code(lines: list[str]) -> tuple[str | None, list[tuple[str, s
 
         role = msg.get("role", "")
         content = msg.get("content", "")
+        timestamp = obj.get("timestamp")
 
         parts: list[str] = []
 
@@ -109,7 +111,7 @@ def process_claude_code(lines: list[str]) -> tuple[str | None, list[tuple[str, s
             parts = _extract_user_parts(content)
 
         if parts:
-            conversation.append((role, "\n\n".join(parts)))
+            conversation.append((role, "\n\n".join(parts), timestamp))
 
     return summary_title, conversation
 
@@ -197,7 +199,6 @@ def _extract_user_parts(content) -> list[str]:
                 if looks_base64(text):
                     parts.append(f"*[binary tool result, {len(text)} chars]*")
                 elif text:
-                    text = truncate(text, 6000, "tool result")
                     label = "Error" if is_err else "Result"
                     parts.append(f"**{label}** (`{tid}`):\n```\n{text}\n```")
 
@@ -213,7 +214,6 @@ def _extract_user_parts(content) -> list[str]:
                                 f"*[binary tool result, {len(text)} chars]*"
                             )
                         elif text:
-                            text = truncate(text, 6000, "tool result")
                             label = "Error" if is_err else "Result"
                             parts.append(
                                 f"**{label}** (`{tid}`):\n```\n{text}\n```"
@@ -231,9 +231,9 @@ def _extract_user_parts(content) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def process_simple(lines: list[str]) -> tuple[None, list[tuple[str, str]]]:
+def process_simple(lines: list[str]) -> tuple[None, list[tuple[str, str, str | None]]]:
     """Parse simple JSONL: {"role": "user/assistant", "message": {"content": [...]}}."""
-    conversation: list[tuple[str, str]] = []
+    conversation: list[tuple[str, str, str | None]] = []
 
     for raw in lines:
         raw = raw.strip()
@@ -266,7 +266,7 @@ def process_simple(lines: list[str]) -> tuple[None, list[tuple[str, str]]]:
                     parts.append("*[image]*")
 
         if parts:
-            conversation.append((role, "\n\n".join(parts)))
+            conversation.append((role, "\n\n".join(parts), None))
 
     return None, conversation
 
@@ -302,9 +302,26 @@ def detect_format(lines: list[str]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def write_markdown(conversation: list[tuple[str, str]], out_path: str, source: str):
+def write_markdown(
+    conversation: list[tuple[str, str, str | None]],
+    out_path: str,
+    source: str,
+    *,
+    source_filename: str | None = None,
+    source_mtime: float | None = None,
+):
     """Write conversation as Markdown, merging consecutive same-role blocks."""
     with open(out_path, "w", encoding="utf-8") as f:
+        # YAML frontmatter for source metadata (sortable, parseable)
+        if source_filename is not None and source_mtime is not None:
+            modified_iso = datetime.fromtimestamp(
+                source_mtime, tz=timezone.utc
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+            f.write("---\n")
+            f.write(f"source: {source_filename}\n")
+            f.write(f"modified: {modified_iso}\n")
+            f.write("---\n\n")
+
         f.write(f"# Conversation: {source}\n\n")
         f.write(
             "*Binary content (base64 images, PDFs) stripped. "
@@ -314,7 +331,7 @@ def write_markdown(conversation: list[tuple[str, str]], out_path: str, source: s
         f.write("---\n\n")
 
         prev_role = None
-        for i, (role, text) in enumerate(conversation):
+        for i, (role, text, timestamp) in enumerate(conversation):
             if role != prev_role:
                 if i > 0:
                     f.write("---\n\n")
@@ -324,6 +341,8 @@ def write_markdown(conversation: list[tuple[str, str]], out_path: str, source: s
                     f.write("## Assistant\n\n")
                 else:
                     f.write(f"## {role}\n\n")
+                if timestamp:
+                    f.write(f"*{timestamp}*\n\n")
             f.write(text + "\n\n")
             prev_role = role
 
@@ -354,7 +373,15 @@ def convert_file(jsonl_path: str, out_path: str | None = None) -> str:
         title, conversation = process_claude_code(lines)
 
     source = title or p.stem
-    write_markdown(conversation, out_path, source)
+    source_mtime = os.path.getmtime(jsonl_path)
+    write_markdown(
+        conversation,
+        out_path,
+        source,
+        source_filename=p.name,
+        source_mtime=source_mtime,
+    )
+    os.utime(out_path, (source_mtime, source_mtime))
 
     in_size = os.path.getsize(jsonl_path)
     out_size = os.path.getsize(out_path)
