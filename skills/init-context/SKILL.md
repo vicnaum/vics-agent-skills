@@ -1,6 +1,6 @@
 ---
 name: init-context
-description: Build a complete mental map of a project through phased exploration so you can work effectively without rediscovering things. Use when the user wants to: (1) Onboard onto a new or unfamiliar codebase, (2) Get a full project overview or briefing, (3) Understand project architecture, structure, and open work, (4) Initialize context at the start of a deep work session, (5) Explore and summarize a repository end-to-end. Triggers on requests like "explore this repo", "get familiar with this project", "give me a project overview", "onboard me", "init context", or any request to deeply understand a codebase before working on it.
+description: "Build a complete mental map of a project through phased exploration so you can work effectively without rediscovering things. Use when the user wants to: (1) Onboard onto a new or unfamiliar codebase, (2) Get a full project overview or briefing, (3) Understand project architecture, structure, and open work, (4) Initialize context at the start of a deep work session, (5) Explore and summarize a repository end-to-end. Triggers on requests like \"explore this repo\", \"get familiar with this project\", \"give me a project overview\", \"onboard me\", \"init context\", or any request to deeply understand a codebase before working on it."
 ---
 
 Build a complete mental map of this project so you can work effectively without rediscovering things. Follow these phases:
