@@ -100,9 +100,11 @@ Then just copy the prompt into a big model and get the answer back to the Agent 
 
 ### [ai-conversation-extractor](skills/ai-conversation-extractor/SKILL.md)
 
-Convert Claude Code conversation JSONL transcripts (from `~/.claude/projects/`) to clean, readable Markdown. Strips binary blobs (base64 images, PDFs — typically 95%+ of file size) while preserving the full human-readable conversation: user messages, assistant text, thinking, tool calls, and tool results.
+Convert AI conversation JSONL transcripts (Claude Code, Codex CLI, ChatGPT/Gemini) to clean, readable Markdown. Strips binary blobs (base64 images, PDFs — typically 95%+ of file size) while preserving the full human-readable conversation: user messages, assistant text, thinking, tool calls, and tool results.
 
-Includes a detailed [JSONL format reference](skills/ai-conversation-extractor/scripts/README.md) documenting all Claude Code record types, content blocks, and the `~/.claude/` folder structure.
+Supports four auto-detected formats: **Claude Code** sessions (`~/.claude/`), **Codex CLI** sessions (`~/.codex/`), **Codex history** prompt logs, and **ChatGPT/Gemini** simple exports. Also includes a messages-only mode (`--ua-final-only`) that keeps just user prompts and final assistant responses — useful for clean conversation summaries.
+
+Includes a detailed [JSONL format reference](skills/ai-conversation-extractor/scripts/README.md) documenting record types, content blocks, and folder structures.
 
 > No external dependencies — uses only Python 3.12+ stdlib.
 
@@ -112,10 +114,18 @@ Includes a detailed [JSONL format reference](skills/ai-conversation-extractor/sc
 Convert my Claude Code conversations in docs/conversations/ to readable Markdown
 ```
 
+```
+Convert my Codex sessions to messages-only Markdown in ./converted/
+```
+
 #### Example usage
 
 ```bash
+# Full conversion (all formats auto-detected)
 python3 <skill-dir>/scripts/extract.py docs/conversations/ --recursive
+
+# Messages-only view to a specific output directory
+python3 <skill-dir>/scripts/extract.py ~/.codex/sessions/ --out-dir ./converted/ --ua-final-only
 ```
 
 Converts a 34MB JSONL transcript to ~670KB of readable Markdown (1.7% of original).
