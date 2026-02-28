@@ -64,10 +64,11 @@ def truncate(text: str, max_len: int = 4000, label: str = "text") -> str:
 # ---------------------------------------------------------------------------
 
 
-def process_claude_code(lines: list[str]) -> tuple[str | None, list[tuple[str, str, str | None]]]:
+def process_claude_code(lines: list[str], *, messages_only: bool = False) -> tuple[str | None, list[tuple[str, str, str | None]]]:
     """Parse Claude Code JSONL (envelope with type/message/toolUseResult).
 
     Returns (summary_title, conversation) where conversation is (role, text, timestamp).
+    When messages_only=True, skips tool_use, tool_result, and thinking blocks — keeps only text.
     """
     conversation: list[tuple[str, str, str | None]] = []
     summary_title: str | None = None
@@ -106,9 +107,9 @@ def process_claude_code(lines: list[str]) -> tuple[str | None, list[tuple[str, s
         parts: list[str] = []
 
         if role == "assistant":
-            parts = _extract_assistant_parts(content)
+            parts = _extract_assistant_parts(content, messages_only=messages_only)
         elif role == "user":
-            parts = _extract_user_parts(content)
+            parts = _extract_user_parts(content, messages_only=messages_only)
 
         if parts:
             conversation.append((role, "\n\n".join(parts), timestamp))
@@ -116,7 +117,7 @@ def process_claude_code(lines: list[str]) -> tuple[str | None, list[tuple[str, s
     return summary_title, conversation
 
 
-def _extract_assistant_parts(content) -> list[str]:
+def _extract_assistant_parts(content, *, messages_only: bool = False) -> list[str]:
     parts: list[str] = []
     if isinstance(content, str):
         t = strip_system_reminders(content).strip()
@@ -137,7 +138,7 @@ def _extract_assistant_parts(content) -> list[str]:
             if t:
                 parts.append(t)
 
-        elif bt == "thinking":
+        elif bt == "thinking" and not messages_only:
             t = block.get("thinking", "").strip()
             if t:
                 t = truncate(t, 3000, "thinking")
@@ -145,7 +146,7 @@ def _extract_assistant_parts(content) -> list[str]:
                     f"<details><summary>Thinking</summary>\n\n{t}\n\n</details>"
                 )
 
-        elif bt == "tool_use":
+        elif bt == "tool_use" and not messages_only:
             name = block.get("name", "?")
             inp = block.get("input", {})
             inp_str = json.dumps(inp, indent=2, ensure_ascii=False)
@@ -155,7 +156,7 @@ def _extract_assistant_parts(content) -> list[str]:
     return parts
 
 
-def _extract_user_parts(content) -> list[str]:
+def _extract_user_parts(content, *, messages_only: bool = False) -> list[str]:
     parts: list[str] = []
     if isinstance(content, str):
         t = strip_system_reminders(content).strip()
@@ -176,11 +177,11 @@ def _extract_user_parts(content) -> list[str]:
             if t:
                 parts.append(t)
 
-        elif bt == "image":
+        elif bt == "image" and not messages_only:
             media = block.get("source", {}).get("media_type", "image")
             parts.append(f"*[image: {media}]*")
 
-        elif bt == "document":
+        elif bt == "document" and not messages_only:
             source = block.get("source", {})
             media = source.get("media_type", "?")
             if source.get("type") == "base64":
@@ -188,7 +189,7 @@ def _extract_user_parts(content) -> list[str]:
             else:
                 parts.append("*[document block]*")
 
-        elif bt == "tool_result":
+        elif bt == "tool_result" and not messages_only:
             tid = block.get("tool_use_id", "")[:12]
             sub = block.get("content", "")
             is_err = block.get("is_error", False)
@@ -584,12 +585,12 @@ def convert_file(
     elif fmt == "codex_history":
         title, conversation = process_codex_history(lines)
     elif fmt == "claude_code":
-        title, conversation = process_claude_code(lines)
+        title, conversation = process_claude_code(lines, messages_only=ua_final_only)
     elif fmt == "simple":
         title, conversation = process_simple(lines)
     else:
         print(f"  WARNING: Unknown format in {jsonl_path}, trying Claude Code parser")
-        title, conversation = process_claude_code(lines)
+        title, conversation = process_claude_code(lines, messages_only=ua_final_only)
 
     source = title or p.stem
     source_mtime = os.path.getmtime(jsonl_path)
