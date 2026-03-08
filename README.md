@@ -98,6 +98,55 @@ Once you paste the Gemini output, I’ll manually verify the claims in the codeb
 
 Then just copy the prompt into a big model and get the answer back to the Agent for verification.
 
+### [init-context](skills/init-context/SKILL.md)
+
+Build a complete mental map of a project through phased exploration. The agent reads root-level docs, spawns sub-agents to explore major source directories / tests / CI / GitHub history in parallel, fills gaps, and synthesizes a full project briefing — architecture, open work, developer guide, and a "where to find things" quick reference.
+
+After this runs, the agent has full project context and shouldn't need to rediscover anything.
+
+#### Example ask
+
+```
+Explore this repo and give me a full briefing
+```
+
+```
+Init context — I want to start a deep work session on this codebase
+```
+
+### [session-stripper](skills/session-stripper/SKILL.md)
+
+CLI tool for trimming Claude Code JSONL sessions that hit "Prompt is too long". Strips tool content (60%+ of context), thinking blocks, images — or persists them to files with AI-generated summaries. 12 commands, no external dependencies (Python 3.8+ stdlib only).
+
+Full technical deep-dive in [references/surgery-report.md](skills/session-stripper/references/surgery-report.md).
+
+#### Commands
+
+| Command | What it does |
+|---------|-------------|
+| `analyze` | Token breakdown by type and tool name, cut points, health check |
+| `strip-tools` | Clear tool inputs/results (granular: by tool name, inputs/results only, keep last N lines) |
+| `strip-thinking` | Remove thinking blocks |
+| `strip-all` | Strip tools + thinking in one pass |
+| `compact` | Summarize early messages behind compact boundary, keep recent work intact |
+| `verify` | Chain integrity check (parentUuid, slug, timestamps) |
+| `show-tool` | List or inspect individual tool calls with context |
+| `persist-tool` | Save tool result to file, replace with summary + reference |
+| `persist-tools` | Bulk persist (like microcompact, keeps last 3 intact) |
+| `show-thinking` | List or inspect individual thinking blocks with context |
+| `persist-thinking` | Save thinking to file, replace with summary |
+| `persist-thinkings` | Bulk persist all thinking blocks |
+
+#### Example ask
+
+```
+My session is hitting "Prompt is too long" — help me strip it
+```
+
+```
+Analyze this session and tell me where the tokens are going
+```
+
 ### [ai-conversation-extractor](skills/ai-conversation-extractor/SKILL.md)
 
 Convert AI conversation JSONL transcripts (Claude Code, Codex CLI, ChatGPT/Gemini) to clean, readable Markdown. Strips binary blobs (base64 images, PDFs — typically 95%+ of file size) while preserving the full human-readable conversation: user messages, assistant text, thinking, tool calls, and tool results.
