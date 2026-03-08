@@ -116,6 +116,61 @@ Init context — I want to start a deep work session on this codebase
 
 ### [session-stripper](skills/session-stripper/SKILL.md)
 
+```
+             ....
+           .::::::::..
+         .::: ::::'::::
+         ,::::::'  `::::
+         :: :::     `:::.
+        .:::::_     _::::
+       .:::::  `  -' ::::
+      .::: :'-o-  -o-::::.
+      ::: ::         |:.::
+      ::::::     >   |::.:.
+      `: :::     __   :::.:
+      .:::::\   --' / :::::.
+      ::: :: `-._.-. .::::::
+     .::::::      | . :::.::
+     ;:.::::.     |. .:::.::.
+   _.::.:::::     | `..:::.::
+  /.;::.: :::-._  \  :::::::'
+ / ::::. :::.        ::::.::
+.  :::::.::::.       `:::....
+|  :::.:.:::::        :::::::
+|  ::::::.:.:.         `::.::
+|  `:.: ::::::.         .::::.
+`.  ::::::::.::        .:.:::.
+ | ::: :::::::'       .::;:::'
+ | `:: :::.:::  '     ::::.::
+ |  `::: :..:: /   \  :: ::::
+ |   `::::::::/     \ ::.::::
+ |    `::::::::      `-`:::::::'
+ |    ||     ``           | ``'
+ |    |`                  |\
+ `.   | \                 \ \
+  |  _|  \                 \ `-
+  |   \   \                 \  `\
+  |    \  |                  \   \
+  `.   |  |                   >-  \
+   |   `  |        o)        /_    )
+   `    | /                 |/ |   |
+    \   | |                    ||| |
+        ` |                   //////
+     \   ||                _-//////\
+      .  `|              .'  \//// .
+      `   \        ___.-'    /`-'  |
+       \   \`-----'         /      |
+       `    \_     :F_P:   /       |
+        \     `\ _        /        |
+         \    <\\ `-__.-|'        .'
+        / \    \\>  |   `.        |
+       /  |   . \   '    |        |
+      /   \\ \ \ \ /     |        |
+           \\ \ -//      `.       |
+     /      '`-.//        |       |
+    /           /         |       |
+```
+
 CLI tool for trimming Claude Code JSONL sessions that hit "Prompt is too long". Strips tool content (60%+ of context), thinking blocks, images — or persists them to files with AI-generated summaries. 12 commands, no external dependencies (Python 3.8+ stdlib only).
 
 Full technical deep-dive in [references/surgery-report.md](skills/session-stripper/references/surgery-report.md).
