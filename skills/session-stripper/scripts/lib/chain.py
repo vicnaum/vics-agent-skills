@@ -71,10 +71,9 @@ def resolve_range(chain, from_pos=None, to_pos=None):
 def save_session(path, objects, create_backup=True):
     """Write all objects as JSONL. Optionally create a .bak backup first."""
     path = Path(path).expanduser()
-    if create_backup:
+    if create_backup and path.exists():
         bak = path.with_suffix(path.suffix + ".bak")
-        if not bak.exists() and path.exists():
-            shutil.copy2(path, bak)
+        shutil.copy2(path, bak)
     with open(path, "w", encoding="utf-8") as f:
         for obj in objects:
             f.write(json.dumps(obj, ensure_ascii=False) + "\n")

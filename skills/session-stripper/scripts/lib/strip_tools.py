@@ -61,6 +61,8 @@ def _content_char_count(content):
 
 def _keep_last_lines(text, n):
     """Keep only the last N lines of a text string."""
+    if n <= 0:
+        return ""
     lines = text.split("\n")
     if len(lines) <= n:
         return text
@@ -176,6 +178,10 @@ def strip_tools(session_path, dry_run=False, no_backup=False,
                 result_content = block.get("content")
                 old_chars = _content_char_count(result_content)
 
+                # When is_error is true, the Anthropic API requires non-empty content.
+                # Use a placeholder instead of "" to avoid 400 errors on resume.
+                empty_replacement = "(stripped)" if block.get("is_error") else ""
+
                 if keep_last_lines is not None:
                     # Preserve last N lines
                     if isinstance(result_content, str):
@@ -189,9 +195,19 @@ def strip_tools(session_path, dry_run=False, no_backup=False,
                             new_items.append(item)
                         block["content"] = new_items
                     else:
-                        block["content"] = ""
+                        block["content"] = empty_replacement
                 else:
-                    block["content"] = ""
+                    block["content"] = empty_replacement
+
+                # Guard: is_error requires non-empty content after any transformation.
+                # A list of all-empty text blocks is truthy but semantically empty.
+                if block.get("is_error"):
+                    c = block["content"]
+                    if not c or (isinstance(c, list) and not any(
+                        (item.get("text") or "").strip()
+                        for item in c if isinstance(item, dict)
+                    )):
+                        block["content"] = "(stripped)"
 
                 new_chars = _content_char_count(block["content"])
                 saved = max(0, old_chars - new_chars)
