@@ -7,6 +7,8 @@ description: "Manually trim, compact, persist, and repair Claude Code conversati
 
 CLI tool for trimming Claude Code JSONL sessions. Sessions live at `~/.claude/projects/<project-path>/<uuid>.jsonl`.
 
+**Important: After stripping, you must exit and resume the session.** Claude Code holds the conversation in memory and reloads from JSONL only on startup. Run the strip, then exit (`/exit`) and resume with `claude --resume <session-id>` for the changes to take effect.
+
 ## Quick Reference
 
 Run scripts from `<skill-dir>/scripts/`:
@@ -120,7 +122,7 @@ Output is a new session file. Resume with `claude -r <session-id>`.
 - Tool content is the #1 context consumer (~60% typical)
 - Thinking blocks are sent to API and count in client-side estimates -- always strip them
 - `formatTranscript()` only strips orphaned (thinking-only messages) and trailing (last message) thinking -- the rest survives
-- Backups are created automatically as `.bak` files
+- Backups (`.bak`) are created on each in-place save, overwriting any previous backup
 - No external dependencies -- Python 3.8+ stdlib only
 
 For the full technical deep-dive, see [references/surgery-report.md](references/surgery-report.md).
