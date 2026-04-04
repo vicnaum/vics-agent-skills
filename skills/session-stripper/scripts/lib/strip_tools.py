@@ -175,11 +175,14 @@ def strip_tools(session_path, dry_run=False, no_backup=False,
 
                 result_content = block.get("content")
                 old_chars = _content_char_count(result_content)
+                is_error = block.get("is_error", False)
+                # API requires non-empty content when is_error=true
+                empty_placeholder = "[stripped]" if is_error else ""
 
                 if keep_last_lines is not None:
                     # Preserve last N lines
                     if isinstance(result_content, str):
-                        block["content"] = _keep_last_lines(result_content, keep_last_lines)
+                        block["content"] = _keep_last_lines(result_content, keep_last_lines) or empty_placeholder
                     elif isinstance(result_content, list):
                         new_items = []
                         for item in result_content:
@@ -187,11 +190,11 @@ def strip_tools(session_path, dry_run=False, no_backup=False,
                                 item = dict(item)
                                 item["text"] = _keep_last_lines(item.get("text", ""), keep_last_lines)
                             new_items.append(item)
-                        block["content"] = new_items
+                        block["content"] = new_items or empty_placeholder
                     else:
-                        block["content"] = ""
+                        block["content"] = empty_placeholder
                 else:
-                    block["content"] = ""
+                    block["content"] = empty_placeholder
 
                 new_chars = _content_char_count(block["content"])
                 saved = max(0, old_chars - new_chars)
