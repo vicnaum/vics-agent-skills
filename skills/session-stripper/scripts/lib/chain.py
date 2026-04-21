@@ -68,6 +68,49 @@ def resolve_range(chain, from_pos=None, to_pos=None):
     return (start, end)
 
 
+def remove_objects_and_rewire(objects, uuids_to_remove):
+    """Remove objects by uuid and rewire parentUuid on descendants to skip them.
+
+    When a message is dropped, any child pointing to it is re-parented to the
+    nearest surviving ancestor (walking up parentUuid). This keeps the active
+    chain unbroken so the API doesn't see dangling references.
+
+    Returns:
+        (survivors, removed_count, rewired_count)
+    """
+    uuids_to_remove = set(u for u in uuids_to_remove if u is not None)
+    if not uuids_to_remove:
+        return objects, 0, 0
+
+    uuid_to_obj = {obj.get("uuid"): obj for obj in objects if obj.get("uuid")}
+
+    def find_surviving_ancestor(uuid):
+        seen = set()
+        cur = uuid
+        while cur is not None and cur in uuids_to_remove:
+            if cur in seen:
+                return None
+            seen.add(cur)
+            obj = uuid_to_obj.get(cur)
+            if obj is None:
+                return None
+            cur = obj.get("parentUuid")
+        return cur
+
+    survivors = []
+    rewired = 0
+    for obj in objects:
+        if obj.get("uuid") in uuids_to_remove:
+            continue
+        p = obj.get("parentUuid")
+        if p in uuids_to_remove:
+            obj["parentUuid"] = find_surviving_ancestor(p)
+            rewired += 1
+        survivors.append(obj)
+
+    return survivors, len(uuids_to_remove), rewired
+
+
 def save_session(path, objects, create_backup=True):
     """Write all objects as JSONL. Optionally create a .bak backup first."""
     path = Path(path).expanduser()

@@ -193,6 +193,12 @@ def strip_tools(session_path, dry_run=False, no_backup=False,
                 else:
                     block["content"] = ""
 
+                # Drop is_error when content is empty — the API rejects
+                # tool_result with is_error=true and empty content. Once we've
+                # cleared the error message itself, the error flag is meaningless.
+                if block.get("is_error") is True and not block.get("content"):
+                    block.pop("is_error", None)
+
                 new_chars = _content_char_count(block["content"])
                 saved = max(0, old_chars - new_chars)
 

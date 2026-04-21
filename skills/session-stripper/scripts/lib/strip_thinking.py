@@ -1,6 +1,6 @@
 """Strip thinking and redacted_thinking blocks from Claude Code JSONL sessions."""
 
-from .chain import load_session, build_uuid_index, walk_active_chain, resolve_range, save_session, estimate_tokens
+from .chain import load_session, build_uuid_index, walk_active_chain, resolve_range, save_session, estimate_tokens, remove_objects_and_rewire
 
 
 def strip_thinking(session_path, dry_run=False, no_backup=False, from_pos=None, to_pos=None):
@@ -32,6 +32,7 @@ def strip_thinking(session_path, dry_run=False, no_backup=False, from_pos=None, 
     thinking_cleared = 0
     messages_affected = 0
     chars_saved = 0
+    uuids_to_drop = set()
 
     for obj in objects:
         if obj.get("type") != "assistant":
@@ -67,8 +68,18 @@ def strip_thinking(session_path, dry_run=False, no_backup=False, from_pos=None, 
         if msg_modified:
             messages_affected += 1
             if not new_content:
-                new_content = [{"type": "text", "text": ""}]
-            obj["message"]["content"] = new_content
+                # Thinking-only message: drop it entirely and rewire parentUuid.
+                # Leaving an empty {"type":"text","text":""} breaks the API
+                # ("text content blocks must be non-empty").
+                if uid is not None:
+                    uuids_to_drop.add(uid)
+            else:
+                obj["message"]["content"] = new_content
+
+    messages_removed = 0
+    parents_rewired = 0
+    if uuids_to_drop:
+        objects, messages_removed, parents_rewired = remove_objects_and_rewire(objects, uuids_to_drop)
 
     if not dry_run:
         save_session(session_path, objects, create_backup=not no_backup)
@@ -78,6 +89,8 @@ def strip_thinking(session_path, dry_run=False, no_backup=False, from_pos=None, 
     stats = {
         "thinking_cleared": thinking_cleared,
         "messages_affected": messages_affected,
+        "messages_removed": messages_removed,
+        "parents_rewired": parents_rewired,
         "chars_saved": chars_saved,
         "est_tokens_saved": est_tokens_saved,
     }
@@ -86,6 +99,8 @@ def strip_thinking(session_path, dry_run=False, no_backup=False, from_pos=None, 
     mode = "[DRY RUN] " if dry_run else ""
     print(f"{mode}Thinking blocks removed: {thinking_cleared}")
     print(f"{mode}Messages affected: {messages_affected}")
+    if messages_removed:
+        print(f"{mode}Thinking-only messages dropped: {messages_removed} (parentUuid rewired on {parents_rewired} descendants)")
     print(f"{mode}Characters saved: {chars_saved:,}")
     print(f"{mode}Estimated tokens saved: {est_tokens_saved:,}")
 
