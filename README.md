@@ -240,7 +240,7 @@ Export a claude.ai (Claude Desktop / web) conversation and convert it to a Claud
 
 claude.ai chats aren't resumable — once you hit the context limit or close the tab, the conversation is read-only. Claude Code CLI stores every session as JSONL at `~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl` and resumes on demand. Same underlying model; only the harness (system prompt, tools, output length) differs.
 
-The skill walks you through: (1) grabbing `conversation.json` + images from the browser console at claude.ai, (2) organizing them locally, (3) running `scripts/convert_to_cli.py` to produce a CC-compatible JSONL, (4) resuming with `claude -r <uuid>`.
+The skill walks you through: (1) grabbing `conversation.json` + images from the browser console at claude.ai (or via the `claude-in-chrome` MCP + bundled `scripts/relay_server.py`), (2) organizing them locally, (3) running `scripts/convert_to_cli.py` to produce a CC-compatible JSONL, (4) resuming with `claude -r <uuid>`.
 
 > No external Python dependencies — stdlib only (Python 3.10+).
 
