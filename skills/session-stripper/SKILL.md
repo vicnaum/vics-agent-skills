@@ -120,6 +120,7 @@ Output is a new session file. Resume with `claude -r <session-id>`.
 - Tool content is the #1 context consumer (~60% typical)
 - Thinking blocks are sent to API and count in client-side estimates -- always strip them
 - `formatTranscript()` only strips orphaned (thinking-only messages) and trailing (last message) thinking -- the rest survives
+- **Wrapped thinking is auto-detected.** Any text block whose whole content is a single `<thinking>…</thinking>` or `<think>…</think>` span (e.g. from `convert_to_cli.py --flatten-thinking`, or from open-source models that emit `<think>` tags) is treated as a real thinking block by `analyze`, `show-thinking`, `strip-thinking`, `strip-all`, and `persist-thinking`. No flag needed.
 - Backups are created automatically as `.bak` files
 - No external dependencies -- Python 3.8+ stdlib only
 

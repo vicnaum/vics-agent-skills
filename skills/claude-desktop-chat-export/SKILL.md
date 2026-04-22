@@ -161,6 +161,7 @@ No external Python dependencies — stdlib only (Python 3.10+).
 | `--version VERSION` | `2.1.114` | CC version stamped on envelopes |
 | `--git-branch NAME` | `master` | `gitBranch` field |
 | `--keep-tools` | off | Keep `tool_use`/`tool_result` blocks. Default flattens them to text (see limitations) |
+| `--flatten-thinking` | off | Preserve thinking as `<thinking>…</thinking>` text blocks instead of dropping. Signature-free, so no resume failures. Strippable later via `session-stripper strip-thinking` (detects the wrappers automatically) |
 | `--out PATH` | default path | Override output location |
 | `--dry-run` | off | Report summary but don't write |
 
@@ -168,7 +169,7 @@ No external Python dependencies — stdlib only (Python 3.10+).
 
 **Tools flattened by default.** claude.ai tool names (`view`, `web_fetch`, `bash_tool`, …) collide with CC's declared tool names (`Read`, `Bash`, …). Resuming with raw tool blocks produces API errors. The default `--keep-tools off` flattens them to readable text so the model retains context of what was looked up. Only pass `--keep-tools` if you know what you're doing.
 
-**Thinking blocks dropped.** Their cryptographic signatures are tied to the original API context and don't transfer. Text is still readable in the original `conversation.json` or any Markdown transcript.
+**Thinking blocks dropped by default.** Their cryptographic signatures are tied to the original API context and don't transfer, so keeping them as structural `thinking` blocks triggers `"Invalid signature in thinking block"` on resume. Pass `--flatten-thinking` to preserve thinking as plain `<thinking>…</thinking>` text blocks — no signatures, no resume failures, model reads it as ordinary context. Later, `session-stripper strip-thinking` detects these wrappers and can clear them without re-converting. Otherwise, the raw thinking text is still readable in `conversation.json`.
 
 **UUIDs regenerate on every converter run.** Only `sessionId` is stable (via `--session-id`). If a CC session for this conversation is currently open, **quit CC before re-running the converter** — otherwise CC's in-memory state points to deleted UUIDs and the chain breaks silently.
 

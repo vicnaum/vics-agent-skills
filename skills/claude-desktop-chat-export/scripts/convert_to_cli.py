@@ -155,7 +155,11 @@ def _flatten_tool_result_to_text(b: dict) -> str:
     return f"[tool result{err}]\n{body}"
 
 
-def split_assistant_blocks(blocks: list[dict], flatten_tools: bool = True) -> list[tuple[str, list[dict]]]:
+def split_assistant_blocks(
+    blocks: list[dict],
+    flatten_tools: bool = True,
+    flatten_thinking: bool = False,
+) -> list[tuple[str, list[dict]]]:
     """Split claude.ai interleaved assistant blocks into API-shape turns.
 
     Claude.ai packs [thinking, text, tool_use, tool_result, thinking, tool_use,
@@ -239,8 +243,20 @@ def split_assistant_blocks(blocks: list[dict], flatten_tools: bool = True) -> li
             elif bt == "thinking":
                 # Thinking block signatures are cryptographic HMACs tied to the
                 # original API context (claude.ai); they won't validate in a CC
-                # resume. Drop the block entirely. If you want to preserve the
-                # thinking text for posterity, it's still in conversation.md.
+                # resume. Two options:
+                #   flatten_thinking=False (default): drop the block entirely.
+                #   flatten_thinking=True: emit a plain text block wrapped in
+                #     <thinking>...</thinking>. The text carries no signature,
+                #     so the API accepts it; the model reads it as ordinary
+                #     context. session-stripper recognizes whole-block wraps
+                #     and can strip them later without re-converting.
+                if flatten_thinking:
+                    txt = b.get("thinking", "")
+                    if txt:
+                        buf.append({
+                            "type": "text",
+                            "text": f"<thinking>\n{txt}\n</thinking>",
+                        })
                 continue
             elif bt == "tool_use":
                 buf.append({
@@ -313,6 +329,7 @@ def convert(
     dry_run: bool,
     session_id_override: str | None = None,
     flatten_tools: bool = True,
+    flatten_thinking: bool = False,
 ) -> Path:
     data = load_conversation(conv_path)
     model = data.get("model") or "claude-opus-4-6"
@@ -349,7 +366,11 @@ def convert(
             last_ts = ts
 
         elif sender == "assistant":
-            turns = split_assistant_blocks(m.get("content") or [], flatten_tools=flatten_tools)
+            turns = split_assistant_blocks(
+                m.get("content") or [],
+                flatten_tools=flatten_tools,
+                flatten_thinking=flatten_thinking,
+            )
             for j, (role, blocks) in enumerate(turns):
                 # each sub-turn gets its own ms-bumped timestamp to keep order
                 sub_ts = ts + timedelta(milliseconds=j)
@@ -431,6 +452,12 @@ def main() -> int:
                          "them into text blocks because claude.ai's tool names (view, "
                          "web_fetch, bash_tool, ...) are unknown to CC and cause the API "
                          "to reject the resumed conversation.")
+    ap.add_argument("--flatten-thinking", action="store_true",
+                    help="Preserve thinking blocks by flattening them into <thinking>...</thinking> "
+                         "text blocks. Default drops thinking because the HMAC signatures tying "
+                         "each block to its original API context won't validate in a CC resume. "
+                         "Flattened thinking is signature-free and readable as context; "
+                         "session-stripper recognizes the wrappers and can strip them later.")
     ap.add_argument("--dry-run", action="store_true", help="Print summary but don't write.")
     args = ap.parse_args()
 
@@ -458,6 +485,7 @@ def main() -> int:
         dry_run=args.dry_run,
         session_id_override=args.session_id,
         flatten_tools=not args.keep_tools,
+        flatten_thinking=args.flatten_thinking,
     )
     return 0
 

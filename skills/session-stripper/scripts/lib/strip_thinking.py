@@ -1,6 +1,15 @@
 """Strip thinking and redacted_thinking blocks from Claude Code JSONL sessions."""
 
-from .chain import load_session, build_uuid_index, walk_active_chain, resolve_range, save_session, estimate_tokens, remove_objects_and_rewire
+from .chain import (
+    build_uuid_index,
+    estimate_tokens,
+    load_session,
+    remove_objects_and_rewire,
+    resolve_range,
+    save_session,
+    walk_active_chain,
+    wrapped_thinking_text,
+)
 
 
 def strip_thinking(session_path, dry_run=False, no_backup=False, from_pos=None, to_pos=None):
@@ -54,12 +63,20 @@ def strip_thinking(session_path, dry_run=False, no_backup=False, from_pos=None, 
                 continue
 
             block_type = block.get("type")
+            wrapped = wrapped_thinking_text(block)
             if block_type in ("thinking", "redacted_thinking"):
                 # Count chars from the text payload
                 if block_type == "thinking":
                     chars_saved += len(block.get("thinking", ""))
                 elif block_type == "redacted_thinking":
                     chars_saved += len(block.get("data", ""))
+                thinking_cleared += 1
+                msg_modified = True
+            elif wrapped is not None:
+                # Whole-block <thinking>/<think> text wrap (from
+                # convert_to_cli.py --flatten-thinking or open-source models
+                # using <think>). Treat same as a real thinking block.
+                chars_saved += len(block.get("text", ""))
                 thinking_cleared += 1
                 msg_modified = True
             else:

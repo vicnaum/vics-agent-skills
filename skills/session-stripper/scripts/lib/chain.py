@@ -1,8 +1,40 @@
 """Core functions for parsing and manipulating Claude Code JSONL session files."""
 
 import json
+import re
 import shutil
 from pathlib import Path
+
+
+# Matches a text block whose entire content (modulo surrounding whitespace) is a
+# single <thinking>...</thinking> or <think>...</think> span. Used to detect
+# "flattened" thinking blocks emitted by convert_to_cli.py --flatten-thinking
+# and by open-source models that use <think> tags.
+#
+# Intentionally conservative: only whole-block wraps match. Embedded wrapped
+# thinking inside a larger text block is not auto-detected (it would require
+# in-place span edits which complicate semantics).
+WRAPPED_THINKING_RE = re.compile(
+    r"^\s*<(thinking|think)\b[^>]*>(.*?)</\1>\s*$",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def wrapped_thinking_text(block):
+    """If `block` is a text block wrapping thinking in <thinking>/<think> tags,
+    return the inner text. Otherwise return None.
+    """
+    if not isinstance(block, dict):
+        return None
+    if block.get("type") != "text":
+        return None
+    text = block.get("text", "")
+    if not isinstance(text, str):
+        return None
+    m = WRAPPED_THINKING_RE.match(text)
+    if not m:
+        return None
+    return m.group(2)
 
 
 def load_session(path):
@@ -172,7 +204,11 @@ def count_content_chars(obj):
                 block_type = block.get("type", "other")
                 block_text = json.dumps(block, ensure_ascii=False)
                 char_count = len(block_text)
-                if block_type in counts:
+                if block_type == "text" and wrapped_thinking_text(block) is not None:
+                    # Attribute wrapped <thinking>/<think> text blocks to the
+                    # thinking bucket so they show up in analyze() output.
+                    counts["thinking"] += char_count
+                elif block_type in counts:
                     counts[block_type] += char_count
                 else:
                     counts["other"] += char_count

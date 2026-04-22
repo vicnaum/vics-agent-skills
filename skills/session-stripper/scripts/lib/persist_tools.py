@@ -3,7 +3,15 @@
 import json
 from pathlib import Path
 
-from .chain import load_session, build_uuid_index, walk_active_chain, resolve_range, save_session, estimate_tokens
+from .chain import (
+    build_uuid_index,
+    estimate_tokens,
+    load_session,
+    resolve_range,
+    save_session,
+    walk_active_chain,
+    wrapped_thinking_text,
+)
 
 
 def _get_content(obj):
@@ -530,9 +538,20 @@ def persist_tools_bulk(session_path, dry_run=False, no_backup=False,
 
 
 def _extract_thinking_blocks(content):
-    """Extract thinking and redacted_thinking blocks from a content list.
+    """Extract thinking blocks from a content list.
 
-    Returns a list of dicts: {type, text, index} for each thinking block found.
+    Covers three shapes:
+    - Real thinking blocks (`type: "thinking"`) — CC extended-thinking native.
+    - Redacted thinking (`type: "redacted_thinking"`).
+    - Wrapped thinking — text blocks whose entire text is
+      <thinking>...</thinking> or <think>...</think>. These are what
+      convert_to_cli.py emits with --flatten-thinking, and what some
+      open-source models produce natively.
+
+    Returns a list of dicts: {type, text, index} for each thinking block
+    found. The index is the block's position in the content list; on
+    mutation the entire block at that index is deleted (wrapped thinking
+    fills its block by definition).
     """
     blocks = []
     if not isinstance(content, list):
@@ -540,18 +559,27 @@ def _extract_thinking_blocks(content):
     for i, block in enumerate(content):
         if not isinstance(block, dict):
             continue
-        if block.get("type") == "thinking":
+        btype = block.get("type")
+        if btype == "thinking":
             blocks.append({
                 "type": "thinking",
                 "text": block.get("thinking", ""),
                 "index": i,
             })
-        elif block.get("type") == "redacted_thinking":
+        elif btype == "redacted_thinking":
             blocks.append({
                 "type": "redacted_thinking",
                 "text": block.get("data", ""),
                 "index": i,
             })
+        else:
+            wrapped = wrapped_thinking_text(block)
+            if wrapped is not None:
+                blocks.append({
+                    "type": "wrapped_thinking",
+                    "text": wrapped,
+                    "index": i,
+                })
     return blocks
 
 
@@ -564,9 +592,14 @@ def _extract_message_text(content):
         if isinstance(block, str):
             parts.append(block)
         elif isinstance(block, dict):
-            if block.get("type") == "text":
+            btype = block.get("type")
+            if btype == "text":
+                # Skip whole-block <thinking>/<think> wraps — they're thinking,
+                # not message text.
+                if wrapped_thinking_text(block) is not None:
+                    continue
                 parts.append(block.get("text", ""))
-            elif block.get("type") not in ("thinking", "redacted_thinking"):
+            elif btype not in ("thinking", "redacted_thinking"):
                 parts.append(json.dumps(block, ensure_ascii=False))
     return "\n".join(parts)
 
