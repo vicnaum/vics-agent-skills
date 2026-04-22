@@ -234,6 +234,26 @@ python3 <skill-dir>/scripts/extract.py ~/.codex/sessions/ --out-dir ./converted/
 
 Converts a 34MB JSONL transcript to ~670KB of readable Markdown (1.7% of original).
 
+### [claude-desktop-chat-export](skills/claude-desktop-chat-export/SKILL.md)
+
+Export a claude.ai (Claude Desktop / web) conversation and convert it to a Claude Code CLI JSONL session, so it becomes resumable via `claude -r <sessionId>`.
+
+claude.ai chats aren't resumable — once you hit the context limit or close the tab, the conversation is read-only. Claude Code CLI stores every session as JSONL at `~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl` and resumes on demand. Same underlying model; only the harness (system prompt, tools, output length) differs.
+
+The skill walks you through: (1) grabbing `conversation.json` + images from the browser console at claude.ai, (2) organizing them locally, (3) running `scripts/convert_to_cli.py` to produce a CC-compatible JSONL, (4) resuming with `claude -r <uuid>`.
+
+> No external Python dependencies — stdlib only (Python 3.10+).
+
+#### Example ask
+
+```
+I hit the context limit on this claude.ai chat — help me continue it in Claude Code
+```
+
+```
+Export this Claude Desktop conversation and import it into CC
+```
+
 ## Install / use
 
 ### Cursor
