@@ -12,6 +12,7 @@ from lib.strip_tools import strip_tools
 from lib.strip_thinking import strip_thinking
 from lib.compact import compact_before
 from lib.persist_tools import show_tool, persist_tool_result, persist_tools_bulk, show_thinking, persist_thinking, persist_thinking_bulk
+from lib.replace_images import list_images, replace_images
 
 
 def cmd_analyze(args):
@@ -165,6 +166,22 @@ def cmd_persist_thinkings(args):
     )
 
 
+def cmd_list_images(args):
+    """Enumerate image blocks in the active chain with sizes and SHA256 hashes."""
+    list_images(args.session)
+
+
+def cmd_replace_images(args):
+    """Replace image blocks with text transcripts keyed by SHA256."""
+    replace_images(
+        args.session,
+        descriptions_dir=args.dir,
+        dry_run=args.dry_run,
+        no_backup=args.no_backup,
+        drop_missing=args.drop_missing,
+    )
+
+
 def add_common_args(parser):
     """Add common flags shared across subcommands."""
     parser.add_argument("session", help="Path to session JSONL file")
@@ -297,6 +314,30 @@ def main():
     add_common_args(p_persist_thinkings)
     add_range_args(p_persist_thinkings)
     p_persist_thinkings.set_defaults(func=cmd_persist_thinkings)
+
+    # list-images
+    p_list_images = subparsers.add_parser(
+        "list-images",
+        help="List image blocks with SHA256 hashes (active chain)",
+    )
+    p_list_images.add_argument("session", help="Path to session JSONL file")
+    p_list_images.set_defaults(func=cmd_list_images)
+
+    # replace-images
+    p_replace_images = subparsers.add_parser(
+        "replace-images",
+        help="Replace image blocks with text transcripts from <dir>/<sha256>.txt",
+    )
+    add_common_args(p_replace_images)
+    p_replace_images.add_argument(
+        "--dir", required=True,
+        help="Directory containing <sha256>.txt transcripts, one per unique image.",
+    )
+    p_replace_images.add_argument(
+        "--drop-missing", action="store_true",
+        help="If a transcript is missing, drop the image block entirely (default: keep).",
+    )
+    p_replace_images.set_defaults(func=cmd_replace_images)
 
     args = parser.parse_args()
 

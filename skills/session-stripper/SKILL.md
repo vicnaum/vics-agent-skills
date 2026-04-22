@@ -41,6 +41,7 @@ All commands support `--dry-run` (report only) and `--no-backup` (skip .bak). Ra
 | Tool results (`tool_result.content`) | 40-60% of context | `strip-tools --only-results` |
 | Thinking blocks | 10-20% of context | `strip-thinking` |
 | Images | Variable (can be 50%+) | `strip-tools` (auto) |
+| Images → text transcripts | Variable (often 90%+) | `replace-images` |
 | Everything above | 60-90% of context | `strip-all` |
 
 ## Workflow
@@ -101,6 +102,32 @@ python3 <skill-dir>/scripts/stripper.py persist-thinking <session.jsonl> --pos 4
 # Bulk persist all thinking blocks
 python3 <skill-dir>/scripts/stripper.py persist-thinkings <session.jsonl>
 ```
+
+## Image Replacement
+
+Images in CC JSONL are base64-inlined. A 53-image session can be 1M+ tokens of base64 while the *information* in the images is often an order of magnitude smaller (chat screenshots, UIs, memes). `replace-images` swaps each image block for a text block carrying a pre-generated transcript.
+
+Images are keyed by **SHA256 of their decoded bytes** — the same image in two messages hits the same transcript, and identity is unambiguous across any CC session (not tied to claude.ai export formats).
+
+### Workflow
+
+1. Run `list-images` to enumerate all image blocks with their sizes and SHA256 hashes.
+2. Generate one transcript per unique hash (e.g. via Claude Code subagents with Read on the source image files; Claude's vision handles PNG/JPG/WebP natively). Save each as `<transcripts-dir>/<sha256>.txt` (UTF-8).
+3. Run `replace-images --dir <transcripts-dir>` to perform the surgery.
+
+```bash
+# Enumerate
+python3 <skill-dir>/scripts/stripper.py list-images <session.jsonl>
+
+# Replace (dry-run first)
+python3 <skill-dir>/scripts/stripper.py replace-images <session.jsonl> --dir ./image-transcripts --dry-run
+python3 <skill-dir>/scripts/stripper.py replace-images <session.jsonl> --dir ./image-transcripts
+
+# Drop images without a transcript instead of keeping them
+python3 <skill-dir>/scripts/stripper.py replace-images <session.jsonl> --dir ./image-transcripts --drop-missing
+```
+
+Each replaced image becomes a text block: `<image sha256="..." media_type="...">\n{transcript}\n</image>`. Default behavior when a transcript is missing: **keep the original image** (pass `--drop-missing` to drop instead).
 
 ## Compact Operation
 
