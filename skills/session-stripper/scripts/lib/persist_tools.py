@@ -937,7 +937,7 @@ def persist_thinking_bulk(session_path, dry_run=False, no_backup=False,
         if stats["persisted_count"] > 0:
             save_session(session_path, objects, create_backup=not no_backup)
             print(f"\nSession saved: {session_path}")
-            print(f"Thinking saved to: {persist_dir}")
+            print(f"Thinking saved to: {_new_persist_dir(session_path, 'thinking')}")
         else:
             print("\nNo thinking blocks to persist.")
 

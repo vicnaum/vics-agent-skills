@@ -24,7 +24,27 @@ This file logs the manual run.
 
 | Date | Marker schema version | Result | Notes |
 |---|---|---|---|
-| _pending_ | _pending_ | _pending_ | Run after persist-everything implementation lands. |
+| 2026-04-24 | persist-everything v1 (`<persisted-{kind}>` with `Saved to: PATH (N chars)\nSummary: ...\n\nPreview:\n...`) | ✅ PASS | See verification summary below. |
+
+## 2026-04-24 verification summary
+
+Performed against the b856d033 live session, copied to `/tmp/manual-verify.jsonl` (no live mutation).
+
+**Test 1: persist-message single — round-trip integrity**
+- Ran `persist-message --pos 47 --summary "Audit 3-issues update advice — post-the-update + Stani DM angle"`
+- Marker emitted at pos 47 with: relative path `b856d033-.../persisted/message/6a4668fc-...json`, size `2650 chars`, summary, preview of first ~1KB.
+- Path resolved against project dir using the documented `Saved to:\s*(\S+)` regex → absolute path existed.
+- Read-tool fetched the sidecar JSON; both text blocks (67 + 1930 chars) byte-identical to pre-persist capture. **ROUND-TRIP: PASS.**
+
+**Test 2: persist-range over a chunk — multi-kind dispatch**
+- Ran `persist-range --from 0 --to 90 --kinds text,thinking --min-chars 500`
+- 93 text + 43 thinking blocks persisted; 154,057 chars saved (~38K tokens).
+- Chain integrity check: PASS (129 messages, parentUuid unbroken, slug consistent, timestamps monotonic).
+- Sampled a thinking marker at pos 47 → resolved to `<sessionId>/persisted/thinking/<msg-uuid>.txt` → file existed → contents matched the original thinking text.
+
+**Caveat / fix**: Initial run of persist-range printed a stale "Thinking saved to: /tmp/.tool-results" line — leftover from the pre-PR `persist_dir` variable. Files actually went to the new location (verified by manual path resolution). Patched the print to use `_new_persist_dir(session_path, 'thinking')`. All 48 tests still green.
+
+**Conclusion**: The marker contract works end-to-end. A model on resume that follows the documented regex (or any reasonable extraction) finds the path, the path resolves, the sidecar exists, and the content round-trips. The `<persisted-{kind}>` schema is locked.
 
 ## When to re-run
 
