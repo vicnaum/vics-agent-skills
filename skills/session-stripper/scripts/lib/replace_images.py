@@ -26,6 +26,10 @@ from .chain import (
     save_session,
     walk_active_chain,
 )
+from .persist_layout import persist_dir, to_marker_path
+
+_DEFAULT_SUMMARY = "[image transcript]"
+_PREVIEW_CHARS = 512
 
 
 def _iter_image_blocks(objects, active_only=True):
@@ -173,10 +177,24 @@ def replace_images(session_path, descriptions_dir, dry_run=False,
                 transcript = _get_transcript(h)
                 if transcript is not None:
                     mt = src.get("media_type", "image")
+                    transcript_clean = transcript.rstrip()
+
+                    # Copy the transcript into our session-scoped persisted/
+                    # dir so the marker can carry a stable relative path.
+                    out_dir = persist_dir(session_path, "image")
+                    sidecar = out_dir / f"{h}.txt"
+                    if not sidecar.exists():
+                        sidecar.write_text(transcript_clean, encoding="utf-8")
+                    rel = to_marker_path(sidecar, session_path)
+
                     text = (
-                        f'<image sha256="{h}" media_type="{mt}">\n'
-                        f'{transcript.rstrip()}\n'
-                        f'</image>'
+                        f'<persisted-image sha256="{h}" media_type="{mt}">\n'
+                        f'Saved to: {rel} ({len(transcript_clean)} chars)\n'
+                        f'Summary: {_DEFAULT_SUMMARY}\n'
+                        f'\n'
+                        f'Preview:\n'
+                        f'{transcript_clean[:_PREVIEW_CHARS]}\n'
+                        f'</persisted-image>'
                     )
                     new_content.append({"type": "text", "text": text})
                     stats["replaced"] += 1

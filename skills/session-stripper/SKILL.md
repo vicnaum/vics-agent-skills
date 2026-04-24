@@ -103,6 +103,83 @@ python3 <skill-dir>/scripts/stripper.py persist-thinking <session.jsonl> --pos 4
 python3 <skill-dir>/scripts/stripper.py persist-thinkings <session.jsonl>
 ```
 
+## Persist Family — Unified Marker + Sidecar
+
+Every `persist-*` command takes heavy content out of the JSONL, writes the original to a sidecar file in the session's accessory directory, and replaces the block with a `<persisted-X>` marker that carries a path + size + summary + preview. The model can `Read` the path if it needs the original; the chain stays intact; nothing is destroyed.
+
+### Layout
+
+```
+~/.claude/projects/<encoded-cwd>/<sessionId>/
+├── tool-results/<tool_use_id>.txt           ← shared with CC native (kind=tool)
+└── persisted/
+    ├── thinking/<msg_uuid>.txt
+    ├── text/<msg_uuid>_<block_idx>.txt
+    ├── image/<sha256>.txt                   ← image transcripts
+    └── message/<msg_uuid>.json              ← whole-message persists
+```
+
+### Marker shape
+
+```
+<persisted-{kind}>
+Saved to: <relative-path> (N chars)
+Summary: <user-supplied or "[no summary provided]">
+
+Preview:
+<first ~1KB of original>
+</persisted-{kind}>
+```
+
+(For `kind=tool` the body uses CC's native shape: `Output too large (N). Full output saved to: PATH`.)
+
+Paths are stored relative to the project dir (sibling of the JSONL) so the session survives if the `~/.claude/projects/` tree is moved.
+
+### Commands
+
+```bash
+# Single text block at a chain position
+python3 <skill-dir>/scripts/stripper.py persist-text <session.jsonl> --pos 47 --summary "Audit M-02 spec draft"
+
+# Bulk text across a range, only large blocks, keep last 3
+python3 <skill-dir>/scripts/stripper.py persist-texts <session.jsonl> --from 0 --to 95 --min-chars 500 --keep-recent 3
+
+# Whole message — collapses ALL its blocks to one marker
+python3 <skill-dir>/scripts/stripper.py persist-message <session.jsonl> --pos 47 --summary "Adam dialogue"
+
+# Mixed dispatcher: persist tool, thinking, and text together over a range
+python3 <skill-dir>/scripts/stripper.py persist-range <session.jsonl> --from 0 --to 95 \
+    --kinds tool,thinking,text --min-chars 500 --keep-recent 3 \
+    --summaries-file ./summaries.json
+
+# Migrate pre-PR layouts (<image sha256> markers, .tool-results/ sidecars)
+python3 <skill-dir>/scripts/stripper.py migrate-persisted <session.jsonl>
+```
+
+### Summaries file
+
+`--summaries-file <path>` is JSON keyed by:
+- `pos:N` — chain position (text, thinking, message)
+- `toolu_X` — tool_use_id (tools, images)
+- `msg:<uuid>` — message uuid
+
+```json
+{
+  "pos:47": "Adam dialogue analysis",
+  "pos:55": "Aave Pro audit M-02 spec",
+  "toolu_abc123": "Bash: ran test suite, all green"
+}
+```
+
+Session-stripper does not generate summaries itself (it stays stdlib-pure). The calling layer (Claude Code main loop, a wrapper script, etc.) generates summaries — typically by spawning subagents — and writes the JSON.
+
+### Safety rules
+
+- `persist-message` refuses the leaf message of the active chain (would orphan the resume cursor).
+- `persist-message` on a `tool_use`-bearing message also persists the matching `tool_result` user message — otherwise the API rejects the resumed chain.
+- Already-persisted blocks (whose text starts with `<persisted-`) are skipped on re-runs (idempotent).
+- Every persist command emits via the same code path that maintains chain integrity (parentUuid unbroken, slug consistent, timestamps monotonic).
+
 ## Image Replacement
 
 Images in CC JSONL are base64-inlined. A 53-image session can be 1M+ tokens of base64 while the *information* in the images is often an order of magnitude smaller (chat screenshots, UIs, memes). `replace-images` swaps each image block for a text block carrying a pre-generated transcript.

@@ -12,6 +12,10 @@ from lib.strip_tools import strip_tools
 from lib.strip_thinking import strip_thinking
 from lib.compact import compact_before
 from lib.persist_tools import show_tool, persist_tool_result, persist_tools_bulk, show_thinking, persist_thinking, persist_thinking_bulk
+from lib.persist_text import persist_text, persist_text_bulk
+from lib.persist_message import persist_message
+from lib.persist_range import persist_range
+from lib.migrate_persisted import migrate_persisted
 from lib.replace_images import list_images, replace_images
 
 
@@ -166,6 +170,54 @@ def cmd_persist_thinkings(args):
     )
 
 
+def cmd_persist_text(args):
+    """Persist a single text block at a chain position."""
+    persist_text(args.session, chain_pos=args.pos, summary=args.summary,
+                 dry_run=args.dry_run, no_backup=args.no_backup)
+
+
+def cmd_persist_texts(args):
+    """Bulk persist text blocks across a chain range."""
+    persist_text_bulk(
+        args.session,
+        from_pos=args.from_pos, to_pos=args.to_pos,
+        min_chars=args.min_chars or 0,
+        keep_recent=args.keep_recent or 0,
+        dry_run=args.dry_run, no_backup=args.no_backup,
+    )
+
+
+def cmd_persist_message(args):
+    """Persist an entire message — all blocks collapse to one marker."""
+    from lib.persist_message import LeafPersistRefused
+    try:
+        persist_message(args.session, chain_pos=args.pos, summary=args.summary,
+                        dry_run=args.dry_run, no_backup=args.no_backup)
+    except LeafPersistRefused as e:
+        print(f"refused: {e}", file=sys.stderr)
+        sys.exit(2)
+
+
+def cmd_persist_range(args):
+    """Dispatcher: persist multiple kinds across a chain range."""
+    kinds = tuple(k.strip() for k in (args.kinds or "text,thinking").split(",") if k.strip())
+    persist_range(
+        args.session,
+        from_pos=args.from_pos or 0,
+        to_pos=args.to_pos,
+        kinds=kinds,
+        min_chars=args.min_chars or 0,
+        keep_recent=args.keep_recent or 0,
+        summaries_file=args.summaries_file,
+        dry_run=args.dry_run, no_backup=args.no_backup,
+    )
+
+
+def cmd_migrate_persisted(args):
+    """One-shot migration of pre-persist-everything layouts."""
+    migrate_persisted(args.session, dry_run=args.dry_run, no_backup=args.no_backup)
+
+
 def cmd_list_images(args):
     """Enumerate image blocks in the active chain with sizes and SHA256 hashes."""
     list_images(args.session)
@@ -314,6 +366,54 @@ def main():
     add_common_args(p_persist_thinkings)
     add_range_args(p_persist_thinkings)
     p_persist_thinkings.set_defaults(func=cmd_persist_thinkings)
+
+    # persist-text (single)
+    p_persist_text = subparsers.add_parser("persist-text", help="Persist a single text block at a chain position")
+    add_common_args(p_persist_text)
+    p_persist_text.add_argument("--pos", type=int, required=True,
+                                help="Chain position of the message containing the text block")
+    p_persist_text.add_argument("--summary", type=str, default=None,
+                                help="Summary string for the marker (optional)")
+    p_persist_text.set_defaults(func=cmd_persist_text)
+
+    # persist-texts (bulk)
+    p_persist_texts = subparsers.add_parser("persist-texts", help="Bulk persist text blocks across a range")
+    add_common_args(p_persist_texts)
+    add_range_args(p_persist_texts)
+    p_persist_texts.add_argument("--min-chars", type=int, default=0,
+                                  help="Skip text blocks shorter than N chars")
+    p_persist_texts.add_argument("--keep-recent", type=int, default=0,
+                                  help="Skip the last N qualifying blocks (preserve tail)")
+    p_persist_texts.set_defaults(func=cmd_persist_texts)
+
+    # persist-message
+    p_persist_message = subparsers.add_parser("persist-message", help="Persist an entire message at a chain position")
+    add_common_args(p_persist_message)
+    p_persist_message.add_argument("--pos", type=int, required=True,
+                                    help="Chain position of the message to persist")
+    p_persist_message.add_argument("--summary", type=str, default=None,
+                                    help="Summary string for the marker (optional)")
+    p_persist_message.set_defaults(func=cmd_persist_message)
+
+    # persist-range (dispatcher)
+    p_persist_range = subparsers.add_parser("persist-range", help="Dispatcher: persist multiple kinds across a chain range")
+    add_common_args(p_persist_range)
+    add_range_args(p_persist_range)
+    p_persist_range.add_argument("--kinds", type=str, default="text,thinking",
+                                  help="Comma-separated kinds to persist (tool,thinking,text,image,message). Default: text,thinking")
+    p_persist_range.add_argument("--min-chars", type=int, default=0,
+                                  help="Skip text blocks shorter than N chars")
+    p_persist_range.add_argument("--keep-recent", type=int, default=0,
+                                  help="Skip the last N qualifying blocks (preserve tail)")
+    p_persist_range.add_argument("--summaries-file", type=str, default=None,
+                                  help="JSON file mapping pos:N / toolu_X / msg:UUID → summary")
+    p_persist_range.set_defaults(func=cmd_persist_range)
+
+    # migrate-persisted
+    p_migrate = subparsers.add_parser("migrate-persisted",
+                                       help="One-shot migration of pre-PR persisted layouts (<image> markers, .tool-results/ sidecars)")
+    add_common_args(p_migrate)
+    p_migrate.set_defaults(func=cmd_migrate_persisted)
 
     # list-images
     p_list_images = subparsers.add_parser(
