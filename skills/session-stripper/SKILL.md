@@ -103,6 +103,36 @@ python3 <skill-dir>/scripts/stripper.py persist-thinking <session.jsonl> --pos 4
 python3 <skill-dir>/scripts/stripper.py persist-thinkings <session.jsonl>
 ```
 
+## Fork Mode (any mutating command)
+
+Every mutating command (`strip-*`, `persist-*`, `replace-images`, `compact`, `migrate-persisted`) accepts `--fork` and `--fork-title <title>`.
+
+When `--fork` is set, the operation runs against a **forked copy** of the session — written to a new `<newSessionId>.jsonl` next to the original — leaving the original untouched. Both sessions remain resumable via `claude -r`.
+
+```bash
+# In-place (default)
+python3 <skill-dir>/scripts/stripper.py persist-range <session.jsonl> --from 0 --to 90 --kinds text,thinking
+
+# Fork mode — keeps original intact
+python3 <skill-dir>/scripts/stripper.py persist-range <session.jsonl> --from 0 --to 90 --kinds text,thinking \
+    --fork --fork-title "Polymarket-only thread (stripped)"
+
+# Standalone fork without any operation
+python3 <skill-dir>/scripts/stripper.py fork <session.jsonl> --fork-title "checkpoint"
+```
+
+### What gets stamped on the fork
+
+Matches Claude Code's `/branch` convention exactly (verified against `~/github/claude-src/commands/branch/branch.ts`):
+
+- New `sessionId` (random UUID), written to `<project-dir>/<newSessionId>.jsonl`
+- `forkedFrom = {sessionId: <original>, messageUuid: <env's original uuid>}` on every conversation envelope
+- Root envelope's `parentUuid` stays `null` (CC convention; the fork pointer is `forkedFrom`)
+- A `custom-title` entry appended with " (Stripped)" suffix; collisions auto-increment to "(Stripped 2)", etc. `--fork-title` overrides
+- **Plus a session-stripper-specific** `strippedBy = {tool, operation, at}` field on every envelope so future tooling can show strip lineage. CC ignores unknown fields, so this doesn't break anything.
+
+Forked sessions appear as siblings in CC's session listings; `claude -r <newId>` resumes the stripped copy, `claude -r <originalId>` resumes the original.
+
 ## Persist Family — Unified Marker + Sidecar
 
 Every `persist-*` command takes heavy content out of the JSONL, writes the original to a sidecar file in the session's accessory directory, and replaces the block with a `<persisted-X>` marker that carries a path + size + summary + preview. The model can `Read` the path if it needs the original; the chain stays intact; nothing is destroyed.
