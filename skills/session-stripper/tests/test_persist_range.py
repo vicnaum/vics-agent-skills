@@ -69,15 +69,13 @@ class TestPersistRangeMixed(unittest.TestCase):
         from lib.persist_range import persist_range
         persist_range(self.session_path, from_pos=0, to_pos=5,
                       kinds=("text",), min_chars=500, keep_recent=1)
-        # Long text at pos 3 should be persisted; long text at pos 1 should be too;
-        # but the LAST text-bearing turn (pos 5) should be untouched.
-        positions = {pos for *_, fields in iter_persisted_markers(self.session_path)
-                     for (pos, _, _, _, _) in [(_, _, _, _, fields)]}
-        # Simpler assertion:
-        marked = list(iter_persisted_markers(self.session_path))
-        last_marked_pos = max(p for p, *_ in marked) if marked else -1
-        self.assertLess(last_marked_pos, 5,
-                        "keep_recent=1 didn't protect the last text-bearing turn")
+        # With keep_recent=1, the last qualifying text block (pos 3) is
+        # skipped — only pos 1 should be persisted. pos 5 is below
+        # min_chars and never qualifies.
+        marked_positions = [p for p, *_ in iter_persisted_markers(self.session_path)]
+        self.assertEqual(marked_positions, [1],
+                         f"keep_recent=1 should leave the last qualifying block "
+                         f"intact; got {marked_positions}")
 
     def test_chain_remains_valid(self):
         from lib.persist_range import persist_range

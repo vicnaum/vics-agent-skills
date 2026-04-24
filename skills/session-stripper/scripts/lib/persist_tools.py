@@ -12,6 +12,27 @@ from .chain import (
     walk_active_chain,
     wrapped_thinking_text,
 )
+from .persist_layout import persist_dir as _new_persist_dir, to_marker_path
+
+# Preview length for the new persist marker shape (matches persist_text/message).
+_THINKING_PREVIEW_CHARS = 1024
+_DEFAULT_SUMMARY = "[no summary provided]"
+
+
+def _build_thinking_marker(rel_path: str, original_chars: int,
+                           summary: str | None, preview: str) -> str:
+    """Standard <persisted-thinking> marker shape (matches the contract pinned
+    by tests/test_marker_contract.py)."""
+    s = summary if summary is not None else _DEFAULT_SUMMARY
+    return (
+        f"<persisted-thinking>\n"
+        f"Saved to: {rel_path} ({original_chars} chars)\n"
+        f"Summary: {s}\n"
+        f"\n"
+        f"Preview:\n"
+        f"{preview[:_THINKING_PREVIEW_CHARS]}\n"
+        f"</persisted-thinking>"
+    )
 
 
 def _get_content(obj):
@@ -786,63 +807,43 @@ def persist_thinking(session_path, chain_pos, summary=None, dry_run=False, no_ba
     total_chars = sum(len(b["text"]) for b in thinking_blocks)
     thinking_text = "\n---\n".join(b["text"] for b in thinking_blocks)
 
-    # Determine persist path
-    persist_dir = _get_persist_dir(session_path)
-    persist_path = persist_dir / f"{msg_uuid}_thinking.txt"
+    # New layout: <sessionId>/persisted/thinking/<msg_uuid>.txt
+    out_dir = _new_persist_dir(session_path, "thinking")
+    sidecar = out_dir / f"{msg_uuid}.txt"
+    rel = to_marker_path(sidecar, session_path)
+    marker_text = _build_thinking_marker(rel, total_chars, summary, thinking_text)
 
     print(f"Chain pos {pos} (uuid: {msg_uuid})")
     print(f"Thinking: {total_chars:,} chars ({len(thinking_blocks)} block(s))")
-    print(f"Persist to: {persist_path}")
+    print(f"Persist to: {sidecar}")
     if summary:
         print(f"Summary: {summary}")
 
     if dry_run:
-        chars_saved = total_chars
-        if summary:
-            replacement_len = len(f"<persisted-thinking>\nSummary: {summary}\n\nFull thinking saved to: {persist_path}\n</persisted-thinking>")
-            chars_saved = max(0, total_chars - replacement_len)
+        chars_saved = max(0, total_chars - len(marker_text))
         print(f"Would save ~{chars_saved:,} chars")
         print("\n[dry run] No changes written.")
     else:
-        # Save thinking to file
-        with open(persist_path, "w", encoding="utf-8") as f:
-            f.write(thinking_text)
-
-        # Remove thinking blocks from content (in reverse order to preserve indices)
+        sidecar.write_text(thinking_text, encoding="utf-8")
         if isinstance(content, list):
             for b in reversed(thinking_blocks):
                 del content[b["index"]]
-
-            # Insert summary block if provided
-            if summary:
-                summary_block = {
-                    "type": "text",
-                    "text": (
-                        f"<persisted-thinking>\n"
-                        f"Summary: {summary}\n"
-                        f"\n"
-                        f"Full thinking saved to: {persist_path}\n"
-                        f"</persisted-thinking>"
-                    ),
-                }
-                content.insert(0, summary_block)
+            # Always insert the marker (the contract requires a reference,
+            # not just removal).
+            content.insert(0, {"type": "text", "text": marker_text})
 
             _set_content(obj, content)
 
         save_session(session_path, objects, create_backup=not no_backup)
         print(f"\nSession saved: {session_path}")
 
-    summary_chars = 0
-    if summary:
-        summary_chars = len(f"<persisted-thinking>\nSummary: {summary}\n\nFull thinking saved to: {persist_path}\n</persisted-thinking>")
-
     return {
         "chain_pos": pos,
         "uuid": msg_uuid,
         "original_chars": total_chars,
         "summary_provided": summary is not None,
-        "persist_path": str(persist_path),
-        "chars_saved": max(0, total_chars - summary_chars),
+        "persist_path": str(sidecar),
+        "chars_saved": max(0, total_chars - len(marker_text)),
     }
 
 
@@ -895,41 +896,28 @@ def persist_thinking_bulk(session_path, dry_run=False, no_backup=False,
         msg_uuid = obj.get("uuid", "unknown")
         total_chars = sum(len(b["text"]) for b in thinking_blocks)
         thinking_text = "\n---\n".join(b["text"] for b in thinking_blocks)
-        persist_path = persist_dir / f"{msg_uuid}_thinking.txt"
+
+        # Use the new contract dir + relative-path marker.
+        out_dir = _new_persist_dir(session_path, "thinking")
+        sidecar = out_dir / f"{msg_uuid}.txt"
+        rel = to_marker_path(sidecar, session_path)
 
         summary = summary_map.get(pos)
+        marker_text = _build_thinking_marker(rel, total_chars, summary, thinking_text)
 
         if not dry_run:
-            # Save thinking to file
-            with open(persist_path, "w", encoding="utf-8") as f:
-                f.write(thinking_text)
-
-            # Remove thinking blocks from content (reverse order)
+            sidecar.write_text(thinking_text, encoding="utf-8")
             if isinstance(content, list):
+                # Remove all thinking/redacted_thinking blocks (reverse order
+                # so indices stay valid).
                 for b in reversed(thinking_blocks):
                     del content[b["index"]]
-
-                # Insert summary block if provided
-                if summary:
-                    summary_block = {
-                        "type": "text",
-                        "text": (
-                            f"<persisted-thinking>\n"
-                            f"Summary: {summary}\n"
-                            f"\n"
-                            f"Full thinking saved to: {persist_path}\n"
-                            f"</persisted-thinking>"
-                        ),
-                    }
-                    content.insert(0, summary_block)
-
+                # Always insert a marker — the contract requires that the
+                # model knows thinking happened here and can read it back.
+                content.insert(0, {"type": "text", "text": marker_text})
                 _set_content(obj, content)
 
-        summary_chars = 0
-        if summary:
-            summary_chars = len(f"<persisted-thinking>\nSummary: {summary}\n\nFull thinking saved to: {persist_path}\n</persisted-thinking>")
-
-        chars_saved = max(0, total_chars - summary_chars)
+        chars_saved = max(0, total_chars - len(marker_text))
         stats["persisted_count"] += 1
         stats["chars_saved"] += chars_saved
         stats["persisted_positions"].append(pos)
