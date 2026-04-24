@@ -42,7 +42,7 @@ CC_VERSION = "2.1.114"
 
 # Kinds session-stripper emits. Extended over time. Tests should add to this
 # tuple as new persist commands ship.
-PERSIST_KINDS = ("output", "tool", "thinking", "text", "message", "image")
+PERSIST_KINDS = ("output", "tool", "thinking", "text", "message", "image", "range")
 
 # Matches the wrapper. The inside is captured loosely; specific field
 # extraction happens in marker_fields().
