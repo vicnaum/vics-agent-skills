@@ -103,6 +103,50 @@ python3 <skill-dir>/scripts/stripper.py persist-thinking <session.jsonl> --pos 4
 python3 <skill-dir>/scripts/stripper.py persist-thinkings <session.jsonl>
 ```
 
+## Compact a Range — One Summary for Many Messages
+
+When a topical chunk of the conversation is closed and you want to subsume the whole chunk under a single summary, use `compact-range`. It collapses N consecutive messages into **one survivor** carrying a `<persisted-range>` marker; the originals are saved one-per-file to the sidecar dir, fully recoverable.
+
+```bash
+# Drop a chunk as irrelevant (uses default placeholder summary)
+stripper compact-range <session.jsonl> --from 10 --to 30
+
+# Compress a chunk under a tailored summary
+stripper compact-range <session.jsonl> --from 46 --to 77 \
+    --summary "Certora audit done in 4 days; 21 issues; AAVE-3813/14/15 (M-02), AAVE-3866 (M-07)"
+
+# Multi-arc cleanup: one invocation per range (each runs in <1s)
+stripper compact-range ... --from 10 --to 30 --summary "..." --fork --fork-title "scope-X"
+stripper compact-range ... --from 32 --to 45 --summary "..."
+```
+
+**Marker shape**:
+```
+<persisted-range from="A" to="B" count="N">
+Saved to: <sessionId>/persisted/message (N files)
+Summary: ...
+
+Preview:
+[role] first message excerpt
+[role] second message excerpt
+[... N-K more]
+</persisted-range>
+```
+
+**Safety**:
+- Refuses if the range includes the leaf message (would orphan resume).
+- Refuses if the range contains a `tool_use` whose matching `tool_result` lives outside the range (or vice versa).
+- Idempotent: re-running on a survivor that already carries a `<persisted-range>` marker is a no-op.
+
+**When to use which**:
+
+| Use case | Tool |
+|---|---|
+| Drop a topical chunk (one default placeholder for all) | `compact-range` |
+| Compress a topical chunk with one summary | `compact-range` |
+| Persist N messages with N tailored summaries (per-message granularity) | `persist-message` per position (loop or external script) |
+| Persist individual text/thinking blocks across a range, leaving message structure intact | `persist-range --kinds text,thinking` |
+
 ## Fork Mode (any mutating command)
 
 Every mutating command (`strip-*`, `persist-*`, `replace-images`, `compact`, `migrate-persisted`) accepts `--fork` and `--fork-title <title>`.

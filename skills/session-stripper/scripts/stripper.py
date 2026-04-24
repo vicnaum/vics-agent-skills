@@ -18,6 +18,7 @@ from lib.persist_range import persist_range
 from lib.migrate_persisted import migrate_persisted
 from lib.replace_images import list_images, replace_images
 from lib.fork import fork_session, cli_fork
+from lib.compact_range import compact_range
 
 
 def _maybe_fork(args, operation: str):
@@ -256,6 +257,19 @@ def cmd_migrate_persisted(args):
 def cmd_fork(args):
     """Fork a session without applying any other operation."""
     cli_fork(args.session, custom_title=args.fork_title, operation=args.operation)
+
+
+def cmd_compact_range(args):
+    """Collapse a range of messages into one survivor with a summary marker."""
+    from lib.compact_range import RangeRefused
+    _maybe_fork(args, f"compact-range --from {args.from_pos} --to {args.to_pos}")
+    try:
+        compact_range(args.session, from_pos=args.from_pos, to_pos=args.to_pos,
+                      summary=args.summary,
+                      dry_run=args.dry_run, no_backup=args.no_backup)
+    except RangeRefused as e:
+        print(f"refused: {e}", file=sys.stderr)
+        sys.exit(2)
 
 
 def cmd_list_images(args):
@@ -506,6 +520,23 @@ def main():
     )
     add_fork_args(p_replace_images)
     p_replace_images.set_defaults(func=cmd_replace_images)
+
+    # compact-range — collapse N consecutive messages to one survivor
+    p_compact_range = subparsers.add_parser(
+        "compact-range",
+        help="Collapse messages [from..to] into one survivor carrying a "
+             "<persisted-range> summary marker. Originals saved to sidecar files.",
+    )
+    add_common_args(p_compact_range)
+    p_compact_range.add_argument("--from", dest="from_pos", type=int, required=True,
+                                  help="Range start chain position (inclusive)")
+    p_compact_range.add_argument("--to", dest="to_pos", type=int, required=True,
+                                  help="Range end chain position (inclusive)")
+    p_compact_range.add_argument("--summary", type=str, default=None,
+                                  help="Summary covering the whole range "
+                                       "(default: '[range collapsed]')")
+    add_fork_args(p_compact_range)
+    p_compact_range.set_defaults(func=cmd_compact_range)
 
     # fork (standalone) — fork a session without applying any other operation
     p_fork = subparsers.add_parser(
