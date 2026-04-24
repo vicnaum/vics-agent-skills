@@ -17,6 +17,25 @@ from lib.persist_message import persist_message
 from lib.persist_range import persist_range
 from lib.migrate_persisted import migrate_persisted
 from lib.replace_images import list_images, replace_images
+from lib.fork import fork_session, cli_fork
+
+
+def _maybe_fork(args, operation: str):
+    """If `--fork` is set, fork the session in place and rewrite args.session
+    to point at the fork. Subsequent command logic then mutates the fork
+    instead of the original. Returns the (possibly-new) session path.
+    """
+    if not getattr(args, "fork", False):
+        return args.session
+    forked = fork_session(
+        args.session,
+        custom_title=getattr(args, "fork_title", None),
+        operation=operation,
+    )
+    print(f"Forked: {forked}")
+    print(f"New sessionId: {forked.stem}\n")
+    args.session = str(forked)
+    return args.session
 
 
 def cmd_analyze(args):
@@ -26,6 +45,7 @@ def cmd_analyze(args):
 
 def cmd_strip_tools(args):
     """Strip tool call content from a session."""
+    _maybe_fork(args, f"strip-tools --from {args.from_pos} --to {args.to_pos}")
     tools = None
     if args.tools:
         tools = [t.strip() for t in args.tools.split(",")]
@@ -45,6 +65,7 @@ def cmd_strip_tools(args):
 
 def cmd_strip_thinking(args):
     """Strip thinking blocks from a session."""
+    _maybe_fork(args, f"strip-thinking --from {args.from_pos} --to {args.to_pos}")
     strip_thinking(
         args.session,
         dry_run=args.dry_run,
@@ -56,6 +77,7 @@ def cmd_strip_thinking(args):
 
 def cmd_strip_all(args):
     """Strip both tool content and thinking blocks."""
+    _maybe_fork(args, f"strip-all --from {args.from_pos} --to {args.to_pos}")
     tools = None
     if args.tools:
         tools = [t.strip() for t in args.tools.split(",")]
@@ -83,6 +105,7 @@ def cmd_strip_all(args):
 
 def cmd_compact(args):
     """Compact messages before a given chain position."""
+    _maybe_fork(args, f"compact --before {args.before}")
     compact_before(
         args.session,
         before_pos=args.before,
@@ -114,6 +137,7 @@ def cmd_show_tool(args):
 
 def cmd_persist_tool(args):
     """Persist a single tool result to file with optional summary."""
+    _maybe_fork(args, f"persist-tool --id {args.id}")
     persist_tool_result(
         args.session,
         tool_use_id=args.id,
@@ -125,6 +149,7 @@ def cmd_persist_tool(args):
 
 def cmd_persist_tools(args):
     """Bulk persist tool results to files."""
+    _maybe_fork(args, f"persist-tools --from {args.from_pos} --to {args.to_pos}")
     tools = None
     if args.tools:
         tools = [t.strip() for t in args.tools.split(",")]
@@ -150,6 +175,7 @@ def cmd_show_thinking(args):
 
 def cmd_persist_thinking(args):
     """Persist a single thinking block to file with optional summary."""
+    _maybe_fork(args, f"persist-thinking --pos {args.pos}")
     persist_thinking(
         args.session,
         chain_pos=args.pos,
@@ -161,6 +187,7 @@ def cmd_persist_thinking(args):
 
 def cmd_persist_thinkings(args):
     """Bulk persist all thinking blocks to files."""
+    _maybe_fork(args, f"persist-thinkings --from {args.from_pos} --to {args.to_pos}")
     persist_thinking_bulk(
         args.session,
         dry_run=args.dry_run,
@@ -172,12 +199,15 @@ def cmd_persist_thinkings(args):
 
 def cmd_persist_text(args):
     """Persist a single text block at a chain position."""
+    _maybe_fork(args, f"persist-text --pos {args.pos}")
     persist_text(args.session, chain_pos=args.pos, summary=args.summary,
                  dry_run=args.dry_run, no_backup=args.no_backup)
 
 
 def cmd_persist_texts(args):
     """Bulk persist text blocks across a chain range."""
+    _maybe_fork(args, f"persist-texts --from {args.from_pos} --to {args.to_pos} "
+                       f"--min-chars {args.min_chars} --keep-recent {args.keep_recent}")
     persist_text_bulk(
         args.session,
         from_pos=args.from_pos, to_pos=args.to_pos,
@@ -190,6 +220,7 @@ def cmd_persist_texts(args):
 def cmd_persist_message(args):
     """Persist an entire message — all blocks collapse to one marker."""
     from lib.persist_message import LeafPersistRefused
+    _maybe_fork(args, f"persist-message --pos {args.pos}")
     try:
         persist_message(args.session, chain_pos=args.pos, summary=args.summary,
                         dry_run=args.dry_run, no_backup=args.no_backup)
@@ -201,6 +232,9 @@ def cmd_persist_message(args):
 def cmd_persist_range(args):
     """Dispatcher: persist multiple kinds across a chain range."""
     kinds = tuple(k.strip() for k in (args.kinds or "text,thinking").split(",") if k.strip())
+    _maybe_fork(args, f"persist-range --from {args.from_pos} --to {args.to_pos} "
+                       f"--kinds {','.join(kinds)} --min-chars {args.min_chars} "
+                       f"--keep-recent {args.keep_recent}")
     persist_range(
         args.session,
         from_pos=args.from_pos or 0,
@@ -215,7 +249,13 @@ def cmd_persist_range(args):
 
 def cmd_migrate_persisted(args):
     """One-shot migration of pre-persist-everything layouts."""
+    _maybe_fork(args, "migrate-persisted")
     migrate_persisted(args.session, dry_run=args.dry_run, no_backup=args.no_backup)
+
+
+def cmd_fork(args):
+    """Fork a session without applying any other operation."""
+    cli_fork(args.session, custom_title=args.fork_title, operation=args.operation)
 
 
 def cmd_list_images(args):
@@ -225,6 +265,7 @@ def cmd_list_images(args):
 
 def cmd_replace_images(args):
     """Replace image blocks with text transcripts keyed by SHA256."""
+    _maybe_fork(args, f"replace-images --dir {args.dir}")
     replace_images(
         args.session,
         descriptions_dir=args.dir,
@@ -239,6 +280,19 @@ def add_common_args(parser):
     parser.add_argument("session", help="Path to session JSONL file")
     parser.add_argument("--dry-run", action="store_true", help="Report only, don't modify")
     parser.add_argument("--no-backup", action="store_true", help="Skip .bak backup creation")
+
+
+def add_fork_args(parser):
+    """Add --fork / --fork-title flags. When --fork is set, mutating commands
+    operate on a forked copy (new sessionId, forkedFrom stamped on every
+    envelope) and leave the original untouched."""
+    parser.add_argument("--fork", action="store_true",
+                        help="Fork the session before mutating: writes to a "
+                             "new <newSessionId>.jsonl with forkedFrom "
+                             "metadata; original is left untouched")
+    parser.add_argument("--fork-title", type=str, default=None,
+                        help="Custom title for the forked session "
+                             "(default: <orig title> (Stripped))")
 
 
 def add_range_args(parser):
@@ -278,12 +332,14 @@ def main():
     add_common_args(p_strip_tools)
     add_range_args(p_strip_tools)
     add_tool_filter_args(p_strip_tools)
+    add_fork_args(p_strip_tools)
     p_strip_tools.set_defaults(func=cmd_strip_tools)
 
     # strip-thinking
     p_strip_thinking = subparsers.add_parser("strip-thinking", help="Strip thinking blocks")
     add_common_args(p_strip_thinking)
     add_range_args(p_strip_thinking)
+    add_fork_args(p_strip_thinking)
     p_strip_thinking.set_defaults(func=cmd_strip_thinking)
 
     # strip-all
@@ -291,6 +347,7 @@ def main():
     add_common_args(p_strip_all)
     add_range_args(p_strip_all)
     add_tool_filter_args(p_strip_all)
+    add_fork_args(p_strip_all)
     p_strip_all.set_defaults(func=cmd_strip_all)
 
     # compact
@@ -302,6 +359,7 @@ def main():
                            help="Custom output path (default: auto-generate)")
     p_compact.add_argument("--slug", type=str, default=None,
                            help="Custom slug for compacted session")
+    add_fork_args(p_compact)
     p_compact.set_defaults(func=cmd_compact)
 
     # verify
@@ -329,6 +387,7 @@ def main():
                                 help="Tool use ID to persist")
     p_persist_tool.add_argument("--summary", type=str, default=None,
                                 help="Summary text to include in replacement")
+    add_fork_args(p_persist_tool)
     p_persist_tool.set_defaults(func=cmd_persist_tool)
 
     # persist-tools
@@ -339,6 +398,7 @@ def main():
                                  help="Comma-separated list of tool names to persist (default: all)")
     p_persist_tools.add_argument("--keep-recent", type=int, default=3,
                                  help="Keep last N tool results intact (default: 3)")
+    add_fork_args(p_persist_tools)
     p_persist_tools.set_defaults(func=cmd_persist_tools)
 
     # show-thinking
@@ -359,12 +419,14 @@ def main():
                                      help="Chain position of assistant message")
     p_persist_thinking.add_argument("--summary", type=str, default=None,
                                      help="Summary text to include in replacement")
+    add_fork_args(p_persist_thinking)
     p_persist_thinking.set_defaults(func=cmd_persist_thinking)
 
     # persist-thinkings
     p_persist_thinkings = subparsers.add_parser("persist-thinkings", help="Bulk persist all thinking blocks to files")
     add_common_args(p_persist_thinkings)
     add_range_args(p_persist_thinkings)
+    add_fork_args(p_persist_thinkings)
     p_persist_thinkings.set_defaults(func=cmd_persist_thinkings)
 
     # persist-text (single)
@@ -374,6 +436,7 @@ def main():
                                 help="Chain position of the message containing the text block")
     p_persist_text.add_argument("--summary", type=str, default=None,
                                 help="Summary string for the marker (optional)")
+    add_fork_args(p_persist_text)
     p_persist_text.set_defaults(func=cmd_persist_text)
 
     # persist-texts (bulk)
@@ -384,6 +447,7 @@ def main():
                                   help="Skip text blocks shorter than N chars")
     p_persist_texts.add_argument("--keep-recent", type=int, default=0,
                                   help="Skip the last N qualifying blocks (preserve tail)")
+    add_fork_args(p_persist_texts)
     p_persist_texts.set_defaults(func=cmd_persist_texts)
 
     # persist-message
@@ -393,6 +457,7 @@ def main():
                                     help="Chain position of the message to persist")
     p_persist_message.add_argument("--summary", type=str, default=None,
                                     help="Summary string for the marker (optional)")
+    add_fork_args(p_persist_message)
     p_persist_message.set_defaults(func=cmd_persist_message)
 
     # persist-range (dispatcher)
@@ -407,12 +472,14 @@ def main():
                                   help="Skip the last N qualifying blocks (preserve tail)")
     p_persist_range.add_argument("--summaries-file", type=str, default=None,
                                   help="JSON file mapping pos:N / toolu_X / msg:UUID → summary")
+    add_fork_args(p_persist_range)
     p_persist_range.set_defaults(func=cmd_persist_range)
 
     # migrate-persisted
     p_migrate = subparsers.add_parser("migrate-persisted",
                                        help="One-shot migration of pre-PR persisted layouts (<image> markers, .tool-results/ sidecars)")
     add_common_args(p_migrate)
+    add_fork_args(p_migrate)
     p_migrate.set_defaults(func=cmd_migrate_persisted)
 
     # list-images
@@ -437,7 +504,21 @@ def main():
         "--drop-missing", action="store_true",
         help="If a transcript is missing, drop the image block entirely (default: keep).",
     )
+    add_fork_args(p_replace_images)
     p_replace_images.set_defaults(func=cmd_replace_images)
+
+    # fork (standalone) — fork a session without applying any other operation
+    p_fork = subparsers.add_parser(
+        "fork",
+        help="Fork a session: copy to <newSessionId>.jsonl with forkedFrom metadata; original untouched",
+    )
+    p_fork.add_argument("session", help="Path to session JSONL file")
+    p_fork.add_argument("--fork-title", type=str, default=None,
+                        help="Custom title for the forked session "
+                             "(default: <orig title> (Stripped))")
+    p_fork.add_argument("--operation", type=str, default=None,
+                        help="Stamp strippedBy.operation (optional)")
+    p_fork.set_defaults(func=cmd_fork)
 
     args = parser.parse_args()
 
