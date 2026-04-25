@@ -26,6 +26,7 @@ from .chain import (
     save_session,
     walk_active_chain,
 )
+from .image_tokens import image_block_tokens
 from .persist_layout import persist_dir, to_marker_path
 
 _DEFAULT_SUMMARY = "[image transcript]"
@@ -129,6 +130,7 @@ def replace_images(session_path, descriptions_dir, dry_run=False,
         "dropped": 0,
         "base64_chars_removed": 0,
         "transcript_chars_added": 0,
+        "image_tokens_removed": 0,  # Anthropic formula, not chars/4
     }
 
     # Cache loaded transcripts so repeated identical images hit disk once.
@@ -178,6 +180,8 @@ def replace_images(session_path, descriptions_dir, dry_run=False,
                 if transcript is not None:
                     mt = src.get("media_type", "image")
                     transcript_clean = transcript.rstrip()
+                    # Account for what we're freeing in real Anthropic tokens
+                    stats["image_tokens_removed"] += image_block_tokens(block)
 
                     # Copy the transcript into our session-scoped persisted/
                     # dir so the marker can carry a stable relative path.
@@ -206,6 +210,7 @@ def replace_images(session_path, descriptions_dir, dry_run=False,
                     if drop_missing:
                         stats["dropped"] += 1
                         stats["base64_chars_removed"] += len(data)
+                        stats["image_tokens_removed"] += image_block_tokens(block)
                         mutated = True
                         # skip appending the block
                     else:
@@ -222,9 +227,13 @@ def replace_images(session_path, descriptions_dir, dry_run=False,
         print(f"Image blocks dropped:        {stats['dropped']}")
     print(f"Base64 chars removed:        {stats['base64_chars_removed']:,}")
     print(f"Transcript chars added:      {stats['transcript_chars_added']:,}")
-    net = stats["base64_chars_removed"] - stats["transcript_chars_added"]
-    print(f"Net chars saved:             {net:,}")
-    print(f"Est. tokens saved:           {estimate_tokens(net):,}")
+    # Image tokens use Anthropic's (w*h)/750 formula, not chars/4.
+    image_tokens_freed = stats.get("image_tokens_removed", 0)
+    transcript_tokens = estimate_tokens(stats["transcript_chars_added"])
+    net_tokens = image_tokens_freed - transcript_tokens
+    print(f"Image tokens removed:        {image_tokens_freed:,}  (Anthropic formula)")
+    print(f"Transcript tokens added:     {transcript_tokens:,}  (chars/4)")
+    print(f"Net tokens saved:            {net_tokens:,}")
 
     if dry_run:
         print("\n[dry run] No changes written.")
