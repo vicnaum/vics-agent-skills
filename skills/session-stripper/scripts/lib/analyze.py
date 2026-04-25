@@ -8,6 +8,21 @@ import json
 from collections import Counter, defaultdict
 
 from .chain import load_session, build_uuid_index, walk_active_chain, count_content_chars, estimate_tokens
+from .image_tokens import image_block_tokens
+
+
+def _accurate_image_tokens(obj):
+    """Sum Anthropic-correct image tokens for all image blocks in obj's content.
+    The chars/4 estimate over-counts image cost ~50-100x; this corrects it."""
+    msg = obj.get("message", {}) if isinstance(obj, dict) else {}
+    content = msg.get("content") if isinstance(msg, dict) else obj.get("content")
+    if not isinstance(content, list):
+        return 0
+    total = 0
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "image":
+            total += image_block_tokens(block)
+    return total
 
 
 def _extract_text_from_content(content):
@@ -108,15 +123,25 @@ def analyze_session(session_path, show_cut_points=True):
     # ── 2. Token breakdown by content type ──────────────────────────────
 
     totals = {"tool_use": 0, "tool_result": 0, "thinking": 0, "text": 0, "image": 0, "other": 0, "total": 0}
+    image_tokens_real = 0  # Anthropic formula for images, not chars/4
 
     for obj in chain:
         cc = count_content_chars(obj)
         for key in totals:
             totals[key] += cc[key]
+        image_tokens_real += _accurate_image_tokens(obj)
 
     stats["char_totals"] = dict(totals)
+    # Token totals: chars/4 for everything except images, which use Anthropic's
+    # (w*h)/750 formula. The chars/4 estimate over-counts images by 50-100x
+    # because base64 expansion has nothing to do with the actual model cost.
     token_totals = {k: estimate_tokens(v) for k, v in totals.items()}
+    image_tokens_naive = token_totals["image"]
+    token_totals["image"] = image_tokens_real
+    # Recompute total: subtract the naive image estimate, add the real one.
+    token_totals["total"] = token_totals["total"] - image_tokens_naive + image_tokens_real
     stats["token_totals"] = token_totals
+    stats["image_tokens_naive_chars_div_4"] = image_tokens_naive
 
     strippable_keys = {"tool_use", "tool_result", "thinking", "image"}
     strippable_tokens = sum(token_totals[k] for k in strippable_keys)
@@ -134,11 +159,18 @@ def analyze_session(session_path, show_cut_points=True):
         chars = totals[key]
         tokens = token_totals[key]
         pct = (tokens / grand_total) * 100
-        note = "strippable" if key in strippable_keys else ""
+        if key == "image":
+            note = "strippable · (w×h)/750 capped 1600"
+        else:
+            note = "strippable" if key in strippable_keys else ""
         print(f"  {key:<16s} {chars:>12,d} {tokens:>12,d} {pct:>6.1f}%  {note}")
     print(f"  {'─' * 16} {'─' * 12} {'─' * 12} {'─' * 7}")
     print(f"  {'TOTAL':<16s} {totals['total']:>12,d} {token_totals['total']:>12,d} {'100.0%':>7s}")
     print(f"  {'STRIPPABLE':<16s} {'':>12s} {strippable_tokens:>12,d} {(strippable_tokens / grand_total) * 100:>6.1f}%")
+    if image_tokens_naive != image_tokens_real:
+        delta = image_tokens_naive - image_tokens_real
+        print(f"  (image col uses Anthropic formula; chars/4 would say {image_tokens_naive:,} — "
+              f"over by {delta:,} tokens)")
     print()
 
     # ── 3. Token breakdown by tool name ─────────────────────────────────

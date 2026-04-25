@@ -297,6 +297,7 @@ Output is a new session file. Resume with `claude -r <session-id>`.
 
 - Tool content is the #1 context consumer (~60% typical)
 - Thinking blocks are sent to API and count in client-side estimates -- always strip them
+- **Image tokens are computed via Anthropic's `(w×h)/750` formula (capped at 1600), not chars/4.** A typical screenshot is 380–1600 tokens regardless of base64 byte size — the chars/4 heuristic over-counts images by 50–100×. `analyze` shows the corrected number and notes the discrepancy. Implementation in `lib/image_tokens.py`; supports PNG, JPEG, WebP (VP8/VP8L/VP8X), GIF.
 - `formatTranscript()` only strips orphaned (thinking-only messages) and trailing (last message) thinking -- the rest survives
 - **Wrapped thinking is auto-detected.** Any text block whose whole content is a single `<thinking>…</thinking>` or `<think>…</think>` span (e.g. from `convert_to_cli.py --flatten-thinking`, or from open-source models that emit `<think>` tags) is treated as a real thinking block by `analyze`, `show-thinking`, `strip-thinking`, `strip-all`, and `persist-thinking`. No flag needed.
 - Backups are created automatically as `.bak` files
