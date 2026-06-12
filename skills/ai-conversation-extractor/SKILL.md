@@ -1,11 +1,11 @@
 ---
 name: ai-conversation-extractor
-description: "Convert AI conversation JSONL transcripts (Claude Code, Codex CLI, ChatGPT) to readable Markdown. Use when the user wants to: (1) convert .jsonl conversation transcripts to .md, (2) strip binary/base64 data from AI conversation logs, (3) make AI conversation history human-readable, (4) process session exports from ~/.claude/ or ~/.codex/, or (5) batch-convert a folder of conversation JSONL files. Triggers on mentions of JSONL conversations, transcript conversion, conversation export, or readable conversation logs."
+description: "Convert AI conversation transcripts (Claude Code, Codex CLI, ChatGPT JSONL; Cursor IDE SQLite) to readable Markdown. Use when the user wants to: (1) convert .jsonl conversation transcripts to .md, (2) strip binary/base64 data from AI conversation logs, (3) make AI conversation history human-readable, (4) process session exports from ~/.claude/ or ~/.codex/, (5) batch-convert a folder of conversation JSONL files, or (6) list, search, or export Cursor IDE chat/composer conversations. Triggers on mentions of JSONL conversations, transcript conversion, conversation export, readable conversation logs, or Cursor chat history."
 ---
 
 # ai-conversation-extractor
 
-Convert AI conversation JSONL transcripts (Claude Code, Codex CLI, ChatGPT/Gemini) to clean, readable Markdown files. Strips binary blobs (base64 images, PDFs — typically 95%+ of file size) while preserving all human-readable content: user messages, assistant text, thinking, tool calls, and tool results.
+Convert AI conversation transcripts (Claude Code, Codex CLI, ChatGPT/Gemini JSONL; Cursor IDE SQLite storage) to clean, readable Markdown files. Strips binary blobs (base64 images, PDFs — typically 95%+ of file size) while preserving all human-readable content: user messages, assistant text, thinking, tool calls, and tool results.
 
 See `scripts/README.md` for full JSONL format documentation.
 
@@ -19,6 +19,7 @@ Auto-detected from file content — no flags needed:
 | **Codex CLI** | OpenAI Codex CLI sessions (event stream with `timestamp`/`type`/`payload`) | `~/.codex/sessions/*.jsonl` |
 | **Codex history** | Codex CLI prompt history (`session_id`/`ts`/`text`) — user prompts only | `~/.codex/history.jsonl` |
 | **Simple** | ChatGPT / Gemini exports (`role`/`message`) | varies |
+| **Cursor** | Cursor IDE chat/composer conversations (SQLite, via `cursor_extract.py`) | `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb` |
 
 ## Usage
 
@@ -47,7 +48,27 @@ python3 <skill-dir>/scripts/extract.py <directory> --out-dir ./converted/
 python3 <skill-dir>/scripts/extract.py <file.jsonl> --ua-final-only --keep-env-context --keep-agent-boilerplate
 ```
 
-No external dependencies — uses only Python 3.12+ stdlib (`json`, `re`, `pathlib`, `argparse`).
+No external dependencies — uses only Python 3.12+ stdlib (`json`, `re`, `pathlib`, `argparse`, `sqlite3`).
+
+### Cursor IDE conversations
+
+Cursor stores conversations in a global SQLite DB (`cursorDiskKV` table: `composerData:<id>` metadata rows + `bubbleId:<composerId>:<bubbleId>` message rows; old versions inline the conversation in `composerData`). Use `scripts/cursor_extract.py` (opens the DB read-only, safe with Cursor running):
+
+```bash
+# List all conversations (newest first): composerId, last-updated, message count, title
+python3 <skill-dir>/scripts/cursor_extract.py --list [--limit 50]
+
+# Find conversations whose content matches a regex (full DB scan — can take minutes on multi-GB DBs)
+python3 <skill-dir>/scripts/cursor_extract.py --grep "AccessManager|rate.?limit"
+
+# Extract specific conversations to Markdown (named <title-slug>-<id8>.md)
+python3 <skill-dir>/scripts/cursor_extract.py <composerId> [<composerId>...] --out-dir ./converted/
+
+# Extract everything / use a custom DB path (e.g. Linux/Windows)
+python3 <skill-dir>/scripts/cursor_extract.py --all --out-dir ./converted/ --db <path/to/state.vscdb>
+```
+
+Output uses the same Markdown conventions as `extract.py`. Notes: per-message timestamps are not stored by Cursor (only conversation-level created/updated times, used for frontmatter and file mtime); tool results in very recent Cursor versions may live in encrypted blobs and show as tool calls without results.
 
 ### CLI Flags
 

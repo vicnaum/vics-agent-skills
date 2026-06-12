@@ -507,13 +507,65 @@ def write_markdown(
 # ---------------------------------------------------------------------------
 
 
+def _is_tool_call(text: str) -> bool:
+    """Check if text is a formatted tool call (from Claude Code parser)."""
+    t = text.strip()
+    return t.startswith("**Tool:") or t.startswith("**Tool ")
+
+
+def _is_tool_result(text: str) -> bool:
+    """Check if text is a formatted tool result (from Claude Code parser)."""
+    t = text.strip()
+    return t.startswith("**Result**") or t.startswith("**Result (")
+
+
+def _strip_tool_content(text: str) -> str:
+    """Remove tool call/result blocks from a mixed message, keep the rest."""
+    lines = text.split("\n")
+    out_lines: list[str] = []
+    in_tool_block = False
+    in_code_fence = False
+
+    for line in lines:
+        stripped = line.strip()
+
+        # Detect start of a tool call or result block
+        if _is_tool_call(stripped) or _is_tool_result(stripped):
+            in_tool_block = True
+            in_code_fence = False
+            continue
+
+        if in_tool_block:
+            # Track code fences inside tool blocks
+            if stripped.startswith("```"):
+                in_code_fence = not in_code_fence
+                continue
+            if in_code_fence:
+                continue
+            # End of tool block: blank line after code fence closed
+            if not stripped and not in_code_fence:
+                in_tool_block = False
+                continue
+            # Still inside a non-fenced tool block line
+            continue
+
+        out_lines.append(line)
+
+    return "\n".join(out_lines).strip()
+
+
 def _filter_user_assistant_final_only(
     conversation: list[tuple[str, str, str | None]],
     *,
     drop_env_context: bool,
     drop_agent_boilerplate: bool,
 ) -> list[tuple[str, str, str | None]]:
-    """Keep only: user message(s) and the final assistant message for that turn."""
+    """Keep only: user message(s) and the final assistant text for that turn.
+
+    Drops tool calls (assistant messages containing **Tool:**),
+    tool results (user messages containing **Result**), and thinking blocks.
+    Mixed messages (text + tool content) have the tool parts stripped.
+    """
     out: list[tuple[str, str, str | None]] = []
 
     pending_user: list[tuple[str, str, str | None]] = []
@@ -524,7 +576,6 @@ def _filter_user_assistant_final_only(
         if not pending_user and last_assistant is None:
             return
         if pending_user:
-            # Coalesce consecutive user messages into one block (common in Codex: env_context + prompt).
             merged_txt = "\n\n".join(t for (_r, t, _ts) in pending_user).strip()
             merged_ts = pending_user[-1][2]
             if merged_txt:
@@ -537,8 +588,6 @@ def _filter_user_assistant_final_only(
     for role, text, ts in conversation:
         if role == "user":
             t = text.strip()
-            # New user turn after we've already seen an assistant response:
-            # flush the previous (user..., assistant_final) pair now.
             if last_assistant is not None:
                 flush()
             if drop_env_context and t.startswith("<environment_context>"):
@@ -549,15 +598,24 @@ def _filter_user_assistant_final_only(
                 or "<INSTRUCTIONS>" in t and "Available skills" in t
             ):
                 continue
-            pending_user.append((role, t, ts))
+            # Strip tool results from user messages
+            cleaned = _strip_tool_content(t)
+            if not cleaned:
+                continue
+            pending_user.append((role, cleaned, ts))
             continue
         if role == "assistant":
-            # Overwrite until we hit the next user turn; last one wins.
-            last_assistant = (role, text.strip(), ts)
+            t = text.strip()
+            # Skip pure tool-call messages
+            if _is_tool_call(t):
+                cleaned = _strip_tool_content(t)
+                if not cleaned:
+                    continue
+                last_assistant = (role, cleaned, ts)
+                continue
+            # Regular assistant text — overwrite until next user turn
+            last_assistant = (role, t, ts)
             continue
-        # Unknown role: ignore in this filtered mode.
-
-        # If needed, could flush here, but currently we just skip.
 
     flush()
     return out
