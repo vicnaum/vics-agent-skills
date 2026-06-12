@@ -1,0 +1,27 @@
+skills/session-stripper/scripts/lib/chain.py
+  21751b6724dc1cdd 71-113
+skills/session-stripper/scripts/lib/strip_thinking.py
+  21751b6724dc1cdd 3,35,71-82,92-93,102-103
+skills/session-stripper/scripts/lib/strip_tools.py
+  21751b6724dc1cdd 196-201
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "9b16eac3177f0303b8da0136dbeaaae197b36ea7",
+  "prompts": {
+    "21751b6724dc1cdd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "949148c3-adb1-449d-acb6-d1634dd8f344",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "vicnaum",
+      "messages": [],
+      "total_additions": 67,
+      "total_deletions": 3,
+      "accepted_lines": 67,
+      "overriden_lines": 0
+    }
+  }
+}
