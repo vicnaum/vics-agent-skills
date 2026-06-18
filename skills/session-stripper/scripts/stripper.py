@@ -21,6 +21,23 @@ from lib.fork import fork_session, cli_fork
 from lib.compact_range import compact_range
 
 
+def _reset_usage_after_strip(session_path, dry_run, enabled=True):
+    """After a strip, rewrite stale assistant `usage` counts so CC's context
+    gauge reflects the post-strip size. Without this, the meter keeps reading
+    the pre-strip token count and CC blocks new input even though the
+    conversation is now tiny. Off when --dry-run or --no-usage-reset."""
+    if dry_run or not enabled:
+        return
+    from lib.chain import (load_session, save_session,
+                           compute_active_chain_tokens, reset_usage_metadata)
+    objects = load_session(session_path)
+    est = compute_active_chain_tokens(objects)
+    n = reset_usage_metadata(objects, est)
+    save_session(session_path, objects, create_backup=False)
+    print(f"Context gauge reset: {n} usage record(s) capped to ~{est:,} tokens "
+          f"(active-chain content estimate) so CC's meter reflects the stripped size.")
+
+
 def _maybe_fork(args, operation: str):
     """If `--fork` is set, fork the session in place and rewrite args.session
     to point at the fork. Subsequent command logic then mutates the fork
@@ -62,6 +79,8 @@ def cmd_strip_tools(args):
         tool_names=tools,
         keep_last_lines=args.keep_last_lines,
     )
+    _reset_usage_after_strip(args.session, args.dry_run,
+                             enabled=not getattr(args, "no_usage_reset", False))
 
 
 def cmd_strip_thinking(args):
@@ -74,6 +93,8 @@ def cmd_strip_thinking(args):
         from_pos=args.from_pos,
         to_pos=args.to_pos,
     )
+    _reset_usage_after_strip(args.session, args.dry_run,
+                             enabled=not getattr(args, "no_usage_reset", False))
 
 
 def cmd_strip_all(args):
@@ -102,6 +123,27 @@ def cmd_strip_all(args):
         from_pos=args.from_pos,
         to_pos=args.to_pos,
     )
+    _reset_usage_after_strip(args.session, args.dry_run,
+                             enabled=not getattr(args, "no_usage_reset", False))
+
+
+def cmd_reset_usage(args):
+    """Rewrite stale assistant usage counts so CC's context gauge matches the
+    on-disk (post-strip) conversation size. Standalone: use on a session that
+    was already stripped but whose meter is still pinned at the old size."""
+    from lib.chain import (load_session, save_session,
+                           compute_active_chain_tokens, reset_usage_metadata)
+    _maybe_fork(args, "reset-usage")
+    objects = load_session(args.session)
+    est = compute_active_chain_tokens(objects)
+    if args.dry_run:
+        print(f"[dry run] would cap stale assistant usage to ~{est:,} tokens "
+              f"(active-chain content estimate).")
+        return
+    n = reset_usage_metadata(objects, est)
+    save_session(args.session, objects, create_backup=not args.no_backup)
+    print(f"Reset {n} usage record(s) to ~{est:,} tokens. "
+          f"CC's context gauge will now reflect the on-disk size.")
 
 
 def cmd_compact(args):
@@ -309,6 +351,14 @@ def add_fork_args(parser):
                              "(default: <orig title> (Stripped))")
 
 
+def add_usage_reset_arg(parser):
+    """Opt out of the post-strip context-gauge reset."""
+    parser.add_argument("--no-usage-reset", action="store_true",
+                        help="Don't rewrite stale assistant usage counts after "
+                             "stripping. By default, strip resets CC's context "
+                             "gauge to the post-strip size so it stops blocking input.")
+
+
 def add_range_args(parser):
     """Add --from and --to chain position flags."""
     parser.add_argument("--from", dest="from_pos", type=int, default=0,
@@ -346,6 +396,7 @@ def main():
     add_common_args(p_strip_tools)
     add_range_args(p_strip_tools)
     add_tool_filter_args(p_strip_tools)
+    add_usage_reset_arg(p_strip_tools)
     add_fork_args(p_strip_tools)
     p_strip_tools.set_defaults(func=cmd_strip_tools)
 
@@ -353,6 +404,7 @@ def main():
     p_strip_thinking = subparsers.add_parser("strip-thinking", help="Strip thinking blocks")
     add_common_args(p_strip_thinking)
     add_range_args(p_strip_thinking)
+    add_usage_reset_arg(p_strip_thinking)
     add_fork_args(p_strip_thinking)
     p_strip_thinking.set_defaults(func=cmd_strip_thinking)
 
@@ -361,8 +413,19 @@ def main():
     add_common_args(p_strip_all)
     add_range_args(p_strip_all)
     add_tool_filter_args(p_strip_all)
+    add_usage_reset_arg(p_strip_all)
     add_fork_args(p_strip_all)
     p_strip_all.set_defaults(func=cmd_strip_all)
+
+    # reset-usage — fix CC's context gauge without stripping anything
+    p_reset_usage = subparsers.add_parser(
+        "reset-usage",
+        help="Rewrite stale assistant usage counts so CC's context gauge matches "
+             "the on-disk size (use if a session is stripped but the meter is still full)",
+    )
+    add_common_args(p_reset_usage)
+    add_fork_args(p_reset_usage)
+    p_reset_usage.set_defaults(func=cmd_reset_usage)
 
     # compact
     p_compact = subparsers.add_parser("compact", help="Compact messages before a position")

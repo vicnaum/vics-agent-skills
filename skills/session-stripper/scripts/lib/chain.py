@@ -143,16 +143,108 @@ def remove_objects_and_rewire(objects, uuids_to_remove):
     return survivors, len(uuids_to_remove), rewired
 
 
+def _next_backup_path(path):
+    """Return a backup path that does not yet exist: ``<path>.bak``, then
+    ``<path>.bak.1``, ``<path>.bak.2``, ... — so a backup is NEVER skipped just
+    because a prior one exists."""
+    base = Path(str(path) + ".bak")
+    if not base.exists():
+        return base
+    i = 1
+    while True:
+        cand = Path(str(path) + f".bak.{i}")
+        if not cand.exists():
+            return cand
+        i += 1
+
+
 def save_session(path, objects, create_backup=True):
-    """Write all objects as JSONL. Optionally create a .bak backup first."""
+    """Write all objects as JSONL. Optionally create a fresh backup first.
+
+    The backup is *enumerated*: every mutating run that asks for a backup gets
+    its own recoverable copy (``.bak``, then ``.bak.1``, ``.bak.2``, ...). This
+    fixes a real footgun in the old single-``.bak`` scheme — if a stale ``.bak``
+    already existed, the backup was silently skipped and the run mutated the
+    session with no fresh recovery point. Pass ``create_backup=False`` (the
+    ``--no-backup`` flag) to opt out.
+    """
     path = Path(path).expanduser()
-    if create_backup:
-        bak = path.with_suffix(path.suffix + ".bak")
-        if not bak.exists() and path.exists():
-            shutil.copy2(path, bak)
+    if create_backup and path.exists():
+        shutil.copy2(path, _next_backup_path(path))
     with open(path, "w", encoding="utf-8") as f:
         for obj in objects:
             f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+def compute_active_chain_tokens(objects, uuid_index=None):
+    """Estimate the token weight of the active chain's *content* — roughly what
+    CC re-sends to the model on the next turn. Excludes the runtime system prompt
+    and tool schemas (added at send time, unknowable offline), so it is a
+    conversation-only floor, not the exact prompt size."""
+    chain = walk_active_chain(objects, uuid_index)
+    total_chars = sum(count_content_chars(obj)["total"] for obj in chain)
+    return estimate_tokens(total_chars)
+
+
+def reset_usage_metadata(objects, target_tokens):
+    """Rewrite assistant ``usage`` so CC's context gauge reflects reality.
+
+    CC computes "context left" from the token counts recorded on the most recent
+    assistant turn (``input_tokens`` + ``cache_read_input_tokens`` +
+    ``cache_creation_input_tokens``) — a STORED number, not a live recount of the
+    conversation. After stripping, those numbers still describe the *pre-strip*
+    size, so the meter stays pinned near 100% and CC blocks new input
+    client-side ("Context limit reached"), even though the on-disk conversation
+    is now tiny.
+
+    This caps every assistant turn whose recorded context exceeds
+    ``target_tokens`` down to ``target_tokens`` (it never inflates a smaller
+    turn), and pins the active chain's final assistant turn to exactly
+    ``target_tokens`` — even if that turn recorded 0 (e.g. a blocked
+    "Prompt is too long" turn). Cache fields are zeroed on touched turns; the
+    next real turn re-establishes accurate counts.
+
+    Returns the number of usage records modified.
+    """
+    target = max(0, int(target_tokens))
+    chain = walk_active_chain(objects)
+    chain_uuids = {o.get("uuid") for o in chain}
+
+    touched = set()
+    leaf_obj = None
+    for obj in objects:
+        if obj.get("type") != "assistant":
+            continue
+        msg = obj.get("message")
+        if not isinstance(msg, dict):
+            continue
+        if obj.get("uuid") in chain_uuids:
+            leaf_obj = obj  # last in file order → active-chain leaf assistant
+        u = msg.get("usage")
+        if not isinstance(u, dict):
+            continue
+        total = ((u.get("input_tokens") or 0)
+                 + (u.get("cache_read_input_tokens") or 0)
+                 + (u.get("cache_creation_input_tokens") or 0))
+        if total > target:
+            u["input_tokens"] = target
+            u["cache_read_input_tokens"] = 0
+            u["cache_creation_input_tokens"] = 0
+            touched.add(id(obj))
+
+    if leaf_obj is not None:
+        msg = leaf_obj["message"]
+        u = msg.get("usage")
+        if not isinstance(u, dict):
+            u = {}
+            msg["usage"] = u
+        u["input_tokens"] = target
+        u["cache_read_input_tokens"] = 0
+        u["cache_creation_input_tokens"] = 0
+        u.setdefault("output_tokens", 0)
+        touched.add(id(leaf_obj))
+
+    return len(touched)
 
 
 def format_content_preview(content, max_len=100):

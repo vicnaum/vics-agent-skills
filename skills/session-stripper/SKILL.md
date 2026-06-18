@@ -29,9 +29,26 @@ python3 <skill-dir>/scripts/stripper.py compact <session.jsonl> --before 150
 
 # Verify chain integrity
 python3 <skill-dir>/scripts/stripper.py verify <session.jsonl>
+
+# Fix CC's context gauge without stripping (if a session is stripped but still reads ~full)
+python3 <skill-dir>/scripts/stripper.py reset-usage <session.jsonl>
 ```
 
-All commands support `--dry-run` (report only) and `--no-backup` (skip .bak). Range filtering via `--from N --to M` (chain positions).
+All commands support `--dry-run` (report only) and `--no-backup` (skip backup). Range filtering via `--from N --to M` (chain positions).
+
+### Backups are enumerated (never skipped)
+
+Every mutating run that creates a backup writes a *fresh* one: `<session>.jsonl.bak`, then `.bak.1`, `.bak.2`, … It never silently reuses or skips a backup just because one already exists. (The old single-`.bak` scheme would skip the backup when a stale `.bak` was present — letting a strip run with no recovery point. That footgun is gone.) Pass `--no-backup` to opt out.
+
+### The context gauge resets automatically after stripping
+
+**CC's "context left" meter is not a live recount of the conversation — it reads the token counts (`input_tokens` + `cache_read_input_tokens` + `cache_creation_input_tokens`) recorded on the most recent assistant turn in the JSONL.** So stripping content alone does NOT move the meter: the stored numbers still describe the pre-strip size, the gauge stays pinned near 100%, and CC blocks new input client-side ("Context limit reached") even though the file is now tiny — the strip *looks* like it did nothing.
+
+To fix this, `strip-tools`, `strip-thinking`, and `strip-all` now **automatically rewrite the stale `usage` counts** to the post-strip active-chain content estimate once stripping finishes. Every assistant turn whose recorded context exceeds the estimate is capped down to it (smaller turns are left alone), and the active chain's final assistant turn is pinned to the estimate — even if it recorded 0 (e.g. a blocked "Prompt is too long" turn). The next real turn re-establishes exact counts.
+
+- Opt out with `--no-usage-reset`.
+- Run it standalone with `reset-usage` on an already-stripped session whose meter is still stuck (no need to re-strip). It also accepts `--fork`.
+- The estimate is conversation content only; it excludes the runtime system prompt + tool schemas (added at send time, unknowable offline), so it's a floor — the first live turn corrects it precisely.
 
 ## What Gets Stripped
 
@@ -300,7 +317,8 @@ Output is a new session file. Resume with `claude -r <session-id>`.
 - **Image tokens are computed via Anthropic's `(w×h)/750` formula (capped at 1600), not chars/4.** A typical screenshot is 380–1600 tokens regardless of base64 byte size — the chars/4 heuristic over-counts images by 50–100×. `analyze` shows the corrected number and notes the discrepancy. Implementation in `lib/image_tokens.py`; supports PNG, JPEG, WebP (VP8/VP8L/VP8X), GIF.
 - `formatTranscript()` only strips orphaned (thinking-only messages) and trailing (last message) thinking -- the rest survives
 - **Wrapped thinking is auto-detected.** Any text block whose whole content is a single `<thinking>…</thinking>` or `<think>…</think>` span (e.g. from `convert_to_cli.py --flatten-thinking`, or from open-source models that emit `<think>` tags) is treated as a real thinking block by `analyze`, `show-thinking`, `strip-thinking`, `strip-all`, and `persist-thinking`. No flag needed.
-- Backups are created automatically as `.bak` files
+- Backups are created automatically and **enumerated** (`.bak`, `.bak.1`, `.bak.2`, …) — a fresh one per run, never skipped (use `--no-backup` to opt out)
+- **The context gauge is driven by stored `usage` counts on the last assistant turn, not a live recount** — so stripping auto-resets those counts (or run `reset-usage`), otherwise CC keeps blocking input at the pre-strip size. This is the single most common reason a strip "didn't work."
 - No external dependencies -- Python 3.8+ stdlib only
 
 For the full technical deep-dive, see [references/surgery-report.md](references/surgery-report.md).
