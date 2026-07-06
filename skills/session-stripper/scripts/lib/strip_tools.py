@@ -60,7 +60,13 @@ def _content_char_count(content):
 
 
 def _keep_last_lines(text, n):
-    """Keep only the last N lines of a text string."""
+    """Keep only the last N lines of a text string.
+
+    n <= 0 means keep nothing. (Without the guard, ``lines[-0:]`` slices the
+    WHOLE list, silently turning ``--keep-last-lines 0`` into a no-op.)
+    """
+    if n <= 0:
+        return ""
     lines = text.split("\n")
     if len(lines) <= n:
         return text
@@ -184,10 +190,17 @@ def strip_tools(session_path, dry_run=False, no_backup=False,
                         new_items = []
                         for item in result_content:
                             if isinstance(item, dict) and item.get("type") == "text":
+                                trimmed = _keep_last_lines(item.get("text", ""), keep_last_lines)
+                                if not trimmed:
+                                    # drop the block: the API rejects empty text
+                                    # blocks, and a list of blank ones would be
+                                    # "semantically empty" content — truthy, so
+                                    # it would sneak past the is_error guard below
+                                    continue
                                 item = dict(item)
-                                item["text"] = _keep_last_lines(item.get("text", ""), keep_last_lines)
+                                item["text"] = trimmed
                             new_items.append(item)
-                        block["content"] = new_items
+                        block["content"] = new_items if new_items else ""
                     else:
                         block["content"] = ""
                 else:
