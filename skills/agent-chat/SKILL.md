@@ -58,4 +58,4 @@ A **nudge** covers the remaining case: a fully idle peer. It types a line into t
 
 ## Related
 
-- `respawn` skill — restart a peer's CLI resuming its session (uses this registry for `--name` lookups). Re-registering after a respawn keeps the unread cursor, so no mail is lost across restarts.
+- `respawn` skill — restart a session's CLI after a session-stripper strip. An in-place strip keeps the session id, so the agent-chat registration survives the restart; re-registering keeps the unread cursor either way, so no mail is lost.

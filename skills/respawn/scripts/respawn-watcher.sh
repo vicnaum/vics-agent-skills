@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Internal: detached watcher spawned by respawn.sh — do not run directly.
 # Exits the Claude Code CLI in one iTerm session (by UUID), relaunches it with
-# --resume, and types a kickoff prompt.
+# the given command, and types a kickoff prompt.
 #
-# args: <iterm-uuid> <session-id> <kickoff-prompt> <grace-secs> <exit-wait-secs> [dry]
+# args: <iterm-uuid> <session-id> <relaunch-cmd> <kickoff-prompt> <grace-secs> <exit-wait-secs> [dry]
 
 BASE="$HOME/.claude/respawn"
 LOG="$BASE/respawn.log"
-UUID="$1"; SID="$2"; KICKOFF="$3"; GRACE="${4:-15}"; WAIT_EXIT="${5:-900}"; DRY="${6:-}"
+UUID="$1"; SID="$2"; RELAUNCH="$3"; KICKOFF="$4"; GRACE="${5:-15}"; WAIT_EXIT="${6:-900}"; DRY="${7:-}"
 
 log() { echo "[$(date '+%F %T')] [$SID] $*" >> "$LOG"; }
 
@@ -66,6 +66,7 @@ wait_pid_gone() { # pid timeout-secs -> rc 0 if gone
 }
 
 log "watcher started (grace=${GRACE}s, exit-wait=${WAIT_EXIT}s${DRY:+, DRY RUN})"
+log "relaunch command: $RELAUNCH"
 sleep "$GRACE"
 
 TTY_PATH=$(get_tty)
@@ -75,14 +76,6 @@ if [ -z "$TTY_PATH" ]; then
 fi
 SHORT="${TTY_PATH#/dev/}"
 log "target tty: $SHORT"
-
-# capture the original launch command (preserves flags like
-# --dangerously-skip-permissions), minus any previous --resume/-r
-ORIG=$(ps -t "$SHORT" -o command= 2>/dev/null | grep -E '^(\S*/)?claude( |$)' | head -n1 \
-       | sed -E 's/ (--resume|-r) [^ ]+//g')
-[ -n "$ORIG" ] || ORIG="claude"
-RELAUNCH="$ORIG --resume $SID"
-log "relaunch command: $RELAUNCH"
 
 PID=$(claude_pid "$SHORT")
 if [ -n "$PID" ]; then

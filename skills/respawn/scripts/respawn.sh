@@ -1,84 +1,119 @@
 #!/usr/bin/env bash
-# respawn.sh — schedule a restart of a Claude Code CLI in its iTerm window,
-# resuming its (typically just-stripped) session. The agent calls this as its
-# LAST action, then ends its turn; a detached watcher does the rest.
+# respawn.sh — schedule a restart of THIS Claude Code CLI in its own iTerm
+# window, resuming a session (typically right after a session-stripper strip).
+# The agent calls this as its LAST action, then ends its turn; a detached
+# watcher does the rest.
 #
-# Usage (self-respawn, the common case):
-#   respawn.sh [--session <sid>] [--prompt "kickoff text"] [--grace N] [--force] [--dry-run]
-# Peer respawn (requires the peer to be registered in agent-chat):
-#   respawn.sh --name <agent-name> [...]
+# Usage:
+#   respawn.sh [<session-id>] [--prompt "kickoff"] [--grace N] [--force] [--cmd "claude ..."] [--dry-run]
 #
-# --session   session id to resume (default: this session; pass the NEW id when
-#             session-stripper forked to a new session instead of in-place)
-# --prompt    first prompt typed into the resumed CLI (default: a continue-where-
-#             you-left-off instruction)
-# --grace     seconds the watcher waits before typing /exit (default 15)
-# --force     escalate to SIGTERM after 20s instead of waiting out a long turn
-# --dry-run   watcher logs what it would do, types/kills nothing
+# <session-id>  session to resume. Default: $CLAUDE_CODE_SESSION_ID (this
+#               session) — correct for in-place strips. Pass the NEW id after
+#               a forked strip.
+# --prompt      first prompt typed into the resumed CLI
+# --grace       seconds the watcher waits before typing /exit (default 15)
+# --force       escalate to SIGTERM after 20s instead of waiting out a long turn
+# --cmd         full relaunch command override, e.g. --cmd "claude --model opus".
+#               Skips ps-based reconstruction; --resume <sid> is appended.
+# --dry-run     watcher logs what it would do, types/kills nothing
 #
-# The relaunch reuses the CLI's original command line captured from ps (flags
-# like --dangerously-skip-permissions are preserved), swapping in --resume <sid>.
+# The relaunch command is rebuilt from the running CLI's ps entry: all flags
+# are kept (e.g. --dangerously-skip-permissions, --model) EXCEPT session
+# selectors, which are stripped so the wrong session can't be resumed:
+#   -c/--continue, -r/--resume [id], --from-pr [ref], --session-id <id>,
+#   --fork-session, and -w/--worktree [name]/--tmux (would create a new
+#   worktree instead of resuming in place).
+# Caveat: ps loses shell quoting — if the CLI was launched with quoted args
+# containing spaces (e.g. --append-system-prompt "be brief"), pass --cmd.
 # Watcher log: ~/.claude/respawn/respawn.log
 
 set -u
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" && pwd)"
 BASE="$HOME/.claude/respawn"
-REG="$HOME/.claude/agent-chat/registry"
-JQ="/usr/bin/jq"
 mkdir -p "$BASE"
 
 die() { echo "respawn: $*" >&2; exit 1; }
 
-NAME="" SID="" KICKOFF="" GRACE=15 FORCE="" DRY=""
+SID="" KICKOFF="" GRACE=15 FORCE="" DRY="" CMD=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --name) NAME="$2"; shift 2;;
-    --session) SID="$2"; shift 2;;
     --prompt) KICKOFF="$2"; shift 2;;
     --grace) GRACE="$2"; shift 2;;
     --force) FORCE=1; shift;;
+    --cmd) CMD="$2"; shift 2;;
     --dry-run) DRY="dry"; shift;;
-    *) die "unknown arg '$1' (see header of $0)";;
+    -*) die "unknown arg '$1' (see header of $0)";;
+    *) [ -n "$SID" ] && die "multiple session ids given"; SID="$1"; shift;;
   esac
 done
 
-if [ -n "$NAME" ]; then
-  f="$REG/$NAME.json"
-  [ -e "$f" ] || die "no agent named '$NAME' in the agent-chat registry"
-  UUID=$($JQ -r '.iterm_session_id // empty' "$f"); UUID="${UUID#*:}"
-  [ -n "$SID" ] || SID=$($JQ -r '.session_id // empty' "$f")
+UUID="${ITERM_SESSION_ID:-}"; UUID="${UUID#*:}"
+[ -n "$UUID" ] || die "no \$ITERM_SESSION_ID (not running inside iTerm?)"
+[ -n "$SID" ] || SID="${CLAUDE_CODE_SESSION_ID:-}"
+[[ "$SID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
+  || die "'$SID' does not look like a session id (pass one explicitly)"
+
+get_tty() {
+  osascript - "$UUID" <<'AS'
+on run argv
+  set targetId to item 1 of argv
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if (id of s as text) is equal to targetId then return (tty of s)
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return ""
+end run
+AS
+}
+
+# Rebuild the relaunch command from the live process: keep every flag except
+# session selectors (and worktree/tmux creation), then resume $SID.
+build_relaunch() {
+  local orig="$1"
+  local -a toks out=()
+  read -r -a toks <<< "$orig"
+  local i=0 n=${#toks[@]} t
+  while [ "$i" -lt "$n" ]; do
+    t="${toks[$i]}"
+    case "$t" in
+      -c|--continue|--fork-session|--tmux) ;;                    # drop, no arg
+      --session-id) i=$((i+1));;                                 # drop + required arg
+      --session-id=*|--resume=*|--from-pr=*|--worktree=*) ;;     # drop inline-arg forms
+      -r|--resume|--from-pr|-w|--worktree)                       # drop + optional arg
+        if [ $((i+1)) -lt "$n" ] && [[ "${toks[$((i+1))]}" != -* ]]; then i=$((i+1)); fi;;
+      *) out+=("$t");;
+    esac
+    i=$((i+1))
+  done
+  echo "${out[*]}"
+}
+
+if [ -n "$CMD" ]; then
+  RELAUNCH="$CMD --resume $SID"
 else
-  UUID="${ITERM_SESSION_ID:-}"; UUID="${UUID#*:}"
-  [ -n "$SID" ] || SID="${CLAUDE_CODE_SESSION_ID:-}"
-  # personalize the kickoff if this session is registered in agent-chat
-  if [ -z "$NAME" ] && [ -d "$REG" ] && [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
-    for f in "$REG"/*.json; do
-      [ -e "$f" ] || break
-      n=$($JQ -r --arg sid "$CLAUDE_CODE_SESSION_ID" 'select(.session_id == $sid) | .name' "$f")
-      [ -n "$n" ] && { NAME="$n"; break; }
-    done
-  fi
+  TTY_PATH=$(get_tty)
+  [ -n "$TTY_PATH" ] || die "iTerm session $UUID not found"
+  SHORT="${TTY_PATH#/dev/}"
+  ORIG=$(ps -t "$SHORT" -o command= 2>/dev/null | grep -E '^(\S*/)?claude( |$)' | head -n1)
+  [ -n "$ORIG" ] || ORIG="claude"
+  RELAUNCH="$(build_relaunch "$ORIG") --resume $SID"
 fi
 
-[ -n "$UUID" ] || die "no iTerm session id (not running inside iTerm?)"
-case "$SID" in ''|manual-*) die "no session id to resume (pass --session <sid>)";; esac
-[[ "$SID" =~ ^[0-9a-f-]{36}$ ]] || die "'$SID' does not look like a session id"
-
-if [ -z "$KICKOFF" ]; then
-  KICKOFF="[respawn] Your CLI was restarted, resuming your session (after a strip). Re-read your recent context and continue exactly where you left off."
-  [ -n "$NAME" ] && KICKOFF="$KICKOFF First run: agent-chat register $NAME"
-fi
+[ -n "$KICKOFF" ] || KICKOFF="[respawn] Your CLI was restarted, resuming your session (after a strip). Re-read your recent context and continue exactly where you left off."
 
 WAIT_EXIT=900
 [ -n "$FORCE" ] && WAIT_EXIT=20
 
-nohup "$SCRIPT_DIR/respawn-watcher.sh" "$UUID" "$SID" "$KICKOFF" "$GRACE" "$WAIT_EXIT" "$DRY" \
+nohup "$SCRIPT_DIR/respawn-watcher.sh" "$UUID" "$SID" "$RELAUNCH" "$KICKOFF" "$GRACE" "$WAIT_EXIT" "$DRY" \
   >> "$BASE/respawn.log" 2>&1 &
 disown
 
-echo "Respawn scheduled (session $SID${NAME:+, agent '$NAME'}${DRY:+, DRY RUN})."
-echo "Watcher: waits ${GRACE}s, types /exit (queues if a turn is still running), relaunches with --resume, then types the kickoff prompt."
+echo "Respawn scheduled${DRY:+ (DRY RUN)}."
+echo "Relaunch command: $RELAUNCH"
 echo "Log: $BASE/respawn.log"
-if [ -z "$NAME" ] || [ -z "$DRY" ]; then
-  echo "IMPORTANT: if you are respawning yourself, this must be your LAST action — end your turn NOW."
-fi
+echo "IMPORTANT: this must be your LAST action — end your turn NOW (the watcher types /exit in ${GRACE}s; if your turn is still running it queues and fires at turn end)."
