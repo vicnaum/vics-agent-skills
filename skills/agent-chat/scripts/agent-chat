@@ -1,40 +1,61 @@
 #!/usr/bin/env bash
 # agent-chat — local peer-to-peer chat between Claude Code sessions on this machine.
 #
-# Messages live in ~/.claude/agent-chat/chat.jsonl. Each registered session gets
-# unread messages auto-delivered via Claude Code hooks (UserPromptSubmit, PostToolUse,
-# Stop). `nudge` wakes an idle session by typing into its iTerm window (AppleScript).
+# No server: rooms are append-only JSONL files under ~/.claude/agent-chat/rooms/,
+# with per-agent read cursors. Registered sessions get unread messages
+# auto-delivered via Claude Code hooks (UserPromptSubmit, PostToolUse, Stop).
+# `nudge` wakes an idle session by typing into its iTerm window (AppleScript).
+#
+# Rooms (mIRC-style): every agent is a member of its project room (derived from
+# the cwd it registered in, like Claude Code's per-folder session storage) and
+# of #general. Agents can join/leave/peek other rooms.
+#
+# Identity is the NAME, not the session: re-registering an existing name from a
+# new session (after a fork, strip, or fresh start) silently rebinds it — read
+# cursors are kept and no join announcement is made, so to other agents it is
+# seamlessly the same agent.
 #
 # Usage:
-#   agent-chat register <name>              join the chat as <name> (run from inside a session)
-#   agent-chat send "<msg>" [--to <name>] [--nudge]
-#                                           broadcast (default) or DM; --nudge wakes idle recipient(s)
-#   agent-chat read                         print + consume unread messages
-#   agent-chat log [N]                      show last N messages (default 20), read-only
-#   agent-chat who                          list registered agents
+#   agent-chat register <name>              join (or silently rebind) as <name>
+#   agent-chat send "<msg>" [--room <room>] [--to <name>] [--nudge]
+#                                           default room: your project room;
+#                                           --to = DM (delivered via #general);
+#                                           --nudge wakes recipient(s)
+#   agent-chat read                         print + consume unread from all your rooms
+#   agent-chat log [N] [--room <room>]      last N messages of a room (default: project room)
+#   agent-chat rooms                        list all rooms (* = joined)
+#   agent-chat join <room> / leave <room>   manage room membership
+#   agent-chat peek <room> [N]              read any room without joining (no cursor change)
+#   agent-chat who                          list registered agents and their rooms
 #   agent-chat nudge <name> [text]          type a wake-up line into that agent's iTerm window
 #   agent-chat unregister [<name>]          leave the chat (default: self)
 #   agent-chat hook <EventName>             internal: called by Claude Code hooks (stdin = hook JSON)
 #
-# Identity: resolved from $CLAUDE_CODE_SESSION_ID against the registry.
-# Manual override for humans/testing: --as <name> (global flag).
+# Identity resolves from $CLAUDE_CODE_SESSION_ID; --as <name> overrides (humans/testing).
 
 BASE="$HOME/.claude/agent-chat"
-CHAT="$BASE/chat.jsonl"
+ROOMS="$BASE/rooms"
 REG="$BASE/registry"
 CUR="$BASE/cursors"
 JQ="/usr/bin/jq"
 
-mkdir -p "$REG" "$CUR"
-touch "$CHAT"
+mkdir -p "$ROOMS" "$REG" "$CUR"
+# migrate pre-rooms layout: the old single chat.jsonl becomes #general
+if [ -s "$BASE/chat.jsonl" ] && [ ! -e "$ROOMS/general.jsonl" ]; then
+  mv "$BASE/chat.jsonl" "$ROOMS/general.jsonl"
+fi
+touch "$ROOMS/general.jsonl"
 
 die() { echo "agent-chat: $*" >&2; exit 1; }
 now() { date +"%Y-%m-%dT%H:%M:%S%z"; }
 
+proj_room() { printf '%s' "$PWD" | sed 's/[^a-zA-Z0-9]/-/g'; }
+
+valid_room() { printf '%s' "$1" | grep -Eq '^-?[A-Za-z0-9][A-Za-z0-9_-]{0,128}$'; }
+
 # ---------- identity ----------
 
-# resolve_name [session_id] -> prints registered name, rc=1 if not registered
-resolve_name() {
+resolve_name() { # [session_id] -> registered name, rc=1 if not registered
   local sid="${1:-${CLAUDE_CODE_SESSION_ID:-}}"
   [ -n "$AS_NAME" ] && { echo "$AS_NAME"; return 0; }
   [ -z "$sid" ] && return 1
@@ -52,40 +73,44 @@ require_name() {
   echo "$name"
 }
 
+my_rooms() { $JQ -r '.rooms[]' "$REG/$1.json" 2>/dev/null; }
+home_room() { $JQ -r '.home_room' "$REG/$1.json" 2>/dev/null; }
+
 # ---------- core ----------
 
-append_msg() { # from to msg
+append_msg() { # room from to msg
   local line
-  line=$($JQ -cn --arg ts "$(now)" --arg from "$1" --arg to "$2" --arg msg "$3" \
+  line=$($JQ -cn --arg ts "$(now)" --arg from "$2" --arg to "$3" --arg msg "$4" \
     '{ts:$ts,from:$from,to:$to,msg:$msg}') || die "failed to encode message"
-  printf '%s\n' "$line" >> "$CHAT"
+  touch "$ROOMS/$1.jsonl"
+  printf '%s\n' "$line" >> "$ROOMS/$1.jsonl"
 }
 
-fmt_filter() { # jq program: format messages addressed to $me (excludes own)
-  echo 'select(.from != $me and (.to == "*" or .to == $me))
-        | "[\(.ts | sub("T"; " ") | .[0:16])] \(.from)\(if .to != "*" then " → you" else "" end): \(.msg)"'
-}
+FMT_ADDRESSED='select(.from != $me and (.to == "*" or .to == $me))
+  | "[#\($room)] [\(.ts | sub("T"; " ") | .[0:16])] \(.from)\(if .to != "*" then " → you" else "" end): \(.msg)"'
+FMT_PLAIN='"[\(.ts | sub("T"; " ") | .[0:16])] \(.from)\(if .to != "*" then " → \(.to)" else "" end): \(.msg)"'
 
-# deliver <name>: print unread messages addressed to <name>, advance cursor to EOF
+# deliver <name>: print unread addressed to <name> across all joined rooms; advance cursors
 deliver() {
-  local name="$1" total cursor
-  total=$(wc -l < "$CHAT" | tr -d ' ')
-  cursor=$(cat "$CUR/$name" 2>/dev/null || echo 0)
-  case "$cursor" in (*[!0-9]*|'') cursor=0;; esac
-  [ "$total" -le "$cursor" ] && return 0
-  tail -n +"$((cursor + 1))" "$CHAT" | $JQ -r --arg me "$name" "$(fmt_filter)"
-  echo "$total" > "$CUR/$name"
+  local name="$1" room f total cursor curfile chunk out=""
+  while IFS= read -r room; do
+    [ -n "$room" ] || continue
+    f="$ROOMS/$room.jsonl"; [ -e "$f" ] || continue
+    total=$(wc -l < "$f" | tr -d ' ')
+    curfile="$CUR/$name@$room"
+    cursor=$(cat "$curfile" 2>/dev/null || echo 0)
+    case "$cursor" in (*[!0-9]*|'') cursor=0;; esac
+    [ "$total" -le "$cursor" ] && continue
+    chunk=$(tail -n +"$((cursor + 1))" "$f" | $JQ -r --arg me "$name" --arg room "$room" "$FMT_ADDRESSED")
+    echo "$total" > "$curfile"
+    [ -n "$chunk" ] && out="${out}${chunk}"$'\n'
+  done <<< "$(my_rooms "$name")"
+  printf '%s' "$out"
 }
 
-# unread_count <name> (does not advance cursor)
-unread_count() {
-  local name="$1" total cursor
-  total=$(wc -l < "$CHAT" | tr -d ' ')
-  cursor=$(cat "$CUR/$name" 2>/dev/null || echo 0)
-  case "$cursor" in (*[!0-9]*|'') cursor=0;; esac
-  [ "$total" -le "$cursor" ] && { echo 0; return; }
-  tail -n +"$((cursor + 1))" "$CHAT" | $JQ -r --arg me "$name" \
-    'select(.from != $me and (.to == "*" or .to == $me)) | 1' | wc -l | tr -d ' '
+set_cursor_eof() { # name room
+  local f="$ROOMS/$2.jsonl"
+  if [ -e "$f" ]; then wc -l < "$f" | tr -d ' ' > "$CUR/$1@$2"; else echo 0 > "$CUR/$1@$2"; fi
 }
 
 # ---------- commands ----------
@@ -95,50 +120,81 @@ cmd_register() {
   [ -n "$name" ] || die "usage: agent-chat register <name>"
   printf '%s' "$name" | grep -Eq '^[a-z0-9][a-z0-9_-]{0,31}$' \
     || die "name must be short lowercase [a-z0-9_-], e.g. 'summarizer'"
-  local sid="${CLAUDE_CODE_SESSION_ID:-manual-$$}"
-  # drop stale entries for this same session under a different name
+  local sid="${CLAUDE_CODE_SESSION_ID:-manual-$$}" proom rooms_json
+  proom=$(proj_room)
+  # drop stale entries binding this same session to a different name
   local f oldname
   for f in "$REG"/*.json; do
     [ -e "$f" ] || break
     oldname=$($JQ -r --arg sid "$sid" 'select(.session_id == $sid) | .name' "$f")
-    if [ -n "$oldname" ] && [ "$oldname" != "$name" ]; then rm -f "$f" "$CUR/$oldname"; fi
+    if [ -n "$oldname" ] && [ "$oldname" != "$name" ]; then rm -f "$f" "$CUR/$oldname"@*; fi
   done
-  $JQ -n --arg name "$name" --arg sid "$sid" \
-        --arg iterm "${ITERM_SESSION_ID:-}" --arg cwd "$PWD" --arg ts "$(now)" \
-        '{name:$name, session_id:$sid, iterm_session_id:$iterm, cwd:$cwd, registered_at:$ts}' \
-        > "$REG/$name.json"
-  append_msg "system" "*" "$name joined the chat (cwd: $PWD)"
-  # keep an existing cursor (re-registration after a respawn must not lose unread mail)
-  [ -f "$CUR/$name" ] || wc -l < "$CHAT" | tr -d ' ' > "$CUR/$name"
-  echo "Registered as '$name'. Peers currently in the chat:"
+  if [ -e "$REG/$name.json" ]; then
+    # existing identity: silent rebind (new session/window/cwd), keep rooms + cursors
+    rooms_json=$($JQ -c --arg hr "$proom" '(.rooms + [$hr]) | unique' "$REG/$name.json")
+    $JQ -n --arg name "$name" --arg sid "$sid" --arg iterm "${ITERM_SESSION_ID:-}" \
+          --arg cwd "$PWD" --arg ts "$(now)" --arg hr "$proom" --argjson rooms "$rooms_json" \
+          '{name:$name, session_id:$sid, iterm_session_id:$iterm, cwd:$cwd, home_room:$hr, rooms:$rooms, registered_at:$ts}' \
+          > "$REG/$name.json.tmp" && mv "$REG/$name.json.tmp" "$REG/$name.json"
+    local r
+    while IFS= read -r r; do
+      [ -n "$r" ] && [ ! -f "$CUR/$name@$r" ] && set_cursor_eof "$name" "$r"
+    done <<< "$(my_rooms "$name")"
+    echo "Rebound '$name' to this session (silent — no join announcement, cursors kept)."
+  else
+    $JQ -n --arg name "$name" --arg sid "$sid" --arg iterm "${ITERM_SESSION_ID:-}" \
+          --arg cwd "$PWD" --arg ts "$(now)" --arg hr "$proom" \
+          '{name:$name, session_id:$sid, iterm_session_id:$iterm, cwd:$cwd, home_room:$hr, rooms:([$hr,"general"] | unique), registered_at:$ts}' \
+          > "$REG/$name.json"
+    append_msg "$proom" "system" "*" "$name joined (cwd: $PWD)"
+    set_cursor_eof "$name" "$proom"
+    set_cursor_eof "$name" "general"
+    echo "Registered as '$name' (project room: #$proom, also in #general)."
+  fi
+  echo "Agents currently registered:"
   cmd_who
 }
 
 cmd_unregister() {
   local name="${1:-}"
   [ -n "$name" ] || name=$(require_name)
-  rm -f "$REG/$name.json" "$CUR/$name"
-  append_msg "system" "*" "$name left the chat"
+  local hr; hr=$(home_room "$name")
+  rm -f "$REG/$name.json" "$CUR/$name"@*
+  [ -n "$hr" ] && append_msg "$hr" "system" "*" "$name left the chat"
   echo "Unregistered '$name'."
 }
 
 cmd_send() {
-  local to="*" nudge=0 msg=""
+  local room="" to="*" nudge=0 msg=""
   while [ $# -gt 0 ]; do
     case "$1" in
+      --room) room="$2"; shift 2;;
       --to) to="$2"; shift 2;;
       --nudge) nudge=1; shift;;
       *) [ -n "$msg" ] && die "one message per send (quote it)"; msg="$1"; shift;;
     esac
   done
-  [ -n "$msg" ] || die 'usage: agent-chat send "<message>" [--to <name>] [--nudge]'
+  [ -n "$msg" ] || die 'usage: agent-chat send "<message>" [--room <room>] [--to <name>] [--nudge]'
   local from
   from=$(require_name)
+  if [ -z "$room" ]; then
+    # DMs default to #general (every agent is a member — guaranteed delivery);
+    # broadcasts default to the sender's project room
+    if [ "$to" != "*" ]; then room="general"; else room=$(home_room "$from"); fi
+  fi
+  valid_room "$room" || die "invalid room name '$room'"
   if [ "$to" != "*" ] && [ ! -e "$REG/$to.json" ]; then
     echo "warning: no agent named '$to' is registered (sending anyway)" >&2
   fi
-  append_msg "$from" "$to" "$msg"
-  echo "sent."
+  # sending to a room auto-joins it (so replies come back to you)
+  if ! my_rooms "$from" | grep -qxF -- "$room"; then
+    $JQ --arg r "$room" '.rooms = ((.rooms + [$r]) | unique)' "$REG/$from.json" > "$REG/$from.json.tmp" \
+      && mv "$REG/$from.json.tmp" "$REG/$from.json"
+    set_cursor_eof "$from" "$room"
+    echo "(auto-joined #$room)"
+  fi
+  append_msg "$room" "$from" "$to" "$msg"
+  echo "sent to #$room."
   if [ "$nudge" = 1 ]; then
     local f name
     for f in "$REG"/*.json; do
@@ -146,7 +202,8 @@ cmd_send() {
       name=$($JQ -r .name "$f")
       [ "$name" = "$from" ] && continue
       [ "$to" != "*" ] && [ "$name" != "$to" ] && continue
-      do_nudge "$name" "[agent-chat] new message from $from — run: agent-chat read" || true
+      if [ "$to" = "*" ] && ! $JQ -e --arg r "$room" '.rooms | index($r)' "$f" >/dev/null; then continue; fi
+      do_nudge "$name" "[agent-chat] new message from $from in #$room — run: agent-chat read" || true
     done
   fi
 }
@@ -159,18 +216,72 @@ cmd_read() {
 }
 
 cmd_log() {
-  local n="${1:-20}"
-  tail -n "$n" "$CHAT" | $JQ -r \
-    '"[\(.ts | sub("T"; " ") | .[0:16])] \(.from)\(if .to != "*" then " → \(.to)" else "" end): \(.msg)"'
+  local n=20 room=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --room) room="$2"; shift 2;;
+      *) n="$1"; shift;;
+    esac
+  done
+  if [ -z "$room" ]; then
+    local name; name=$(resolve_name) || die "not registered — specify --room <room>"
+    room=$(home_room "$name")
+  fi
+  [ -e "$ROOMS/$room.jsonl" ] || die "no room '#$room'"
+  tail -n "$n" "$ROOMS/$room.jsonl" | $JQ -r "$FMT_PLAIN"
+}
+
+cmd_peek() {
+  local room="${1:-}" n="${2:-20}"
+  [ -n "$room" ] || die "usage: agent-chat peek <room> [N]"
+  [ -e "$ROOMS/$room.jsonl" ] || die "no room '#$room' (agent-chat rooms to list)"
+  tail -n "$n" "$ROOMS/$room.jsonl" | $JQ -r "$FMT_PLAIN"
+}
+
+cmd_rooms() {
+  local name="" f room count last mark
+  name=$(resolve_name) || true
+  for f in "$ROOMS"/*.jsonl; do
+    [ -e "$f" ] || break
+    room=$(basename "$f" .jsonl)
+    count=$(wc -l < "$f" | tr -d ' ')
+    last=$(tail -n 1 "$f" 2>/dev/null | $JQ -r '.ts | sub("T"; " ") | .[0:16]' 2>/dev/null)
+    mark=" "
+    if [ -n "$name" ] && my_rooms "$name" | grep -qxF -- "$room"; then mark="*"; fi
+    printf '%s #%s\t%s msgs\tlast: %s\n' "$mark" "$room" "$count" "${last:-—}"
+  done
+}
+
+cmd_join() {
+  local room="${1:-}" name
+  [ -n "$room" ] || die "usage: agent-chat join <room>"
+  valid_room "$room" || die "invalid room name '$room'"
+  name=$(require_name)
+  my_rooms "$name" | grep -qxF -- "$room" && { echo "already in #$room"; return; }
+  $JQ --arg r "$room" '.rooms = ((.rooms + [$r]) | unique)' "$REG/$name.json" > "$REG/$name.json.tmp" \
+    && mv "$REG/$name.json.tmp" "$REG/$name.json"
+  set_cursor_eof "$name" "$room"
+  echo "Joined #$room (you'll receive messages posted from now on; agent-chat peek $room for history)."
+}
+
+cmd_leave() {
+  local room="${1:-}" name
+  [ -n "$room" ] || die "usage: agent-chat leave <room>"
+  name=$(require_name)
+  [ "$room" = "general" ] && die "#general membership is fixed (DM delivery depends on it)"
+  [ "$room" = "$(home_room "$name")" ] && die "cannot leave your project room"
+  $JQ --arg r "$room" '.rooms = (.rooms - [$r])' "$REG/$name.json" > "$REG/$name.json.tmp" \
+    && mv "$REG/$name.json.tmp" "$REG/$name.json"
+  rm -f "$CUR/$name@$room"
+  echo "Left #$room."
 }
 
 cmd_who() {
-  local f
-  local found=0
+  local f found=0
   for f in "$REG"/*.json; do
     [ -e "$f" ] || break
     found=1
-    $JQ -r '"  \(.name)\t\(.cwd)\tsince \(.registered_at | sub("T"; " ") | .[0:16])"' "$f"
+    $JQ -r '"  \(.name)\thome: #\(.home_room)\trooms: \(.rooms | map("#" + .) | join(", "))\tcwd: \(.cwd)"' "$f"
   done
   [ "$found" = 1 ] || echo "  (nobody registered)"
 }
@@ -184,7 +295,6 @@ do_nudge() { # name [text]
   iterm=$($JQ -r '.iterm_session_id // empty' "$f")
   [ -n "$iterm" ] || die "'$name' has no iTerm session recorded; cannot nudge"
   uuid="${iterm#*:}"
-  # sanitize for AppleScript string literal
   text=$(printf '%s' "$text" | tr -d '"\\')
   osascript - "$uuid" "$text" <<'APPLESCRIPT'
 on run argv
@@ -212,7 +322,6 @@ APPLESCRIPT
 cmd_hook() {
   local event="$1" input sid name text payload
   input=$(cat)
-  # fast exits: empty registry, or session not registered
   local files=("$REG"/*.json)
   [ -e "${files[0]}" ] || exit 0
   sid=$(printf '%s' "$input" | $JQ -r '.session_id // empty' 2>/dev/null)
@@ -223,7 +332,7 @@ cmd_hook() {
   payload="📨 agent-chat — new message(s) for you ('$name'):
 $text
 
-If a reply or coordination is needed, respond with: agent-chat send \"...\" (add --to <sender> for a DM). If purely informational, take note and continue."
+If a reply or coordination is needed, respond with: agent-chat send \"...\" (add --to <sender> for a DM, --room <room> to answer in that room). If purely informational, take note and continue."
   case "$event" in
     Stop)
       $JQ -n --arg r "$payload
@@ -256,10 +365,14 @@ case "$cmd" in
   send)       cmd_send "$@";;
   read)       cmd_read "$@";;
   log)        cmd_log "$@";;
+  rooms)      cmd_rooms "$@";;
+  join)       cmd_join "$@";;
+  leave)      cmd_leave "$@";;
+  peek)       cmd_peek "$@";;
   who)        cmd_who "$@";;
   nudge)      do_nudge "$@";;
   hook)       cmd_hook "$@";;
   help|--help|-h)
-    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//';;
+    sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//';;
   *) die "unknown command '$cmd' (try: agent-chat help)";;
 esac

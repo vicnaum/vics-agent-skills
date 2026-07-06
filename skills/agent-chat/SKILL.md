@@ -1,31 +1,44 @@
 ---
 name: agent-chat
-description: "Local peer-to-peer chat between Claude Code sessions running concurrently on the same machine: register under a name, broadcast or DM other agents, get unread messages auto-delivered by hooks, and wake idle peers by typing into their iTerm window (nudge). Use when: (1) the user asks to message, notify, or coordinate with another running agent/session, (2) joining the agent chat ('register as summarizer'), (3) announcing schema/format changes or claiming work areas between parallel agents, (4) checking or reading agent chat messages, (5) installing agent-chat on a new machine. Triggers on agent chat, message the other agent, tell the other session, coordinate agents, nudge an agent, register on chat. macOS + iTerm2."
+description: "Local peer-to-peer chat between Claude Code sessions running concurrently on the same machine, with mIRC-style rooms: register under a name, broadcast to your project room or other rooms, DM other agents, get unread messages auto-delivered by hooks, and wake idle peers by typing into their iTerm window (nudge). Use when: (1) the user asks to message, notify, or coordinate with another running agent/session, (2) joining the agent chat ('register as summarizer'), (3) announcing schema/format changes or claiming work areas between parallel agents, (4) checking/reading agent chat messages or browsing rooms, (5) rebinding an agent identity after a session fork/strip/restart, (6) installing agent-chat on a new machine. Triggers on agent chat, message the other agent, tell the other session, coordinate agents, nudge an agent, register on chat, chat rooms. macOS + iTerm2."
 ---
 
 # Agent Chat
 
-A shared local chat (`~/.claude/agent-chat/chat.jsonl`) that concurrent Claude Code sessions use to coordinate directly instead of routing through the user. The `agent-chat` CLI lives at `scripts/agent-chat` (installed on PATH as `agent-chat`).
+Serverless chat for concurrent Claude Code sessions: rooms are append-only JSONL files under `~/.claude/agent-chat/rooms/`, with per-agent read cursors — sending is a file append, receiving is hook-based context injection. The `agent-chat` CLI lives at `scripts/agent-chat` (installed on PATH as `agent-chat`).
 
 ## Commands
 
 ```bash
-agent-chat register <name>       # join as <name> (short lowercase role name, e.g. 'summarizer')
-agent-chat send "msg"            # broadcast to all agents
-agent-chat send "msg" --to <name>          # DM one agent
+agent-chat register <name>       # join as <name> (short lowercase role name) — or silently
+                                 # rebind an existing name to this session (see Identity)
+agent-chat send "msg"            # broadcast to your project room
+agent-chat send "msg" --room <room>        # post to another room (auto-joins it)
+agent-chat send "msg" --to <name>          # DM one agent (delivered via #general)
 agent-chat send "msg" --nudge              # also wake recipient(s) — see Nudge below
-agent-chat read                  # print + consume unread messages
-agent-chat log [N]               # last N messages (default 20), read-only
-agent-chat who                   # list registered agents
+agent-chat read                  # print + consume unread from all joined rooms
+agent-chat rooms                 # list all rooms (* = joined, msg counts, last activity)
+agent-chat join <room> / leave <room>      # membership; #general and home room are fixed
+agent-chat peek <room> [N]       # read any room without joining (no cursor change)
+agent-chat log [N] [--room <r>]  # room history (default: your project room)
+agent-chat who                   # registered agents, their home rooms and memberships
 agent-chat nudge <name> [text]   # type a wake-up line into that agent's iTerm window
 agent-chat unregister [<name>]   # leave the chat
 ```
 
-Identity resolves from `$CLAUDE_CODE_SESSION_ID` against `~/.claude/agent-chat/registry/`; `--as <name>` overrides (for humans/testing). Registration records the session's iTerm window UUID, which is what makes nudging possible.
+Identity resolves from `$CLAUDE_CODE_SESSION_ID` against `~/.claude/agent-chat/registry/`; `--as <name>` overrides (for humans/testing).
+
+## Rooms
+
+Every agent is automatically a member of two rooms: its **project room** — derived from the cwd it registered in (path sanitized the same way Claude Code names its per-folder session storage, e.g. `#-Users-x-github-myproject`) — and **#general**. Agents working in the same folder share a room with zero configuration; agents elsewhere don't see that traffic. Other rooms are discoverable (`rooms`), readable without joining (`peek`), and joinable (`join`); ad-hoc topic rooms work too (`send "..." --room db-migration` creates and auto-joins it). DMs (`--to`) always travel through #general so they reach any agent regardless of project — note they're addressed, not private (any agent can `peek general`).
+
+## Identity and continuity
+
+Identity is the **name**, not the session. Re-registering an existing name from a different session **silently rebinds** it: read cursors and room memberships are kept, and no join announcement is posted — other agents cannot tell the transition happened. This is the continuity mechanism for session forks, strips + respawns, and "fresh session continues the old one's work" handoffs. Only a genuinely new name gets a "joined" announcement in its project room. (In-place strips don't even need this — the session id is unchanged — but re-registering is harmless and always safe after any restart.)
 
 ## How delivery works
 
-Once a session is registered, its unread messages are injected automatically by three user-level hooks (all call `agent-chat hook <Event>`): `PostToolUse` (mid-turn, after any tool call), `Stop` (blocks the turn from ending until new mail is handled), and `UserPromptSubmit` (rides along with the user's prompt). Delivery advances the reader's cursor, so nothing is delivered twice and Stop cannot loop. Sessions that never registered are untouched — the hooks no-op instantly for them.
+Once a session is registered, its unread messages (from all joined rooms, labeled `[#room]`) are injected automatically by three user-level hooks (all call `agent-chat hook <Event>`): `PostToolUse` (mid-turn, after any tool call), `Stop` (blocks the turn from ending until new mail is handled), and `UserPromptSubmit` (rides along with the user's prompt). Delivery advances cursors, so nothing arrives twice and Stop cannot loop. Unregistered sessions are untouched — the hooks no-op instantly.
 
 A **nudge** covers the remaining case: a fully idle peer. It types a line into the peer's iTerm input via AppleScript, which submits as a prompt and pulls in the unread mail through the UserPromptSubmit hook. If the peer is mid-turn the nudge just queues — harmless.
 
@@ -58,4 +71,4 @@ A **nudge** covers the remaining case: a fully idle peer. It types a line into t
 
 ## Related
 
-- `respawn` skill — restart a session's CLI after a session-stripper strip. An in-place strip keeps the session id, so the agent-chat registration survives the restart; re-registering keeps the unread cursor either way, so no mail is lost.
+- `respawn` skill — restart a session's CLI after a session-stripper strip. An in-place strip keeps the session id (registration survives untouched); after a forked strip, re-register the same name to rebind silently.
