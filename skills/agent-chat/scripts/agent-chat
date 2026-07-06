@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+# agent-chat — local peer-to-peer chat between Claude Code sessions on this machine.
+#
+# Messages live in ~/.claude/agent-chat/chat.jsonl. Each registered session gets
+# unread messages auto-delivered via Claude Code hooks (UserPromptSubmit, PostToolUse,
+# Stop). `nudge` wakes an idle session by typing into its iTerm window (AppleScript).
+#
+# Usage:
+#   agent-chat register <name>              join the chat as <name> (run from inside a session)
+#   agent-chat send "<msg>" [--to <name>] [--nudge]
+#                                           broadcast (default) or DM; --nudge wakes idle recipient(s)
+#   agent-chat read                         print + consume unread messages
+#   agent-chat log [N]                      show last N messages (default 20), read-only
+#   agent-chat who                          list registered agents
+#   agent-chat nudge <name> [text]          type a wake-up line into that agent's iTerm window
+#   agent-chat unregister [<name>]          leave the chat (default: self)
+#   agent-chat hook <EventName>             internal: called by Claude Code hooks (stdin = hook JSON)
+#
+# Identity: resolved from $CLAUDE_CODE_SESSION_ID against the registry.
+# Manual override for humans/testing: --as <name> (global flag).
+
+BASE="$HOME/.claude/agent-chat"
+CHAT="$BASE/chat.jsonl"
+REG="$BASE/registry"
+CUR="$BASE/cursors"
+JQ="/usr/bin/jq"
+
+mkdir -p "$REG" "$CUR"
+touch "$CHAT"
+
+die() { echo "agent-chat: $*" >&2; exit 1; }
+now() { date +"%Y-%m-%dT%H:%M:%S%z"; }
+
+# ---------- identity ----------
+
+# resolve_name [session_id] -> prints registered name, rc=1 if not registered
+resolve_name() {
+  local sid="${1:-${CLAUDE_CODE_SESSION_ID:-}}"
+  [ -n "$AS_NAME" ] && { echo "$AS_NAME"; return 0; }
+  [ -z "$sid" ] && return 1
+  local files=("$REG"/*.json)
+  [ -e "${files[0]}" ] || return 1
+  local name
+  name=$($JQ -r --arg sid "$sid" 'select(.session_id == $sid) | .name' "${files[@]}" 2>/dev/null | head -n1)
+  [ -n "$name" ] || return 1
+  echo "$name"
+}
+
+require_name() {
+  local name
+  name=$(resolve_name) || die "this session is not registered. Run: agent-chat register <short-name>"
+  echo "$name"
+}
+
+# ---------- core ----------
+
+append_msg() { # from to msg
+  local line
+  line=$($JQ -cn --arg ts "$(now)" --arg from "$1" --arg to "$2" --arg msg "$3" \
+    '{ts:$ts,from:$from,to:$to,msg:$msg}') || die "failed to encode message"
+  printf '%s\n' "$line" >> "$CHAT"
+}
+
+fmt_filter() { # jq program: format messages addressed to $me (excludes own)
+  echo 'select(.from != $me and (.to == "*" or .to == $me))
+        | "[\(.ts | sub("T"; " ") | .[0:16])] \(.from)\(if .to != "*" then " → you" else "" end): \(.msg)"'
+}
+
+# deliver <name>: print unread messages addressed to <name>, advance cursor to EOF
+deliver() {
+  local name="$1" total cursor
+  total=$(wc -l < "$CHAT" | tr -d ' ')
+  cursor=$(cat "$CUR/$name" 2>/dev/null || echo 0)
+  case "$cursor" in (*[!0-9]*|'') cursor=0;; esac
+  [ "$total" -le "$cursor" ] && return 0
+  tail -n +"$((cursor + 1))" "$CHAT" | $JQ -r --arg me "$name" "$(fmt_filter)"
+  echo "$total" > "$CUR/$name"
+}
+
+# unread_count <name> (does not advance cursor)
+unread_count() {
+  local name="$1" total cursor
+  total=$(wc -l < "$CHAT" | tr -d ' ')
+  cursor=$(cat "$CUR/$name" 2>/dev/null || echo 0)
+  case "$cursor" in (*[!0-9]*|'') cursor=0;; esac
+  [ "$total" -le "$cursor" ] && { echo 0; return; }
+  tail -n +"$((cursor + 1))" "$CHAT" | $JQ -r --arg me "$name" \
+    'select(.from != $me and (.to == "*" or .to == $me)) | 1' | wc -l | tr -d ' '
+}
+
+# ---------- commands ----------
+
+cmd_register() {
+  local name="$1"
+  [ -n "$name" ] || die "usage: agent-chat register <name>"
+  printf '%s' "$name" | grep -Eq '^[a-z0-9][a-z0-9_-]{0,31}$' \
+    || die "name must be short lowercase [a-z0-9_-], e.g. 'summarizer'"
+  local sid="${CLAUDE_CODE_SESSION_ID:-manual-$$}"
+  # drop stale entries for this same session under a different name
+  local f oldname
+  for f in "$REG"/*.json; do
+    [ -e "$f" ] || break
+    oldname=$($JQ -r --arg sid "$sid" 'select(.session_id == $sid) | .name' "$f")
+    if [ -n "$oldname" ] && [ "$oldname" != "$name" ]; then rm -f "$f" "$CUR/$oldname"; fi
+  done
+  $JQ -n --arg name "$name" --arg sid "$sid" \
+        --arg iterm "${ITERM_SESSION_ID:-}" --arg cwd "$PWD" --arg ts "$(now)" \
+        '{name:$name, session_id:$sid, iterm_session_id:$iterm, cwd:$cwd, registered_at:$ts}' \
+        > "$REG/$name.json"
+  append_msg "system" "*" "$name joined the chat (cwd: $PWD)"
+  # keep an existing cursor (re-registration after a respawn must not lose unread mail)
+  [ -f "$CUR/$name" ] || wc -l < "$CHAT" | tr -d ' ' > "$CUR/$name"
+  echo "Registered as '$name'. Peers currently in the chat:"
+  cmd_who
+}
+
+cmd_unregister() {
+  local name="${1:-}"
+  [ -n "$name" ] || name=$(require_name)
+  rm -f "$REG/$name.json" "$CUR/$name"
+  append_msg "system" "*" "$name left the chat"
+  echo "Unregistered '$name'."
+}
+
+cmd_send() {
+  local to="*" nudge=0 msg=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --to) to="$2"; shift 2;;
+      --nudge) nudge=1; shift;;
+      *) [ -n "$msg" ] && die "one message per send (quote it)"; msg="$1"; shift;;
+    esac
+  done
+  [ -n "$msg" ] || die 'usage: agent-chat send "<message>" [--to <name>] [--nudge]'
+  local from
+  from=$(require_name)
+  if [ "$to" != "*" ] && [ ! -e "$REG/$to.json" ]; then
+    echo "warning: no agent named '$to' is registered (sending anyway)" >&2
+  fi
+  append_msg "$from" "$to" "$msg"
+  echo "sent."
+  if [ "$nudge" = 1 ]; then
+    local f name
+    for f in "$REG"/*.json; do
+      [ -e "$f" ] || break
+      name=$($JQ -r .name "$f")
+      [ "$name" = "$from" ] && continue
+      [ "$to" != "*" ] && [ "$name" != "$to" ] && continue
+      do_nudge "$name" "[agent-chat] new message from $from — run: agent-chat read" || true
+    done
+  fi
+}
+
+cmd_read() {
+  local name out
+  name=$(require_name)
+  out=$(deliver "$name")
+  if [ -n "$out" ]; then printf '%s\n' "$out"; else echo "No new messages."; fi
+}
+
+cmd_log() {
+  local n="${1:-20}"
+  tail -n "$n" "$CHAT" | $JQ -r \
+    '"[\(.ts | sub("T"; " ") | .[0:16])] \(.from)\(if .to != "*" then " → \(.to)" else "" end): \(.msg)"'
+}
+
+cmd_who() {
+  local f
+  local found=0
+  for f in "$REG"/*.json; do
+    [ -e "$f" ] || break
+    found=1
+    $JQ -r '"  \(.name)\t\(.cwd)\tsince \(.registered_at | sub("T"; " ") | .[0:16])"' "$f"
+  done
+  [ "$found" = 1 ] || echo "  (nobody registered)"
+}
+
+do_nudge() { # name [text]
+  local name="$1"
+  local text="${2:-[agent-chat] you have new messages — run: agent-chat read}"
+  local f="$REG/$name.json"
+  [ -e "$f" ] || die "no agent named '$name' is registered"
+  local iterm uuid
+  iterm=$($JQ -r '.iterm_session_id // empty' "$f")
+  [ -n "$iterm" ] || die "'$name' has no iTerm session recorded; cannot nudge"
+  uuid="${iterm#*:}"
+  # sanitize for AppleScript string literal
+  text=$(printf '%s' "$text" | tr -d '"\\')
+  osascript - "$uuid" "$text" <<'APPLESCRIPT'
+on run argv
+  set targetId to item 1 of argv
+  set msg to item 2 of argv
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if (id of s as text) is equal to targetId then
+            tell s to write text msg
+            return "nudged"
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return "session not found (window closed?)"
+end run
+APPLESCRIPT
+}
+
+# ---------- hook mode ----------
+
+cmd_hook() {
+  local event="$1" input sid name text payload
+  input=$(cat)
+  # fast exits: empty registry, or session not registered
+  local files=("$REG"/*.json)
+  [ -e "${files[0]}" ] || exit 0
+  sid=$(printf '%s' "$input" | $JQ -r '.session_id // empty' 2>/dev/null)
+  [ -n "$sid" ] || exit 0
+  name=$(resolve_name "$sid") || exit 0
+  text=$(deliver "$name")
+  [ -n "$text" ] || exit 0
+  payload="📨 agent-chat — new message(s) for you ('$name'):
+$text
+
+If a reply or coordination is needed, respond with: agent-chat send \"...\" (add --to <sender> for a DM). If purely informational, take note and continue."
+  case "$event" in
+    Stop)
+      $JQ -n --arg r "$payload
+If nothing is actionable, acknowledge briefly and stop." '{decision:"block", reason:$r}'
+      ;;
+    UserPromptSubmit|PostToolUse)
+      $JQ -n --arg e "$event" --arg t "$payload" \
+        '{hookSpecificOutput:{hookEventName:$e, additionalContext:$t}}'
+      ;;
+    *) exit 0;;
+  esac
+}
+
+# ---------- main ----------
+
+AS_NAME=""
+ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --as) AS_NAME="$2"; shift 2;;
+    *) ARGS+=("$1"); shift;;
+  esac
+done
+set -- "${ARGS[@]}"
+
+cmd="${1:-help}"; shift 2>/dev/null || true
+case "$cmd" in
+  register)   cmd_register "$@";;
+  unregister) cmd_unregister "$@";;
+  send)       cmd_send "$@";;
+  read)       cmd_read "$@";;
+  log)        cmd_log "$@";;
+  who)        cmd_who "$@";;
+  nudge)      do_nudge "$@";;
+  hook)       cmd_hook "$@";;
+  help|--help|-h)
+    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//';;
+  *) die "unknown command '$cmd' (try: agent-chat help)";;
+esac
