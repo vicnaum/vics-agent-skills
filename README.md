@@ -224,7 +224,7 @@ Two terminal backends, auto-detected per agent: **iTerm2** (AppleScript) and **t
 | `nudge <name> [text]` | wake an idle agent (types a prompt into its iTerm window) |
 | `screen <name> [N]` | live snapshot of the agent's visible terminal |
 | `type <name> "text"` / `key <name> <keys...>` | remote-drive its TUI: escape, enter, ctrl-c, arrows, tab... |
-| `spawn <name> [--dir d] [--prompt "task"] [--tmux]` | launch a new self-registering agent in a new window/tmux session |
+| `spawn <name> [--dir d] [--prompt "task"] [--tab\|--pane\|--tmux]` | launch a new self-registering agent — new window, tab, split pane, or tmux session |
 
 #### Example ask
 

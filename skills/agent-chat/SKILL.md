@@ -27,9 +27,10 @@ agent-chat type <name> "text"    # type into that agent's input box WITHOUT subm
 agent-chat screen <name> [N]     # live snapshot of that agent's visible terminal
 agent-chat key <name> <key...>   # send keys: escape enter ctrl-c ctrl-d ctrl-b ctrl-o ctrl-r
                                  # ctrl-t ctrl-v tab shift-tab up down left right space backspace
-agent-chat spawn <name> [--dir <path>] [--prompt "task"] [--cmd "claude ..."] [--tmux]
-                                 # launch a NEW agent (new iTerm window, or detached tmux
-                                 # session with --tmux / on headless boxes); it inherits this
+agent-chat spawn <name> [--dir <path>] [--prompt "task"] [--cmd "claude ..."] [--tab|--pane] [--tmux]
+                                 # launch a NEW agent — new iTerm window (default), a new tab
+                                 # in your window (--tab), a split pane next to you (--pane), or
+                                 # a detached tmux session (--tmux / headless). It inherits this
                                  # session's CLI flags and registers itself as <name>
 agent-chat unregister [<name>]   # leave the chat
 ```
@@ -50,7 +51,9 @@ Each agent's terminal is recorded at registration and auto-detected: a tmux pane
 
 ## Spawning new agents
 
-`spawn <name> --prompt "task"` creates the terminal (new iTerm window, or detached tmux session when `--tmux` or no GUI), launches the CLI reusing the spawning session's own flags (minus session selectors), waits for boot, and types a kickoff prompt with **verify-and-retry** (input typed during TUI startup gets swallowed; the screen is checked to confirm the prompt landed). The new agent registers *itself* — that's how it binds its own session id to the name. Verified end-to-end: two spawned agents autonomously exchanged a DM + nudge and posted the reply, with no human involved.
+`spawn <name> --prompt "task"` creates the terminal and launches the CLI reusing the spawning session's own flags (minus session selectors), waits for boot, and types a kickoff prompt. Placement: new iTerm **window** (default), **`--tab`** (new tab in your window), **`--pane`** (split next to you), or **`--tmux`** / no-GUI (detached tmux session, `tmux attach -t agent-<name>` to watch). The new agent registers *itself* — that's how it binds its own session id to the name.
+
+Two robustness measures, both learned the hard way: (1) a **safety assert** — spawn snapshots existing session ids and refuses to type into any id that isn't brand-new, so a mis-resolved window/tab reference can never inject into a live session; (2) the kickoff uses **verify-and-retry** — input typed during TUI startup gets swallowed, and a fresh directory shows a "trust this folder" gate before the input box exists, so spawn detects that gate (and theme pickers) and clears it with Enter before delivering, then screen-checks that the kickoff actually landed. Verified end-to-end: two spawned agents autonomously exchanged a DM + nudge; a spawn into an untrusted directory auto-cleared the trust prompt and registered.
 
 ## How delivery works
 
