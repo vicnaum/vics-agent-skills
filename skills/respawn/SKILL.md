@@ -1,11 +1,11 @@
 ---
 name: respawn
-description: "Restart the current Claude Code CLI in its own iTerm window and resume a session — the external relaunch step an agent cannot perform on itself. Use when: (1) the session's context is nearly full and was just stripped in place with session-stripper, so the CLI must restart to load the smaller transcript, (2) resuming a forked stripped session under a new session id, (3) the user or the agent says respawn, restart yourself, restart the CLI, reload the session, or resume after strip. macOS + iTerm2 only."
+description: "Restart the current Claude Code CLI in its own terminal (iTerm2 window or tmux pane) and resume a session — the external relaunch step an agent cannot perform on itself. Use when: (1) the session's context is nearly full and was just stripped in place with session-stripper, so the CLI must restart to load the smaller transcript, (2) resuming a forked stripped session under a new session id, (3) the user or the agent says respawn, restart yourself, restart the CLI, reload the session, or resume after strip. Backends: iTerm2 (macOS) and tmux (works headless, e.g. Linux servers)."
 ---
 
 # Respawn
 
-Restarts the Claude Code CLI in the current iTerm window and resumes a session, via a detached watcher that types into the window over AppleScript. Companion to the `session-stripper` skill: stripping shrinks the transcript on disk, but only a CLI restart loads it as the new (smaller) context.
+Restarts the Claude Code CLI in the current terminal (iTerm2 window via AppleScript, or tmux pane via send-keys — works headless) and resumes a session, via a detached watcher that types into it. Companion to the `session-stripper` skill: stripping shrinks the transcript on disk, but only a CLI restart loads it as the new (smaller) context.
 
 ## Workflow (context nearly full)
 
@@ -23,7 +23,7 @@ Run inside the session that needs restarting:
 
 ## How it works
 
-`respawn.sh` targets its own window via `$ITERM_SESSION_ID` and defaults the session to `$CLAUDE_CODE_SESSION_ID` (both exported to Bash tool calls; the env session id matches the real transcript id). It rebuilds the relaunch command from the live CLI's `ps` entry: **all flags are preserved** (`--dangerously-skip-permissions`, `--model`, ...) **except session selectors, which are stripped** so a stale selector can't resume the wrong session: `-c/--continue`, `-r/--resume [id]`, `--from-pr [ref]`, `--session-id <id>`, `--fork-session`, and `-w/--worktree [name]`/`--tmux`. Then `--resume <sid>` is appended. The command is printed for sanity-checking before the turn ends.
+`respawn.sh` targets its own terminal — a tmux pane via `$TMUX_PANE` (wins when both are set) or an iTerm window via `$ITERM_SESSION_ID` — and defaults the session to `$CLAUDE_CODE_SESSION_ID` (all exported to Bash tool calls; the env session id matches the real transcript id). It rebuilds the relaunch command from the live CLI's `ps` entry: **all flags are preserved** (`--dangerously-skip-permissions`, `--model`, ...) **except session selectors, which are stripped** so a stale selector can't resume the wrong session: `-c/--continue`, `-r/--resume [id]`, `--from-pr [ref]`, `--session-id <id>`, `--fork-session`, and `-w/--worktree [name]`/`--tmux`. Then `--resume <sid>` is appended. The command is printed for sanity-checking before the turn ends.
 
 A detached watcher (`scripts/respawn-watcher.sh`, survives the CLI exiting) then:
 

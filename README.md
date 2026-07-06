@@ -208,9 +208,11 @@ Serverless local chat between Claude Code sessions running concurrently on the s
 
 Identity is the *name*, not the session: re-registering the same name after a fork/strip/restart silently rebinds it — cursors kept, no join announcement, peers can't tell the transition happened.
 
-Also includes remote control of peers via AppleScript typing into their iTerm windows: wake an idle agent (`nudge`), watch what one is doing right now (`screen` — spinner, running tool, stuck permission prompt), stop a runaway one (`key <name> escape`), or drive it with any shortcut (`type <name> "/compact"` + `key <name> enter`).
+Also includes remote control of peers by typing into their terminals: wake an idle agent (`nudge`), watch what one is doing right now (`screen` — spinner, running tool, stuck permission prompt), stop a runaway one (`key <name> escape`), drive it with any shortcut (`type <name> "/compact"` + `key <name> enter`) — or **spawn a brand-new agent** into a fresh iTerm window or detached tmux session (`spawn <name> --prompt "task"`); it inherits your CLI flags and registers itself in the chat.
 
-> macOS + iTerm2 + `jq`. Needs three hooks in `~/.claude/settings.json` — see the [SKILL.md](skills/agent-chat/SKILL.md) install section.
+Two terminal backends, auto-detected per agent: **iTerm2** (AppleScript) and **tmux** (`send-keys`/`capture-pane`) — the tmux backend works fully headless, e.g. agents on a Linux server over SSH. The chat core itself is plain bash+jq+files and runs anywhere.
+
+> macOS iTerm2 and/or tmux + `jq`. Needs three hooks in `~/.claude/settings.json` — see the [SKILL.md](skills/agent-chat/SKILL.md) install section.
 
 | Command | What it does |
 |---------|-------------|
@@ -222,6 +224,7 @@ Also includes remote control of peers via AppleScript typing into their iTerm wi
 | `nudge <name> [text]` | wake an idle agent (types a prompt into its iTerm window) |
 | `screen <name> [N]` | live snapshot of the agent's visible terminal |
 | `type <name> "text"` / `key <name> <keys...>` | remote-drive its TUI: escape, enter, ctrl-c, arrows, tab... |
+| `spawn <name> [--dir d] [--prompt "task"] [--tmux]` | launch a new self-registering agent in a new window/tmux session |
 
 #### Example ask
 
@@ -239,7 +242,7 @@ Companion to session-stripper: stripping shrinks the session file on disk, but o
 
 The relaunch command is rebuilt from the live process: all flags are preserved (`--dangerously-skip-permissions`, `--model`, ...) except session selectors (`-r/--resume`, `-c/--continue`, `--session-id`, `--fork-session`, `--from-pr`), which are stripped so a stale selector can't resume the wrong session. Defaults to the current session id (in-place strips); pass the new id after a forked strip. `--dry-run` rehearses everything without touching the window.
 
-> macOS + iTerm2. Watcher log at `~/.claude/respawn/respawn.log`.
+> iTerm2 or tmux (works headless, e.g. Linux servers). Watcher log at `~/.claude/respawn/respawn.log`.
 
 #### Example ask
 

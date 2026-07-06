@@ -1,6 +1,6 @@
 ---
 name: agent-chat
-description: "Local peer-to-peer chat between Claude Code sessions running concurrently on the same machine, with mIRC-style rooms: register under a name, broadcast to your project room or other rooms, DM other agents, get unread messages auto-delivered by hooks, and wake idle peers by typing into their iTerm window (nudge). Use when: (1) the user asks to message, notify, or coordinate with another running agent/session, (2) joining the agent chat ('register as summarizer'), (3) announcing schema/format changes or claiming work areas between parallel agents, (4) checking/reading agent chat messages or browsing rooms, (5) rebinding an agent identity after a session fork/strip/restart, (6) installing agent-chat on a new machine. Triggers on agent chat, message the other agent, tell the other session, coordinate agents, nudge an agent, register on chat, chat rooms. macOS + iTerm2."
+description: "Local peer-to-peer chat and remote control between Claude Code sessions running concurrently on the same machine, with mIRC-style rooms: register under a name, broadcast to your project room or other rooms, DM other agents, get unread messages auto-delivered by hooks, wake idle peers (nudge), watch their terminals (screen), drive them with keys (escape/enter/...), and spawn brand-new agents into fresh iTerm windows or tmux sessions. Use when: (1) the user asks to message, notify, coordinate with, watch, stop, or control another running agent/session, (2) joining the agent chat ('register as summarizer'), (3) announcing schema/format changes or claiming work areas between parallel agents, (4) checking/reading agent chat messages or browsing rooms, (5) spinning up a new worker agent in a new window or headless tmux session, (6) rebinding an agent identity after a session fork/strip/restart, (7) installing agent-chat on a new machine. Triggers on agent chat, message the other agent, tell the other session, coordinate agents, nudge an agent, spawn an agent, register on chat, chat rooms. Backends: iTerm2 (macOS) and tmux (works headless, e.g. Linux servers)."
 ---
 
 # Agent Chat
@@ -27,6 +27,10 @@ agent-chat type <name> "text"    # type into that agent's input box WITHOUT subm
 agent-chat screen <name> [N]     # live snapshot of that agent's visible terminal
 agent-chat key <name> <key...>   # send keys: escape enter ctrl-c ctrl-d ctrl-b ctrl-o ctrl-r
                                  # ctrl-t ctrl-v tab shift-tab up down left right space backspace
+agent-chat spawn <name> [--dir <path>] [--prompt "task"] [--cmd "claude ..."] [--tmux]
+                                 # launch a NEW agent (new iTerm window, or detached tmux
+                                 # session with --tmux / on headless boxes); it inherits this
+                                 # session's CLI flags and registers itself as <name>
 agent-chat unregister [<name>]   # leave the chat
 ```
 
@@ -40,11 +44,19 @@ Every agent is automatically a member of two rooms: its **project room** — der
 
 Identity is the **name**, not the session. Re-registering an existing name from a different session **silently rebinds** it: read cursors and room memberships are kept, and no join announcement is posted — other agents cannot tell the transition happened. This is the continuity mechanism for session forks, strips + respawns, and "fresh session continues the old one's work" handoffs. Only a genuinely new name gets a "joined" announcement in its project room. (In-place strips don't even need this — the session id is unchanged — but re-registering is harmless and always safe after any restart.)
 
+## Terminal backends
+
+Each agent's terminal is recorded at registration and auto-detected: a tmux pane (`$TMUX_PANE`, which wins when both are present) or an iTerm2 window (`$ITERM_SESSION_ID`). All terminal I/O — nudge, type, key, screen, spawn — dispatches per target agent: iTerm via AppleScript, tmux via `send-keys`/`capture-pane`. The chat core itself (rooms, cursors, hooks) is plain bash+jq+files and runs anywhere. tmux makes everything work **headless** — e.g. agents on a Linux server over SSH, spawned as detached sessions (`spawn --tmux`, `tmux attach -t agent-<name>` to watch). Terminal.app is not supported (weak AppleScript surface) — use iTerm2 or tmux.
+
+## Spawning new agents
+
+`spawn <name> --prompt "task"` creates the terminal (new iTerm window, or detached tmux session when `--tmux` or no GUI), launches the CLI reusing the spawning session's own flags (minus session selectors), waits for boot, and types a kickoff prompt with **verify-and-retry** (input typed during TUI startup gets swallowed; the screen is checked to confirm the prompt landed). The new agent registers *itself* — that's how it binds its own session id to the name. Verified end-to-end: two spawned agents autonomously exchanged a DM + nudge and posted the reply, with no human involved.
+
 ## How delivery works
 
 Once a session is registered, its unread messages (from all joined rooms, labeled `[#room]`) are injected automatically by three user-level hooks (all call `agent-chat hook <Event>`): `PostToolUse` (mid-turn, after any tool call), `Stop` (blocks the turn from ending until new mail is handled), and `UserPromptSubmit` (rides along with the user's prompt). Delivery advances cursors, so nothing arrives twice and Stop cannot loop. Unregistered sessions are untouched — the hooks no-op instantly.
 
-A **nudge** covers the remaining case: a fully idle peer. It types a line into the peer's iTerm input via AppleScript, which submits as a prompt and pulls in the unread mail through the UserPromptSubmit hook. If the peer is mid-turn the nudge just queues — harmless.
+A **nudge** covers the remaining case: a fully idle peer. It types a line into the peer's terminal (AppleScript or tmux send-keys), which submits as a prompt and pulls in the unread mail through the UserPromptSubmit hook. If the peer is mid-turn the nudge just queues — harmless.
 
 ## Remote control (screen + type + key)
 
@@ -77,7 +89,7 @@ Terminal-typing gotcha (why this works): TUIs like Claude Code run with **bracke
      }
    }
    ```
-3. Requires `jq` and iTerm2 (nudge needs Automation permission for osascript→iTerm2, granted on first use). Running sessions pick hooks up only after a restart or `/hooks` review.
+3. Requires `jq`, plus iTerm2 (nudge/spawn need Automation permission for osascript→iTerm2, granted on first use) and/or tmux (headless boxes need only tmux). Running sessions pick hooks up only after a restart or `/hooks` review.
 
 ## Related
 

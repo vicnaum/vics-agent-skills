@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# respawn.sh — schedule a restart of THIS Claude Code CLI in its own iTerm
-# window, resuming a session (typically right after a session-stripper strip).
-# The agent calls this as its LAST action, then ends its turn; a detached
-# watcher does the rest.
+# respawn.sh — schedule a restart of THIS Claude Code CLI in its own terminal
+# (iTerm window or tmux pane), resuming a session (typically right after a
+# session-stripper strip). The agent calls this as its LAST action, then ends
+# its turn; a detached watcher does the rest.
 #
 # Usage:
 #   respawn.sh [<session-id>] [--prompt "kickoff"] [--grace N] [--force] [--cmd "claude ..."] [--dry-run]
@@ -16,6 +16,9 @@
 # --cmd         full relaunch command override, e.g. --cmd "claude --model opus".
 #               Skips ps-based reconstruction; --resume <sid> is appended.
 # --dry-run     watcher logs what it would do, types/kills nothing
+#
+# Terminal backends: tmux pane ($TMUX_PANE) or iTerm2 window ($ITERM_SESSION_ID);
+# tmux wins when both are set. Works headless (e.g. Linux server) under tmux.
 #
 # The relaunch command is rebuilt from the running CLI's ps entry: all flags
 # are kept (e.g. --dangerously-skip-permissions, --model) EXCEPT session
@@ -47,14 +50,24 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-UUID="${ITERM_SESSION_ID:-}"; UUID="${UUID#*:}"
-[ -n "$UUID" ] || die "no \$ITERM_SESSION_ID (not running inside iTerm?)"
+# terminal backend of this very session
+if [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ]; then
+  TB="tmux"; TA="$TMUX_PANE"
+elif [ -n "${ITERM_SESSION_ID:-}" ]; then
+  TB="iterm"; TA="${ITERM_SESSION_ID#*:}"
+else
+  die "no supported terminal (need iTerm2 or tmux)"
+fi
+
 [ -n "$SID" ] || SID="${CLAUDE_CODE_SESSION_ID:-}"
 [[ "$SID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
   || die "'$SID' does not look like a session id (pass one explicitly)"
 
 get_tty() {
-  osascript - "$UUID" <<'AS'
+  case "$TB" in
+    tmux) tmux display -p -t "$TA" '#{pane_tty}' 2>/dev/null;;
+    iterm)
+      osascript - "$TA" <<'AS'
 on run argv
   set targetId to item 1 of argv
   tell application "iTerm2"
@@ -69,6 +82,8 @@ on run argv
   return ""
 end run
 AS
+      ;;
+  esac
 }
 
 # Rebuild the relaunch command from the live process: keep every flag except
@@ -97,7 +112,7 @@ if [ -n "$CMD" ]; then
   RELAUNCH="$CMD --resume $SID"
 else
   TTY_PATH=$(get_tty)
-  [ -n "$TTY_PATH" ] || die "iTerm session $UUID not found"
+  [ -n "$TTY_PATH" ] || die "terminal for this session not found ($TB $TA)"
   SHORT="${TTY_PATH#/dev/}"
   ORIG=$(ps -t "$SHORT" -o command= 2>/dev/null | grep -E '^(\S*/)?claude( |$)' | head -n1)
   [ -n "$ORIG" ] || ORIG="claude"
@@ -109,11 +124,11 @@ fi
 WAIT_EXIT=900
 [ -n "$FORCE" ] && WAIT_EXIT=20
 
-nohup "$SCRIPT_DIR/respawn-watcher.sh" "$UUID" "$SID" "$RELAUNCH" "$KICKOFF" "$GRACE" "$WAIT_EXIT" "$DRY" \
+nohup "$SCRIPT_DIR/respawn-watcher.sh" "$TB" "$TA" "$SID" "$RELAUNCH" "$KICKOFF" "$GRACE" "$WAIT_EXIT" "$DRY" \
   >> "$BASE/respawn.log" 2>&1 &
 disown
 
-echo "Respawn scheduled${DRY:+ (DRY RUN)}."
+echo "Respawn scheduled${DRY:+ (DRY RUN)} on $TB ($TA)."
 echo "Relaunch command: $RELAUNCH"
 echo "Log: $BASE/respawn.log"
 echo "IMPORTANT: this must be your LAST action — end your turn NOW (the watcher types /exit in ${GRACE}s; if your turn is still running it queues and fires at turn end)."

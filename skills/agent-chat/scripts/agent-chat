@@ -34,6 +34,10 @@
 #   agent-chat key <name> <key...>          send keys/shortcuts: escape (stop current work), enter,
 #                                           ctrl-c, tab, shift-tab, up/down/left/right, ctrl-b/o/r/t/v...
 #                                           e.g. remote slash command: type <n> "/compact" + key <n> enter
+#   agent-chat spawn <name> [--dir <path>] [--prompt "task"] [--cmd "claude ..."] [--tmux]
+#                                           launch a NEW agent: new iTerm window (or tmux session with
+#                                           --tmux / on headless boxes), reusing this session's CLI flags;
+#                                           the new agent registers itself as <name>
 #   agent-chat unregister [<name>]          leave the chat (default: self)
 #   agent-chat hook <EventName>             internal: called by Claude Code hooks (stdin = hook JSON)
 #
@@ -56,6 +60,17 @@ die() { echo "agent-chat: $*" >&2; exit 1; }
 now() { date +"%Y-%m-%dT%H:%M:%S%z"; }
 
 proj_room() { printf '%s' "$PWD" | sed 's/[^a-zA-Z0-9]/-/g'; }
+
+# terminal backend for this process: "tmux <pane-id>" | "iterm <uuid>" | "none -"
+detect_term() {
+  if [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ]; then
+    echo "tmux ${TMUX_PANE}"
+  elif [ -n "${ITERM_SESSION_ID:-}" ]; then
+    echo "iterm ${ITERM_SESSION_ID#*:}"
+  else
+    echo "none -"
+  fi
+}
 
 valid_room() { printf '%s' "$1" | grep -Eq '^-?[A-Za-z0-9][A-Za-z0-9_-]{0,128}$'; }
 
@@ -135,12 +150,14 @@ cmd_register() {
     oldname=$($JQ -r --arg sid "$sid" 'select(.session_id == $sid) | .name' "$f")
     if [ -n "$oldname" ] && [ "$oldname" != "$name" ]; then rm -f "$f" "$CUR/$oldname"@*; fi
   done
+  local tb ta
+  read -r tb ta <<< "$(detect_term)"
   if [ -e "$REG/$name.json" ]; then
     # existing identity: silent rebind (new session/window/cwd), keep rooms + cursors
     rooms_json=$($JQ -c --arg hr "$proom" '(.rooms + [$hr]) | unique' "$REG/$name.json")
-    $JQ -n --arg name "$name" --arg sid "$sid" --arg iterm "${ITERM_SESSION_ID:-}" \
+    $JQ -n --arg name "$name" --arg sid "$sid" --arg tb "$tb" --arg ta "$ta" \
           --arg cwd "$PWD" --arg ts "$(now)" --arg hr "$proom" --argjson rooms "$rooms_json" \
-          '{name:$name, session_id:$sid, iterm_session_id:$iterm, cwd:$cwd, home_room:$hr, rooms:$rooms, registered_at:$ts}' \
+          '{name:$name, session_id:$sid, term_backend:$tb, term_addr:$ta, cwd:$cwd, home_room:$hr, rooms:$rooms, registered_at:$ts}' \
           > "$REG/$name.json.tmp" && mv "$REG/$name.json.tmp" "$REG/$name.json"
     local r
     while IFS= read -r r; do
@@ -148,9 +165,9 @@ cmd_register() {
     done <<< "$(my_rooms "$name")"
     echo "Rebound '$name' to this session (silent — no join announcement, cursors kept)."
   else
-    $JQ -n --arg name "$name" --arg sid "$sid" --arg iterm "${ITERM_SESSION_ID:-}" \
+    $JQ -n --arg name "$name" --arg sid "$sid" --arg tb "$tb" --arg ta "$ta" \
           --arg cwd "$PWD" --arg ts "$(now)" --arg hr "$proom" \
-          '{name:$name, session_id:$sid, iterm_session_id:$iterm, cwd:$cwd, home_room:$hr, rooms:([$hr,"general"] | unique), registered_at:$ts}' \
+          '{name:$name, session_id:$sid, term_backend:$tb, term_addr:$ta, cwd:$cwd, home_room:$hr, rooms:([$hr,"general"] | unique), registered_at:$ts}' \
           > "$REG/$name.json"
     append_msg "$proom" "system" "*" "$name joined (cwd: $PWD)"
     set_cursor_eof "$name" "$proom"
@@ -292,17 +309,21 @@ cmd_who() {
   [ "$found" = 1 ] || echo "  (nobody registered)"
 }
 
-agent_uuid() { # name -> iTerm session UUID
+agent_term() { # name -> "backend addr" from the registry (legacy entries fall back to iterm)
   local f="$REG/$1.json"
   [ -e "$f" ] || die "no agent named '$1' is registered"
-  local iterm
-  iterm=$($JQ -r '.iterm_session_id // empty' "$f")
-  [ -n "$iterm" ] || die "'$1' has no iTerm session recorded"
-  printf '%s' "${iterm#*:}"
+  local tb ta
+  tb=$($JQ -r '.term_backend // empty' "$f")
+  ta=$($JQ -r '.term_addr // empty' "$f")
+  if [ -z "$tb" ]; then
+    ta=$($JQ -r '.iterm_session_id // empty' "$f"); ta="${ta#*:}"
+    [ -n "$ta" ] && tb="iterm"
+  fi
+  { [ -n "$tb" ] && [ "$tb" != "none" ]; } || die "'$1' has no terminal recorded (registered outside iTerm/tmux?)"
+  printf '%s %s' "$tb" "$ta"
 }
 
-raw_write() { # uuid raw-bytes — write into the session verbatim, no auto-newline.
-  # A trailing \r acts as Enter in both raw-mode TUIs (Claude Code) and shells.
+iterm_write() { # uuid raw-bytes — write into the iTerm session verbatim, no auto-newline
   osascript - "$1" "$2" <<'APPLESCRIPT'
 on run argv
   set targetId to item 1 of argv
@@ -324,31 +345,64 @@ end run
 APPLESCRIPT
 }
 
-do_nudge() { # name [text] — type text, then Enter as a SEPARATE keystroke (submits as a prompt).
-  # The two calls are deliberate: TUIs run with bracketed paste on, so a \r inside
-  # the same write-text payload is pasted as a literal newline into the input box
-  # instead of submitting. A lone \r in its own call acts as a real Enter.
-  local name="$1"
-  local text="${2:-[agent-chat] you have new messages — run: agent-chat read}"
-  text=$(printf '%s' "$text" | tr -d '"\\')
-  local uuid
-  uuid=$(agent_uuid "$name")
-  raw_write "$uuid" "$text"
-  raw_write "$uuid" $'\r'
+# terminal I/O primitives — dispatch on backend ("iterm" uuid | "tmux" pane-id)
+term_type() { # backend addr text — type WITHOUT submitting
+  case "$1" in
+    iterm) iterm_write "$2" "$3";;
+    tmux)  tmux send-keys -t "$2" -l -- "$3" && echo ok;;
+    *) die "unsupported terminal backend '$1'";;
+  esac
 }
 
-cmd_type() { # name text — type into the input box WITHOUT submitting
-  local name="${1:-}" text="${2:-}"
-  [ -n "$name" ] && [ -n "$text" ] || die 'usage: agent-chat type <name> "text"'
-  raw_write "$(agent_uuid "$name")" "$text"
+term_enter() { # backend addr — a real Enter keypress (separate from the text: bracketed paste)
+  case "$1" in
+    iterm) iterm_write "$2" $'\r';;
+    tmux)  tmux send-keys -t "$2" Enter && echo ok;;
+    *) die "unsupported terminal backend '$1'";;
+  esac
 }
 
-cmd_screen() { # name [N] — snapshot of the agent's visible terminal (last N lines)
-  local name="${1:-}" n="${2:-0}"
-  [ -n "$name" ] || die "usage: agent-chat screen <name> [N]"
-  local uuid out
-  uuid=$(agent_uuid "$name")
-  out=$(osascript - "$uuid" <<'APPLESCRIPT'
+term_key() { # backend addr keyname
+  local b="$1" a="$2" k="$3"
+  case "$b" in
+    iterm)
+      local seq
+      case "$k" in
+        esc|escape)      seq=$'\033';;
+        enter|return|cr) seq=$'\r';;
+        ctrl-c) seq=$'\003';; ctrl-d) seq=$'\004';; ctrl-b) seq=$'\002';;
+        ctrl-o) seq=$'\017';; ctrl-r) seq=$'\022';; ctrl-t) seq=$'\024';;
+        ctrl-v) seq=$'\026';; ctrl-z) seq=$'\032';;
+        tab) seq=$'\t';; shift-tab) seq=$'\033[Z';;
+        up) seq=$'\033[A';; down) seq=$'\033[B';; right) seq=$'\033[C';; left) seq=$'\033[D';;
+        space) seq=' ';; backspace) seq=$'\177';;
+        *) die "unknown key '$k'";;
+      esac
+      iterm_write "$a" "$seq"
+      ;;
+    tmux)
+      local tk
+      case "$k" in
+        esc|escape) tk="Escape";;
+        enter|return|cr) tk="Enter";;
+        ctrl-c) tk="C-c";; ctrl-d) tk="C-d";; ctrl-b) tk="C-b";;
+        ctrl-o) tk="C-o";; ctrl-r) tk="C-r";; ctrl-t) tk="C-t";;
+        ctrl-v) tk="C-v";; ctrl-z) tk="C-z";;
+        tab) tk="Tab";; shift-tab) tk="BTab";;
+        up) tk="Up";; down) tk="Down";; right) tk="Right";; left) tk="Left";;
+        space) tk="Space";; backspace) tk="BSpace";;
+        *) die "unknown key '$k'";;
+      esac
+      tmux send-keys -t "$a" "$tk" && echo ok
+      ;;
+    *) die "unsupported terminal backend '$b'";;
+  esac
+}
+
+term_screen() { # backend addr — visible terminal contents
+  case "$1" in
+    iterm)
+      osascript - "$2" <<'APPLESCRIPT'
 on run argv
   set targetId to item 1 of argv
   tell application "iTerm2"
@@ -363,7 +417,39 @@ on run argv
   return "agent-chat: session not found (window closed?)"
 end run
 APPLESCRIPT
-)
+      ;;
+    tmux) tmux capture-pane -p -t "$2";;
+    *) die "unsupported terminal backend '$1'";;
+  esac
+}
+
+do_nudge() { # name [text] — type text, then Enter as a SEPARATE keystroke (submits as a prompt).
+  # The separation is deliberate: TUIs run with bracketed paste on, so a \r inside
+  # the same payload is pasted as a literal newline into the input box instead of
+  # submitting. A lone Enter in its own call acts as a real keypress.
+  local name="$1"
+  local text="${2:-[agent-chat] you have new messages — run: agent-chat read}"
+  text=$(printf '%s' "$text" | tr -d '"\\')
+  local tb ta
+  read -r tb ta <<< "$(agent_term "$name")"
+  term_type "$tb" "$ta" "$text"
+  term_enter "$tb" "$ta"
+}
+
+cmd_type() { # name text — type into the input box WITHOUT submitting
+  local name="${1:-}" text="${2:-}"
+  [ -n "$name" ] && [ -n "$text" ] || die 'usage: agent-chat type <name> "text"'
+  local tb ta
+  read -r tb ta <<< "$(agent_term "$name")"
+  term_type "$tb" "$ta" "$text"
+}
+
+cmd_screen() { # name [N] — snapshot of the agent's visible terminal (last N lines)
+  local name="${1:-}" n="${2:-0}"
+  [ -n "$name" ] || die "usage: agent-chat screen <name> [N]"
+  local tb ta out
+  read -r tb ta <<< "$(agent_term "$name")"
+  out=$(term_screen "$tb" "$ta")
   # drop trailing blank lines; optionally keep only the last N
   out=$(printf '%s\n' "$out" | sed -e :a -e '/^[[:space:]]*$/{$d;N;ba' -e '}')
   if [ "$n" -gt 0 ] 2>/dev/null; then printf '%s\n' "$out" | tail -n "$n"; else printf '%s\n' "$out"; fi
@@ -372,33 +458,122 @@ APPLESCRIPT
 cmd_key() { # name key... — send special keys / Claude Code shortcuts
   local name="${1:-}"; shift 2>/dev/null || true
   [ -n "$name" ] && [ $# -gt 0 ] || die "usage: agent-chat key <name> <key...>  (keys: escape enter ctrl-c ctrl-d ctrl-b ctrl-o ctrl-r ctrl-t ctrl-v tab shift-tab up down left right space backspace)"
-  local uuid seq k
-  uuid=$(agent_uuid "$name")
-  seq=""
+  local tb ta k
+  read -r tb ta <<< "$(agent_term "$name")"
   for k in "$@"; do
-    case "$k" in
-      esc|escape)   seq+=$'\033';;
-      enter|return|cr) seq+=$'\r';;
-      ctrl-c)       seq+=$'\003';;
-      ctrl-d)       seq+=$'\004';;
-      ctrl-b)       seq+=$'\002';;
-      ctrl-o)       seq+=$'\017';;
-      ctrl-r)       seq+=$'\022';;
-      ctrl-t)       seq+=$'\024';;
-      ctrl-v)       seq+=$'\026';;
-      ctrl-z)       seq+=$'\032';;
-      tab)          seq+=$'\t';;
-      shift-tab)    seq+=$'\033[Z';;
-      up)           seq+=$'\033[A';;
-      down)         seq+=$'\033[B';;
-      right)        seq+=$'\033[C';;
-      left)         seq+=$'\033[D';;
-      space)        seq+=' ';;
-      backspace)    seq+=$'\177';;
-      *) die "unknown key '$k'";;
+    term_key "$tb" "$ta" "$k" >/dev/null
+  done
+  echo ok
+}
+
+cmd_spawn() { # <name> [--dir d] [--cmd "claude ..."] [--prompt "task"] [--tmux]
+  local name="" dir="$PWD" cmd="" task="" force_tmux=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dir) dir="$2"; shift 2;;
+      --cmd) cmd="$2"; shift 2;;
+      --prompt) task="$2"; shift 2;;
+      --tmux) force_tmux=1; shift;;
+      -*) die "spawn: unknown arg '$1'";;
+      *) [ -n "$name" ] && die "spawn: one name only"; name="$1"; shift;;
     esac
   done
-  raw_write "$uuid" "$seq"
+  [ -n "$name" ] || die 'usage: agent-chat spawn <name> [--dir <path>] [--prompt "task"] [--cmd "claude ..."] [--tmux]'
+  printf '%s' "$name" | grep -Eq '^[a-z0-9][a-z0-9_-]{0,31}$' || die "invalid agent name '$name'"
+  [ -d "$dir" ] || die "no such directory: $dir"
+
+  # default launch command: reuse this session's own CLI flags (minus session
+  # selectors), so e.g. --dangerously-skip-permissions carries over
+  if [ -z "$cmd" ]; then
+    local tb ta ttypath
+    read -r tb ta <<< "$(detect_term)"
+    ttypath=""
+    case "$tb" in
+      tmux)  ttypath=$(tmux display -p -t "$ta" '#{pane_tty}' 2>/dev/null);;
+      iterm) ttypath=$(osascript - "$ta" <<'APPLESCRIPT'
+on run argv
+  set targetId to item 1 of argv
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if (id of s as text) is equal to targetId then return (tty of s)
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return ""
+end run
+APPLESCRIPT
+);;
+    esac
+    if [ -n "$ttypath" ]; then
+      cmd=$(ps -t "${ttypath#/dev/}" -o command= 2>/dev/null | grep -E '^(\S*/)?claude( |$)' | head -n1 \
+            | sed -E 's/ (--resume|-r|--session-id|--from-pr) [^ ]+//g; s/ (--resume|-r|--continue|-c|--fork-session|--from-pr)( |$)/ /g')
+    fi
+    [ -n "$cmd" ] || cmd="claude"
+  fi
+
+  local kickoff="You are a fresh agent. First, register on the local agent chat: agent-chat register $name — then check in with: agent-chat read."
+  [ -n "$task" ] && kickoff="$kickoff Your task: $task"
+
+  local sb sa   # spawned backend + addr
+  if [ "$force_tmux" = 1 ] || ! osascript -e 'tell application "iTerm2" to count windows' >/dev/null 2>&1; then
+    command -v tmux >/dev/null || die "tmux not available and iTerm unreachable"
+    sb="tmux"
+    if [ -n "${TMUX:-}" ]; then
+      sa=$(tmux new-window -P -F '#{pane_id}' -c "$dir")
+    else
+      sa=$(tmux new-session -d -P -F '#{pane_id}' -s "agent-$name" -c "$dir" 2>/dev/null) \
+        || sa=$(tmux new-session -d -P -F '#{pane_id}' -c "$dir")
+    fi
+  else
+    sb="iterm"
+    sa=$(osascript <<APPLESCRIPT
+tell application "iTerm2"
+  set newWin to (create window with default profile)
+  delay 1
+  return id of current session of newWin
+end tell
+APPLESCRIPT
+)
+    [ -n "$sa" ] || die "failed to create iTerm window"
+    term_type "$sb" "$sa" "cd '$dir'" >/dev/null
+    term_enter "$sb" "$sa" >/dev/null
+  fi
+
+  term_type "$sb" "$sa" "$cmd" >/dev/null
+  term_enter "$sb" "$sa" >/dev/null
+
+  # wait for the CLI process, then deliver the kickoff with verify-and-retry:
+  # input typed during TUI startup (MCP servers still loading) gets swallowed
+  local ttypath deadline try landed=0
+  case "$sb" in
+    tmux)  ttypath=$(tmux display -p -t "$sa" '#{pane_tty}');;
+    iterm) ttypath="";;
+  esac
+  deadline=$((SECONDS + 45))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if [ -n "$ttypath" ] && ps -t "${ttypath#/dev/}" -o command= 2>/dev/null | grep -qE '^(\S*/)?claude( |$)'; then break; fi
+    [ -z "$ttypath" ] && [ "$SECONDS" -ge $((deadline - 37)) ] && break   # iterm: fixed ~8s boot wait
+    sleep 2
+  done
+  for try in 1 2 3; do
+    sleep $((try * 5))
+    term_type "$sb" "$sa" "$kickoff" >/dev/null
+    term_enter "$sb" "$sa" >/dev/null
+    sleep 4
+    # verify the prompt landed: its text must be on screen (joined against line wrap)
+    if term_screen "$sb" "$sa" 2>/dev/null | tr -d '\n' | grep -qE "fresh +agent"; then landed=1; break; fi
+  done
+
+  echo "Spawned '$name' ($sb: $sa, dir: $dir)"
+  echo "Launch: $cmd"
+  if [ "$landed" = 1 ]; then
+    echo "Kickoff delivered — it will register itself as '$name' (check: agent-chat who)"
+  else
+    echo "WARNING: kickoff prompt may not have landed — check: agent-chat screen $name"
+  fi
 }
 
 # ---------- hook mode ----------
@@ -458,8 +633,9 @@ case "$cmd" in
   type)       cmd_type "$@";;
   key)        cmd_key "$@";;
   screen)     cmd_screen "$@";;
+  spawn)      cmd_spawn "$@";;
   hook)       cmd_hook "$@";;
   help|--help|-h)
-    sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//';;
+    sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//';;
   *) die "unknown command '$cmd' (try: agent-chat help)";;
 esac

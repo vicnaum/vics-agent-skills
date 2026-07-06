@@ -1,34 +1,27 @@
 #!/usr/bin/env bash
 # Internal: detached watcher spawned by respawn.sh — do not run directly.
-# Exits the Claude Code CLI in one iTerm session (by UUID), relaunches it with
-# the given command, and types a kickoff prompt.
+# Exits the Claude Code CLI in one terminal (iTerm session or tmux pane),
+# relaunches it with the given command, and types a kickoff prompt.
 #
-# args: <iterm-uuid> <session-id> <relaunch-cmd> <kickoff-prompt> <grace-secs> <exit-wait-secs> [dry]
+# args: <backend: iterm|tmux> <addr> <session-id> <relaunch-cmd> <kickoff-prompt> <grace-secs> <exit-wait-secs> [dry]
 
 BASE="$HOME/.claude/respawn"
 LOG="$BASE/respawn.log"
-UUID="$1"; SID="$2"; RELAUNCH="$3"; KICKOFF="$4"; GRACE="${5:-15}"; WAIT_EXIT="${6:-900}"; DRY="${7:-}"
+TB="$1"; TA="$2"; SID="$3"; RELAUNCH="$4"; KICKOFF="$5"; GRACE="${6:-15}"; WAIT_EXIT="${7:-900}"; DRY="${8:-}"
 
 log() { echo "[$(date '+%F %T')] [$SID] $*" >> "$LOG"; }
 
-itype() { # type text + Enter into the target iTerm session.
-  # Enter is a SEPARATE write-text call: TUIs run with bracketed paste on, so a
-  # newline/\r inside the text payload is pasted as a literal line break into the
-  # input box without submitting. A lone \r in its own call is a real Enter, and
-  # also executes at a shell prompt. (Verified live against a Claude Code session.)
-  [ -n "$DRY" ] && { log "DRY: would type: $1"; return 0; }
-  osascript - "$UUID" "$1" <<'AS'
+iterm_write() { # payload — verbatim, no auto-newline
+  osascript - "$TA" "$1" <<'AS'
 on run argv
   set targetId to item 1 of argv
-  set msg to item 2 of argv
+  set payload to item 2 of argv
   tell application "iTerm2"
     repeat with w in windows
       repeat with t in tabs of w
         repeat with s in sessions of t
           if (id of s as text) is equal to targetId then
-            tell s to write text msg newline NO
-            delay 0.2
-            tell s to write text (return) newline NO
+            tell s to write text payload newline NO
             return "ok"
           end if
         end repeat
@@ -40,8 +33,28 @@ end run
 AS
 }
 
+itype() { # type text + Enter. Enter is a SEPARATE keystroke: TUIs run with
+  # bracketed paste on, so a newline inside the payload is pasted as literal
+  # content into the input box without submitting.
+  [ -n "$DRY" ] && { log "DRY: would type: $1"; return 0; }
+  case "$TB" in
+    tmux)
+      tmux send-keys -t "$TA" -l -- "$1"
+      tmux send-keys -t "$TA" Enter
+      ;;
+    iterm)
+      iterm_write "$1" >/dev/null
+      sleep 0.2
+      iterm_write $'\r' >/dev/null
+      ;;
+  esac
+}
+
 get_tty() {
-  osascript - "$UUID" <<'AS'
+  case "$TB" in
+    tmux) tmux display -p -t "$TA" '#{pane_tty}' 2>/dev/null;;
+    iterm)
+      osascript - "$TA" <<'AS'
 on run argv
   set targetId to item 1 of argv
   tell application "iTerm2"
@@ -56,6 +69,8 @@ on run argv
   return ""
 end run
 AS
+      ;;
+  esac
 }
 
 claude_pid() { # tty short name -> pid of the claude CLI on it (empty if none)
@@ -71,13 +86,13 @@ wait_pid_gone() { # pid timeout-secs -> rc 0 if gone
   return 0
 }
 
-log "watcher started (grace=${GRACE}s, exit-wait=${WAIT_EXIT}s${DRY:+, DRY RUN})"
+log "watcher started ($TB $TA, grace=${GRACE}s, exit-wait=${WAIT_EXIT}s${DRY:+, DRY RUN})"
 log "relaunch command: $RELAUNCH"
 sleep "$GRACE"
 
 TTY_PATH=$(get_tty)
 if [ -z "$TTY_PATH" ]; then
-  log "ABORT: iTerm session $UUID not found (window closed?)"
+  log "ABORT: terminal $TB $TA not found (window/pane closed?)"
   exit 1
 fi
 SHORT="${TTY_PATH#/dev/}"
