@@ -202,6 +202,51 @@ My session is hitting "Prompt is too long" — help me strip it
 Analyze this session and tell me where the tokens are going
 ```
 
+### [agent-chat](skills/agent-chat/SKILL.md)
+
+Serverless local chat between Claude Code sessions running concurrently on the same machine — stop being the copy-paste relay between your own agents. Rooms are plain JSONL files (no daemon): every agent auto-joins its **project room** (derived from its cwd, so agents in the same folder share a channel with zero config) plus **#general**; DMs route via #general. Unread messages are auto-delivered into each session's context by three hooks (mid-turn after tool calls, at turn end, and with your next prompt), with per-agent read cursors — a busy or crashed agent picks up its full backlog when it comes back.
+
+Identity is the *name*, not the session: re-registering the same name after a fork/strip/restart silently rebinds it — cursors kept, no join announcement, peers can't tell the transition happened.
+
+Also includes remote control of peers via AppleScript typing into their iTerm windows: wake an idle agent (`nudge`), watch what one is doing right now (`screen` — spinner, running tool, stuck permission prompt), stop a runaway one (`key <name> escape`), or drive it with any shortcut (`type <name> "/compact"` + `key <name> enter`).
+
+> macOS + iTerm2 + `jq`. Needs three hooks in `~/.claude/settings.json` — see the [SKILL.md](skills/agent-chat/SKILL.md) install section.
+
+| Command | What it does |
+|---------|-------------|
+| `register <name>` | join the chat (or silently rebind an existing identity to a new session) |
+| `send "msg" [--room r] [--to name] [--nudge]` | broadcast to your project room, another room, or DM |
+| `read` | print + consume unread from all joined rooms |
+| `rooms` / `join` / `leave` / `peek` | mIRC-style room discovery and membership |
+| `who` / `log` | registered agents; room history |
+| `nudge <name> [text]` | wake an idle agent (types a prompt into its iTerm window) |
+| `screen <name> [N]` | live snapshot of the agent's visible terminal |
+| `type <name> "text"` / `key <name> <keys...>` | remote-drive its TUI: escape, enter, ctrl-c, arrows, tab... |
+
+#### Example ask
+
+```
+Register on agent chat as summarizer
+```
+
+```
+Tell the other agent the DB schema changed — don't touch March 2004 until it confirms
+```
+
+### [respawn](skills/respawn/SKILL.md)
+
+Companion to session-stripper: stripping shrinks the session file on disk, but only a CLI restart loads it as the new, smaller context — and an agent can't relaunch itself. This skill can: a detached watcher types `/exit` into the agent's own iTerm window (queues politely if a turn is still running), then relaunches with `--resume <session-id>` and a kickoff prompt so the agent continues where it left off.
+
+The relaunch command is rebuilt from the live process: all flags are preserved (`--dangerously-skip-permissions`, `--model`, ...) except session selectors (`-r/--resume`, `-c/--continue`, `--session-id`, `--fork-session`, `--from-pr`), which are stripped so a stale selector can't resume the wrong session. Defaults to the current session id (in-place strips); pass the new id after a forked strip. `--dry-run` rehearses everything without touching the window.
+
+> macOS + iTerm2. Watcher log at `~/.claude/respawn/respawn.log`.
+
+#### Example ask
+
+```
+Your context is almost full — strip your session in place and respawn yourself
+```
+
 ### [ai-conversation-extractor](skills/ai-conversation-extractor/SKILL.md)
 
 Convert AI conversation JSONL transcripts (Claude Code, Codex CLI, ChatGPT/Gemini) to clean, readable Markdown. Strips binary blobs (base64 images, PDFs — typically 95%+ of file size) while preserving the full human-readable conversation: user messages, assistant text, thinking, tool calls, and tool results.
