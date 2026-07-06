@@ -38,6 +38,62 @@ def _reset_usage_after_strip(session_path, dry_run, enabled=True):
           f"(active-chain content estimate) so CC's meter reflects the stripped size.")
 
 
+def resolve_current_session(cwd=None):
+    """Return the absolute path to the CURRENT session's JSONL, resolved from
+    $CLAUDE_CODE_SESSION_ID — the only reliable source. Never guess by mtime
+    (`ls -t`): in a project dir with concurrent sessions the newest file is
+    often a *different* session, and stripping it corrupts someone else's work.
+
+    CC stores sessions at ~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl,
+    where <encoded-cwd> is the absolute cwd with every '/' and '.' replaced by
+    '-'. Returns a Path (may not exist if run outside a CC session) or raises
+    RuntimeError if the env var is missing.
+    """
+    import os
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not sid:
+        raise RuntimeError(
+            "$CLAUDE_CODE_SESSION_ID is not set — run this inside the Claude "
+            "Code session you want to strip (it is exported into Bash tool "
+            "calls). Do NOT fall back to `ls -t`; that races with other "
+            "concurrent sessions."
+        )
+    projects = Path.home() / ".claude" / "projects"
+    # Preferred: the project dir encoded from the current cwd.
+    base = Path(cwd or os.getcwd()).resolve()
+    encoded = str(base).replace("/", "-").replace(".", "-")
+    guess = projects / encoded / f"{sid}.jsonl"
+    if guess.exists():
+        return guess
+    # Fallback: the session may have STARTED in a different cwd (the agent
+    # cd'd since). The sessionId is a unique UUID, so a dir-agnostic search is
+    # still unambiguous — and still not an mtime guess. Use it only when it
+    # resolves to exactly one file.
+    matches = sorted(projects.glob(f"*/{sid}.jsonl"))
+    if len(matches) == 1:
+        return matches[0]
+    # 0 or >1 matches: return the cwd-based guess so the caller sees a clear
+    # "exists: NO" rather than silently targeting the wrong file.
+    return guess
+
+
+def cmd_current(args):
+    """Print the current session's JSONL path (resolved from the env var)."""
+    try:
+        path = resolve_current_session()
+    except RuntimeError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(2)
+    exists = path.exists()
+    if args.quiet:
+        print(path)
+    else:
+        print(f"session id: {path.stem}")
+        print(f"path:       {path}")
+        print(f"exists:     {'yes' if exists else 'NO — cwd may differ from where the session started'}")
+    sys.exit(0 if exists else 1)
+
+
 def _maybe_fork(args, operation: str):
     """If `--fork` is set, fork the session in place and rewrite args.session
     to point at the fork. Subsequent command logic then mutates the fork
@@ -613,6 +669,15 @@ def main():
     p_fork.add_argument("--operation", type=str, default=None,
                         help="Stamp strippedBy.operation (optional)")
     p_fork.set_defaults(func=cmd_fork)
+
+    p_current = subparsers.add_parser(
+        "current",
+        help="Print THIS session's JSONL path (from $CLAUDE_CODE_SESSION_ID). "
+             "Use this to target strips — never `ls -t`.",
+    )
+    p_current.add_argument("-q", "--quiet", action="store_true",
+                           help="Print only the path (for $(...) capture)")
+    p_current.set_defaults(func=cmd_current)
 
     args = parser.parse_args()
 

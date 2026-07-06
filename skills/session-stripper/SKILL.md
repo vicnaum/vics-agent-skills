@@ -7,6 +7,33 @@ description: "Manually trim, compact, persist, and repair Claude Code conversati
 
 CLI tool for trimming Claude Code JSONL sessions. Sessions live at `~/.claude/projects/<project-path>/<uuid>.jsonl`.
 
+## Identify the session FIRST — never guess by mtime
+
+Every mutating command operates on the exact `<session.jsonl>` path you pass. Getting that path right is the single most important step: strip the wrong file and you silently corrupt a different, possibly active, session.
+
+**To strip the CURRENT session, resolve it from `$CLAUDE_CODE_SESSION_ID`** — the env var Claude Code exports into every Bash tool call, which matches the real transcript filename:
+
+```bash
+SKILL=<skill-dir>/scripts/stripper.py
+SESS=$(python3 "$SKILL" current --quiet)   # resolves $CLAUDE_CODE_SESSION_ID → its .jsonl (any cwd)
+python3 "$SKILL" strip-all "$SESS"
+```
+
+`current` (without `--quiet`) prints the id, path, and whether it exists.
+
+**NEVER select the session with `ls -t ... | head -1` (most-recently-modified).** In a project folder with more than one session running — increasingly common with parallel/multi-agent work — the newest file is frequently a *different* live session, and you will strip someone else's work. `$CLAUDE_CODE_SESSION_ID` is the only reliable source; if it is unset you are not inside a CC session, so ask the user which file to strip rather than guessing.
+
+When the user names a *specific* session id or file (e.g. "strip session abc123"), use that instead; `current` is only for "strip *this*/*my* session".
+
+## Restarting into the stripped session (respawn)
+
+Stripping shrinks the file on disk, but the running CLI keeps its pre-strip context until it restarts. If the user implies they want to continue in the lighter session ("strip and continue", "strip and reload", "strip into a fork and respawn"), and the **`respawn` skill** is available, use it to relaunch the CLI:
+
+- **In-place strip** (same session id): `respawn.sh` with no args resumes the current session.
+- **Forked strip** (new session id from `--fork`): pass that new id — `respawn.sh <new-session-id>`.
+
+Call `respawn.sh` as the LAST action, then end the turn (see the respawn skill). Without respawn, tell the user to `/exit` and `claude -r <id>` manually — the strip won't take effect until the CLI reloads.
+
 ## Quick Reference
 
 Run scripts from `<skill-dir>/scripts/`:
@@ -192,7 +219,7 @@ Matches Claude Code's `/branch` convention exactly (verified against `~/github/c
 - A `custom-title` entry appended with " (Stripped)" suffix; collisions auto-increment to "(Stripped 2)", etc. `--fork-title` overrides
 - **Plus a session-stripper-specific** `strippedBy = {tool, operation, at}` field on every envelope so future tooling can show strip lineage. CC ignores unknown fields, so this doesn't break anything.
 
-Forked sessions appear as siblings in CC's session listings; `claude -r <newId>` resumes the stripped copy, `claude -r <originalId>` resumes the original.
+Forked sessions appear as siblings in CC's session listings; `claude -r <newId>` resumes the stripped copy, `claude -r <originalId>` resumes the original. To resume the fork automatically instead of by hand, use the **`respawn` skill** with the new id: `respawn.sh <newId>` (see "Restarting into the stripped session" above).
 
 ## Persist Family — Unified Marker + Sidecar
 

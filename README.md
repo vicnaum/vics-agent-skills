@@ -179,6 +179,7 @@ Full technical deep-dive in [references/surgery-report.md](skills/session-stripp
 
 | Command | What it does |
 |---------|-------------|
+| `current` | Resolve THIS session's JSONL path from `$CLAUDE_CODE_SESSION_ID` (so you strip the right file, never an mtime guess) |
 | `analyze` | Token breakdown by type and tool name, cut points, health check |
 | `strip-tools` | Clear tool inputs/results (granular: by tool name, inputs/results only, keep last N lines) |
 | `strip-thinking` | Remove thinking blocks |
