@@ -29,6 +29,8 @@
 #   agent-chat who                          list registered agents and their rooms
 #   agent-chat nudge <name> [text]          type a wake-up line + Enter into that agent's iTerm window
 #   agent-chat type <name> "text"           type into that agent's input box WITHOUT submitting
+#   agent-chat screen <name> [N]            snapshot of that agent's visible terminal (what it is
+#                                           doing right now: spinner, running tool, stuck prompt)
 #   agent-chat key <name> <key...>          send keys/shortcuts: escape (stop current work), enter,
 #                                           ctrl-c, tab, shift-tab, up/down/left/right, ctrl-b/o/r/t/v...
 #                                           e.g. remote slash command: type <n> "/compact" + key <n> enter
@@ -341,6 +343,32 @@ cmd_type() { # name text — type into the input box WITHOUT submitting
   raw_write "$(agent_uuid "$name")" "$text"
 }
 
+cmd_screen() { # name [N] — snapshot of the agent's visible terminal (last N lines)
+  local name="${1:-}" n="${2:-0}"
+  [ -n "$name" ] || die "usage: agent-chat screen <name> [N]"
+  local uuid out
+  uuid=$(agent_uuid "$name")
+  out=$(osascript - "$uuid" <<'APPLESCRIPT'
+on run argv
+  set targetId to item 1 of argv
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if (id of s as text) is equal to targetId then return (contents of s)
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return "agent-chat: session not found (window closed?)"
+end run
+APPLESCRIPT
+)
+  # drop trailing blank lines; optionally keep only the last N
+  out=$(printf '%s\n' "$out" | sed -e :a -e '/^[[:space:]]*$/{$d;N;ba' -e '}')
+  if [ "$n" -gt 0 ] 2>/dev/null; then printf '%s\n' "$out" | tail -n "$n"; else printf '%s\n' "$out"; fi
+}
+
 cmd_key() { # name key... — send special keys / Claude Code shortcuts
   local name="${1:-}"; shift 2>/dev/null || true
   [ -n "$name" ] && [ $# -gt 0 ] || die "usage: agent-chat key <name> <key...>  (keys: escape enter ctrl-c ctrl-d ctrl-b ctrl-o ctrl-r ctrl-t ctrl-v tab shift-tab up down left right space backspace)"
@@ -429,8 +457,9 @@ case "$cmd" in
   nudge)      do_nudge "$@";;
   type)       cmd_type "$@";;
   key)        cmd_key "$@";;
+  screen)     cmd_screen "$@";;
   hook)       cmd_hook "$@";;
   help|--help|-h)
-    sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//';;
+    sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//';;
   *) die "unknown command '$cmd' (try: agent-chat help)";;
 esac
