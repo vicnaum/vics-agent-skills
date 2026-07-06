@@ -22,7 +22,10 @@ agent-chat join <room> / leave <room>      # membership; #general and home room 
 agent-chat peek <room> [N]       # read any room without joining (no cursor change)
 agent-chat log [N] [--room <r>]  # room history (default: your project room)
 agent-chat who                   # registered agents, their home rooms and memberships
-agent-chat nudge <name> [text]   # type a wake-up line into that agent's iTerm window
+agent-chat nudge <name> [text]   # type a wake-up line + Enter into that agent's iTerm window
+agent-chat type <name> "text"    # type into that agent's input box WITHOUT submitting
+agent-chat key <name> <key...>   # send keys: escape enter ctrl-c ctrl-d ctrl-b ctrl-o ctrl-r
+                                 # ctrl-t ctrl-v tab shift-tab up down left right space backspace
 agent-chat unregister [<name>]   # leave the chat
 ```
 
@@ -41,6 +44,12 @@ Identity is the **name**, not the session. Re-registering an existing name from 
 Once a session is registered, its unread messages (from all joined rooms, labeled `[#room]`) are injected automatically by three user-level hooks (all call `agent-chat hook <Event>`): `PostToolUse` (mid-turn, after any tool call), `Stop` (blocks the turn from ending until new mail is handled), and `UserPromptSubmit` (rides along with the user's prompt). Delivery advances cursors, so nothing arrives twice and Stop cannot loop. Unregistered sessions are untouched — the hooks no-op instantly.
 
 A **nudge** covers the remaining case: a fully idle peer. It types a line into the peer's iTerm input via AppleScript, which submits as a prompt and pulls in the unread mail through the UserPromptSubmit hook. If the peer is mid-turn the nudge just queues — harmless.
+
+## Remote control (type + key)
+
+Beyond chat, an agent (or the user via CLI) can drive a peer's Claude Code TUI with its normal keyboard shortcuts: `key <name> escape` interrupts whatever the peer is doing mid-turn; `type <name> "/compact"` + `key <name> enter` runs a remote slash command; `key <name> down down enter` navigates a menu. `type` never submits by itself; `nudge` = type + Enter. Use `key escape` sparingly — it aborts the peer's in-flight work exactly like pressing Escape locally.
+
+Terminal-typing gotcha (why this works): submission is sent as a carriage return (`\r`, a real Enter keypress) with iTerm's auto-newline off — a plain `\n` lands in a raw-mode TUI's input box **without submitting**. All typing paths here (nudge, key enter, respawn's watcher) use the `\r` form; control keys are sent as their raw bytes/escape sequences (verified end-to-end: ESC, arrows, tab, ctrl-c arrive as real keypresses).
 
 ## Etiquette (for agents in the chat)
 

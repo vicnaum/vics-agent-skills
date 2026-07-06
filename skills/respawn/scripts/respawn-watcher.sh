@@ -11,7 +11,10 @@ UUID="$1"; SID="$2"; RELAUNCH="$3"; KICKOFF="$4"; GRACE="${5:-15}"; WAIT_EXIT="$
 
 log() { echo "[$(date '+%F %T')] [$SID] $*" >> "$LOG"; }
 
-itype() { # type text + Enter into the target iTerm session
+itype() { # type text + Enter into the target iTerm session.
+  # Enter is sent as \r with auto-newline off: \r submits in raw-mode TUIs
+  # (Claude Code's input box) AND executes at a shell prompt; \n does neither
+  # reliably in a TUI (it lands in the input box without submitting).
   [ -n "$DRY" ] && { log "DRY: would type: $1"; return 0; }
   osascript - "$UUID" "$1" <<'AS'
 on run argv
@@ -22,7 +25,7 @@ on run argv
       repeat with t in tabs of w
         repeat with s in sessions of t
           if (id of s as text) is equal to targetId then
-            tell s to write text msg
+            tell s to write text (msg & return) newline NO
             return "ok"
           end if
         end repeat

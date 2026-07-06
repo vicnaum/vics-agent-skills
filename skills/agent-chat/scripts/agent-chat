@@ -27,7 +27,11 @@
 #   agent-chat join <room> / leave <room>   manage room membership
 #   agent-chat peek <room> [N]              read any room without joining (no cursor change)
 #   agent-chat who                          list registered agents and their rooms
-#   agent-chat nudge <name> [text]          type a wake-up line into that agent's iTerm window
+#   agent-chat nudge <name> [text]          type a wake-up line + Enter into that agent's iTerm window
+#   agent-chat type <name> "text"           type into that agent's input box WITHOUT submitting
+#   agent-chat key <name> <key...>          send keys/shortcuts: escape (stop current work), enter,
+#                                           ctrl-c, tab, shift-tab, up/down/left/right, ctrl-b/o/r/t/v...
+#                                           e.g. remote slash command: type <n> "/compact" + key <n> enter
 #   agent-chat unregister [<name>]          leave the chat (default: self)
 #   agent-chat hook <EventName>             internal: called by Claude Code hooks (stdin = hook JSON)
 #
@@ -286,27 +290,28 @@ cmd_who() {
   [ "$found" = 1 ] || echo "  (nobody registered)"
 }
 
-do_nudge() { # name [text]
-  local name="$1"
-  local text="${2:-[agent-chat] you have new messages — run: agent-chat read}"
-  local f="$REG/$name.json"
-  [ -e "$f" ] || die "no agent named '$name' is registered"
-  local iterm uuid
+agent_uuid() { # name -> iTerm session UUID
+  local f="$REG/$1.json"
+  [ -e "$f" ] || die "no agent named '$1' is registered"
+  local iterm
   iterm=$($JQ -r '.iterm_session_id // empty' "$f")
-  [ -n "$iterm" ] || die "'$name' has no iTerm session recorded; cannot nudge"
-  uuid="${iterm#*:}"
-  text=$(printf '%s' "$text" | tr -d '"\\')
-  osascript - "$uuid" "$text" <<'APPLESCRIPT'
+  [ -n "$iterm" ] || die "'$1' has no iTerm session recorded"
+  printf '%s' "${iterm#*:}"
+}
+
+raw_write() { # uuid raw-bytes — write into the session verbatim, no auto-newline.
+  # A trailing \r acts as Enter in both raw-mode TUIs (Claude Code) and shells.
+  osascript - "$1" "$2" <<'APPLESCRIPT'
 on run argv
   set targetId to item 1 of argv
-  set msg to item 2 of argv
+  set payload to item 2 of argv
   tell application "iTerm2"
     repeat with w in windows
       repeat with t in tabs of w
         repeat with s in sessions of t
           if (id of s as text) is equal to targetId then
-            tell s to write text msg
-            return "nudged"
+            tell s to write text payload newline NO
+            return "ok"
           end if
         end repeat
       end repeat
@@ -315,6 +320,51 @@ on run argv
   return "session not found (window closed?)"
 end run
 APPLESCRIPT
+}
+
+do_nudge() { # name [text] — type text + Enter (submits as a prompt)
+  local name="$1"
+  local text="${2:-[agent-chat] you have new messages — run: agent-chat read}"
+  text=$(printf '%s' "$text" | tr -d '"\\')
+  raw_write "$(agent_uuid "$name")" "$text"$'\r'
+}
+
+cmd_type() { # name text — type into the input box WITHOUT submitting
+  local name="${1:-}" text="${2:-}"
+  [ -n "$name" ] && [ -n "$text" ] || die 'usage: agent-chat type <name> "text"'
+  raw_write "$(agent_uuid "$name")" "$text"
+}
+
+cmd_key() { # name key... — send special keys / Claude Code shortcuts
+  local name="${1:-}"; shift 2>/dev/null || true
+  [ -n "$name" ] && [ $# -gt 0 ] || die "usage: agent-chat key <name> <key...>  (keys: escape enter ctrl-c ctrl-d ctrl-b ctrl-o ctrl-r ctrl-t ctrl-v tab shift-tab up down left right space backspace)"
+  local uuid seq k
+  uuid=$(agent_uuid "$name")
+  seq=""
+  for k in "$@"; do
+    case "$k" in
+      esc|escape)   seq+=$'\033';;
+      enter|return|cr) seq+=$'\r';;
+      ctrl-c)       seq+=$'\003';;
+      ctrl-d)       seq+=$'\004';;
+      ctrl-b)       seq+=$'\002';;
+      ctrl-o)       seq+=$'\017';;
+      ctrl-r)       seq+=$'\022';;
+      ctrl-t)       seq+=$'\024';;
+      ctrl-v)       seq+=$'\026';;
+      ctrl-z)       seq+=$'\032';;
+      tab)          seq+=$'\t';;
+      shift-tab)    seq+=$'\033[Z';;
+      up)           seq+=$'\033[A';;
+      down)         seq+=$'\033[B';;
+      right)        seq+=$'\033[C';;
+      left)         seq+=$'\033[D';;
+      space)        seq+=' ';;
+      backspace)    seq+=$'\177';;
+      *) die "unknown key '$k'";;
+    esac
+  done
+  raw_write "$uuid" "$seq"
 }
 
 # ---------- hook mode ----------
@@ -371,8 +421,10 @@ case "$cmd" in
   peek)       cmd_peek "$@";;
   who)        cmd_who "$@";;
   nudge)      do_nudge "$@";;
+  type)       cmd_type "$@";;
+  key)        cmd_key "$@";;
   hook)       cmd_hook "$@";;
   help|--help|-h)
-    sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//';;
+    sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//';;
   *) die "unknown command '$cmd' (try: agent-chat help)";;
 esac
