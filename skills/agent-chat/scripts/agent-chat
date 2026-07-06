@@ -322,11 +322,17 @@ end run
 APPLESCRIPT
 }
 
-do_nudge() { # name [text] — type text + Enter (submits as a prompt)
+do_nudge() { # name [text] — type text, then Enter as a SEPARATE keystroke (submits as a prompt).
+  # The two calls are deliberate: TUIs run with bracketed paste on, so a \r inside
+  # the same write-text payload is pasted as a literal newline into the input box
+  # instead of submitting. A lone \r in its own call acts as a real Enter.
   local name="$1"
   local text="${2:-[agent-chat] you have new messages — run: agent-chat read}"
   text=$(printf '%s' "$text" | tr -d '"\\')
-  raw_write "$(agent_uuid "$name")" "$text"$'\r'
+  local uuid
+  uuid=$(agent_uuid "$name")
+  raw_write "$uuid" "$text"
+  raw_write "$uuid" $'\r'
 }
 
 cmd_type() { # name text — type into the input box WITHOUT submitting

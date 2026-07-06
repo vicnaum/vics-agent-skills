@@ -12,9 +12,10 @@ UUID="$1"; SID="$2"; RELAUNCH="$3"; KICKOFF="$4"; GRACE="${5:-15}"; WAIT_EXIT="$
 log() { echo "[$(date '+%F %T')] [$SID] $*" >> "$LOG"; }
 
 itype() { # type text + Enter into the target iTerm session.
-  # Enter is sent as \r with auto-newline off: \r submits in raw-mode TUIs
-  # (Claude Code's input box) AND executes at a shell prompt; \n does neither
-  # reliably in a TUI (it lands in the input box without submitting).
+  # Enter is a SEPARATE write-text call: TUIs run with bracketed paste on, so a
+  # newline/\r inside the text payload is pasted as a literal line break into the
+  # input box without submitting. A lone \r in its own call is a real Enter, and
+  # also executes at a shell prompt. (Verified live against a Claude Code session.)
   [ -n "$DRY" ] && { log "DRY: would type: $1"; return 0; }
   osascript - "$UUID" "$1" <<'AS'
 on run argv
@@ -25,7 +26,9 @@ on run argv
       repeat with t in tabs of w
         repeat with s in sessions of t
           if (id of s as text) is equal to targetId then
-            tell s to write text (msg & return) newline NO
+            tell s to write text msg newline NO
+            delay 0.2
+            tell s to write text (return) newline NO
             return "ok"
           end if
         end repeat

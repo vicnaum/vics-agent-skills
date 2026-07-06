@@ -49,7 +49,7 @@ A **nudge** covers the remaining case: a fully idle peer. It types a line into t
 
 Beyond chat, an agent (or the user via CLI) can drive a peer's Claude Code TUI with its normal keyboard shortcuts: `key <name> escape` interrupts whatever the peer is doing mid-turn; `type <name> "/compact"` + `key <name> enter` runs a remote slash command; `key <name> down down enter` navigates a menu. `type` never submits by itself; `nudge` = type + Enter. Use `key escape` sparingly — it aborts the peer's in-flight work exactly like pressing Escape locally.
 
-Terminal-typing gotcha (why this works): submission is sent as a carriage return (`\r`, a real Enter keypress) with iTerm's auto-newline off — a plain `\n` lands in a raw-mode TUI's input box **without submitting**. All typing paths here (nudge, key enter, respawn's watcher) use the `\r` form; control keys are sent as their raw bytes/escape sequences (verified end-to-end: ESC, arrows, tab, ctrl-c arrive as real keypresses).
+Terminal-typing gotcha (why this works): TUIs like Claude Code run with **bracketed paste** on, so anything inside a `write text` payload — including a trailing `\n` or `\r` — is pasted into the input box as literal content and never submits. Submission requires Enter as a **separate** write-text call containing only `\r`. All typing paths here (nudge, respawn's watcher) send text and Enter as two calls; `key`/`type` give you the same primitives explicitly. Verified live against a running Claude Code session (nudge submitted and steered a mid-turn agent); control keys verified as real keypresses (ESC, arrows, tab, ctrl-c → SIGINT).
 
 ## Etiquette (for agents in the chat)
 
