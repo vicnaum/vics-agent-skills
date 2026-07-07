@@ -17,10 +17,11 @@
 #
 # Usage:
 #   agent-chat register <name>              join (or silently rebind) as <name>
-#   agent-chat send "<msg>" [--room <room>] [--to <name>] [--nudge]
+#   agent-chat send "<msg>" [--room <room>] [--to <name>] [--nudge|--quiet]
 #                                           default room: your project room;
-#                                           --to = DM (delivered via #general);
-#                                           --nudge wakes recipient(s)
+#                                           --to = DM (delivered via #general) — DMs NUDGE the
+#                                           recipient by default (--quiet for FYI-only);
+#                                           room posts are passive unless --nudge
 #   agent-chat read                         print + consume unread from all your rooms
 #   agent-chat log [N] [--room <room>]      last N messages of a room (default: project room)
 #   agent-chat rooms                        list all rooms (* = joined)
@@ -188,16 +189,17 @@ cmd_unregister() {
 }
 
 cmd_send() {
-  local room="" to="*" nudge=0 msg=""
+  local room="" to="*" nudge=0 quiet=0 msg=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --room) room="$2"; shift 2;;
       --to) to="$2"; shift 2;;
       --nudge) nudge=1; shift;;
+      --quiet) quiet=1; shift;;
       *) [ -n "$msg" ] && die "one message per send (quote it)"; msg="$1"; shift;;
     esac
   done
-  [ -n "$msg" ] || die 'usage: agent-chat send "<message>" [--room <room>] [--to <name>] [--nudge]'
+  [ -n "$msg" ] || die 'usage: agent-chat send "<message>" [--room <room>] [--to <name>] [--nudge|--quiet]'
   local from
   from=$(require_name)
   if [ -z "$room" ]; then
@@ -218,6 +220,10 @@ cmd_send() {
   fi
   append_msg "$room" "$from" "$to" "$msg"
   echo "sent to #$room."
+  # DMs nudge the recipient by default: hooks deliver only when the recipient
+  # is ACTIVE, so an idle agent would otherwise never see the message
+  # (--quiet opts out for pure FYIs). Room posts stay passive unless --nudge.
+  if [ "$to" != "*" ] && [ "$quiet" = 0 ]; then nudge=1; fi
   if [ "$nudge" = 1 ]; then
     local f name
     for f in "$REG"/*.json; do
