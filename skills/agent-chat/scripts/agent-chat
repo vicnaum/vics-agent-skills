@@ -28,6 +28,8 @@
 #   agent-chat join <room> / leave <room>   manage room membership
 #   agent-chat peek <room> [N]              read any room without joining (no cursor change)
 #   agent-chat who                          list registered agents and their rooms
+#   agent-chat status [<name>]              live state of an agent: busy|idle|waiting|dead|offline
+#                                           (glyph-primary + hook fallback + process liveness)
 #   agent-chat nudge <name> [text]          type a wake-up line + Enter into that agent's iTerm window
 #   agent-chat type <name> "text"           type into that agent's input box WITHOUT submitting
 #   agent-chat screen <name> [N]            snapshot of that agent's visible terminal (what it is
@@ -225,14 +227,30 @@ cmd_send() {
   # (--quiet opts out for pure FYIs). Room posts stay passive unless --nudge.
   if [ "$to" != "*" ] && [ "$quiet" = 0 ]; then nudge=1; fi
   if [ "$nudge" = 1 ]; then
-    local f name
+    local f name st state src
     for f in "$REG"/*.json; do
       [ -e "$f" ] || break
       name=$($JQ -r .name "$f")
       [ "$name" = "$from" ] && continue
       [ "$to" != "*" ] && [ "$name" != "$to" ] && continue
       if [ "$to" = "*" ] && ! $JQ -e --arg r "$room" '.rooms | index($r)' "$f" >/dev/null; then continue; fi
-      do_nudge "$name" "[agent-chat] new message from $from in #$room — run: agent-chat read" || true
+      # state-aware delivery: only wake an agent that won't otherwise see it
+      st=$(agent_state "$name"); state="${st%%$'\t'*}"; src="${st#*$'\t'}"
+      case "$state" in
+        busy)
+          echo "  → $name is busy — hooks will deliver at its next turn boundary (not nudging)";;
+        waiting)
+          echo "  → $name is blocked on a prompt/dialog — NOT typing (would hit a button). It'll see the message when it resumes. Inspect: agent-chat screen $name";;
+        idle)
+          do_nudge "$name" "[agent-chat] new message from $from in #$room — run: agent-chat read" && \
+            echo "  → $name was idle — nudged" || true;;
+        dead|offline)
+          echo "  → $name is $state ($src) — message stored; it'll be delivered when that session restarts and re-registers";;
+        *)
+          # unknown: nudge anyway (best-effort), typing is harmless at an idle prompt
+          do_nudge "$name" "[agent-chat] new message from $from in #$room — run: agent-chat read" && \
+            echo "  → $name state unknown ($src) — nudged best-effort" || true;;
+      esac
     done
   fi
 }
@@ -427,6 +445,136 @@ APPLESCRIPT
     tmux) tmux capture-pane -p -t "$2";;
     *) die "unsupported terminal backend '$1'";;
   esac
+}
+
+# ---------- liveness & status ----------
+#
+# Layered status, most-authoritative first:
+#   1. terminal reachable? (iterm session / tmux pane exists)  — else OFFLINE
+#   2. a claude process alive on its tty?                      — else DEAD
+#   3. title glyph (Claude's own render loop; ALWAYS fresh, can't go stale):
+#        ⠂/⠐ animating = busy · ✳ static = idle-or-waiting
+#   4. hook status file: adds the "waiting" sub-state the glyph can't express,
+#      and is the fallback when the title is unreadable. TTL-guarded so a
+#      crashed/escaped session's stale "busy" never wins over the live glyph.
+
+STATUS="$BASE/status"
+STATUS_TTL=180   # seconds; a hook stamp older than this is not trusted on its own
+
+term_title() { # backend addr -> current terminal title (carries the state glyph)
+  case "$1" in
+    tmux) tmux display -p -t "$2" '#{pane_title}' 2>/dev/null;;
+    iterm)
+      osascript - "$2" <<'APPLESCRIPT' 2>/dev/null
+on run argv
+  set targetId to item 1 of argv
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if (id of s as text) is equal to targetId then return (name of s)
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return ""
+end run
+APPLESCRIPT
+      ;;
+  esac
+}
+
+glyph_state() { # title -> busy | idle | unknown  (from the leading status glyph)
+  case "$1" in
+    "⠂"*|"⠐"*) echo busy;;      # TITLE_ANIMATION_FRAMES: actively working
+    "✳"*)      echo idle;;      # static prefix: idle OR waiting-for-approval
+    *)         echo unknown;;   # title disabled / non-Claude (e.g. codex ⠋)
+  esac
+}
+
+agent_tty() { # backend addr -> tty path, empty if terminal is gone
+  case "$1" in
+    tmux)  tmux display -p -t "$2" '#{pane_tty}' 2>/dev/null;;
+    iterm)
+      osascript - "$2" <<'APPLESCRIPT' 2>/dev/null
+on run argv
+  set targetId to item 1 of argv
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if (id of s as text) is equal to targetId then return (tty of s)
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return ""
+end run
+APPLESCRIPT
+      ;;
+  esac
+}
+
+stamp_status() { # name state — record a hook-observed state with a timestamp
+  mkdir -p "$STATUS"
+  printf '%s %s\n' "$2" "$(date +%s)" > "$STATUS/$1"
+}
+
+# agent_state <name> -> prints "STATE\tSOURCE"; STATE in busy|idle|waiting|dead|offline|unknown
+agent_state() {
+  local name="$1" tb ta tty g title hstate hepoch age
+  read -r tb ta <<< "$(agent_term "$name" 2>/dev/null)" || { printf 'unknown\tno-terminal\n'; return; }
+  tty=$(agent_tty "$tb" "$ta")
+  [ -n "$tty" ] || { printf 'offline\twindow/pane closed\n'; return; }
+  if ! ps -t "${tty#/dev/}" -o command= 2>/dev/null | grep -qE '^ *(\S*/)?(claude|node)( |$)|claude'; then
+    printf 'dead\tno claude process on tty (crashed/exited)\n'; return
+  fi
+  title=$(term_title "$tb" "$ta"); g=$(glyph_state "$title")
+  hstate=""; if [ -f "$STATUS/$name" ]; then read -r hstate hepoch < "$STATUS/$name"; fi
+  age=999999; [ -n "${hepoch:-}" ] && age=$(( $(date +%s) - hepoch ))
+  _combine_state "$g" "$hstate" "$age"
+}
+
+# _combine_state <glyph:busy|idle|unknown> <hookstate> <age-secs> -> "STATE\tSOURCE"
+# Pure decision table (no I/O) so it is unit-testable. The glyph is the
+# always-fresh primary for busy/idle; the hook file only ADDS the "waiting"
+# sub-state (which looks like ✳ idle to the glyph) and serves as the fallback
+# when the title is unreadable — TTL-guarded so a stale stamp never wins.
+_combine_state() {
+  local g="$1" hstate="$2" age="$3"
+  case "$g" in
+    busy) printf 'busy\tglyph\n';;
+    idle)
+      if [ "$hstate" = "waiting" ] && [ "$age" -le "$STATUS_TTL" ]; then
+        printf 'waiting\thook(fresh)\n'      # glyph shows ✳ but a permission prompt is up
+      else
+        printf 'idle\tglyph\n'               # stale/absent/non-waiting hook → glyph wins
+      fi
+      ;;
+    *) # title unreadable — fall back to a fresh hook stamp, else unknown
+      if [ -n "$hstate" ] && [ "$age" -le "$STATUS_TTL" ]; then
+        printf '%s\thook(fresh, title unreadable)\n' "$hstate"
+      else
+        printf 'unknown\ttitle unreadable, no fresh hook stamp\n'
+      fi
+      ;;
+  esac
+}
+
+cmd_status() { # [name] — resolve one agent's live state (default: all)
+  local name="${1:-}"
+  if [ -n "$name" ]; then
+    [ -e "$REG/$name.json" ] || die "no agent named '$name' is registered"
+    local st; st=$(agent_state "$name")
+    printf '%-16s %s\n' "$name" "$(printf '%s' "$st" | sed 's/\t/  (/;s/$/)/')"
+    return
+  fi
+  local f n
+  for f in "$REG"/*.json; do
+    [ -e "$f" ] || { echo "  (nobody registered)"; break; }
+    n=$($JQ -r .name "$f")
+    printf '%-16s %s\n' "$n" "$(agent_state "$n" | sed 's/\t/  (/;s/$/)/')"
+  done
 }
 
 do_nudge() { # name [text] — type text, then Enter as a SEPARATE keystroke (submits as a prompt).
@@ -680,6 +828,15 @@ cmd_hook() {
   sid=$(printf '%s' "$input" | $JQ -r '.session_id // empty' 2>/dev/null)
   [ -n "$sid" ] || exit 0
   name=$(resolve_name "$sid") || exit 0
+  # stamp coarse state from the event (fallback signal; the live title glyph is
+  # primary). Runs BEFORE the no-mail early-exit so it always records.
+  case "$event" in
+    UserPromptSubmit|PostToolUse|PreToolUse) stamp_status "$name" busy;;
+    Stop|SubagentStop)                       stamp_status "$name" idle;;
+    PermissionRequest)                       stamp_status "$name" waiting;;
+    # (Notification is intentionally NOT mapped — it also fires on idle, so it
+    #  would mislabel an idle agent as "waiting".)
+  esac
   text=$(deliver "$name")
   [ -n "$text" ] || exit 0
   payload="📨 agent-chat — new message(s) for you ('$name'):
@@ -723,6 +880,7 @@ case "$cmd" in
   leave)      cmd_leave "$@";;
   peek)       cmd_peek "$@";;
   who)        cmd_who "$@";;
+  status)     cmd_status "$@";;
   nudge)      do_nudge "$@";;
   type)       cmd_type "$@";;
   key)        cmd_key "$@";;
@@ -730,6 +888,6 @@ case "$cmd" in
   spawn)      cmd_spawn "$@";;
   hook)       cmd_hook "$@";;
   help|--help|-h)
-    sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//';;
+    sed -n '2,48p' "$0" | sed 's/^# \{0,1\}//';;
   *) die "unknown command '$cmd' (try: agent-chat help)";;
 esac
