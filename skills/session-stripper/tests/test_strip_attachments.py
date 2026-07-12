@@ -194,6 +194,54 @@ def test_capability_attachments_are_never_dropped():
     assert stats["nested_memory"]["count"] == 1
 
 
+def test_queued_command_human_input_is_never_dropped():
+    """REGRESSION: queued_command is the ONLY copy of input the user typed while
+    a turn was still running (CC drains it mid-turn; no `user` line is written).
+    An earlier policy kept "the last 2" and silently deleted 9 real user messages
+    from a live session. It must now survive an unqualified strip."""
+    typed = [
+        "How's it going? What's the speed?",
+        "I've restarted the dock",
+        "make no mistakes during copying this - it's important data",
+    ]
+    items = [("user", "m0")]
+    for t in typed:
+        items.append(("attachment", {"type": "queued_command", "prompt": t,
+                                     "commandMode": "prompt"}))
+    items.append(("assistant", "m1"))
+    path = build_session_with_attachments(items)
+
+    strip_attachments(path, no_backup=True)
+
+    surviving = [
+        o["attachment"]["prompt"]
+        for o in load_session(path)
+        if o.get("type") == "attachment"
+        and o["attachment"].get("type") == "queued_command"
+    ]
+    for t in typed:
+        assert t in surviving, f"strip deleted human input: {t!r}"
+
+
+def test_queued_command_task_notifications_are_never_dropped():
+    """REGRESSION: task-notification queued_commands are how CC knows a
+    background shell finished. Drop them and the next resume reports every task
+    as having "no completion record" and marks them stopped."""
+    items = [("user", "m0")]
+    for tid in ("b0q7xpx7g", "bxcvrxszp", "bb5w8p16h", "bc5be39p0"):
+        items.append(("attachment", {
+            "type": "queued_command",
+            "prompt": f"<task-notification>\n<task-id>{tid}</task-id>\n</task-notification>",
+            "commandMode": "task-notification",
+        }))
+    items.append(("assistant", "m1"))
+    path = build_session_with_attachments(items)
+
+    strip_attachments(path, no_backup=True)
+
+    assert collect_stats(load_session(path))["queued_command"]["count"] == 4
+
+
 def test_drop_all_requires_explicit_types():
     path = build_session_with_attachments([("user", "m0"), ("assistant", "m1")])
     try:

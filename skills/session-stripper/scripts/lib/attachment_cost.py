@@ -114,6 +114,26 @@ DEFAULT_POLICY = {
     "opened_file_in_ide": KEEP_ALL,
     "mcp_resource": KEEP_ALL,
 
+    # (c) queued_command — NEVER DROP. Learned the hard way.
+    #
+    # This type looks like disposable system chatter and is not. It carries two
+    # irreplaceable things:
+    #
+    #   1. HUMAN INPUT. When the user types while a turn is still running, CC
+    #      drains that input mid-turn and stores it ONLY as a queued_command
+    #      attachment (commandMode='prompt'). There is no corresponding `user`
+    #      message line. An earlier version of this policy kept "the last 2" and
+    #      silently deleted 9 real user messages from a live session — the sole
+    #      copy of each.
+    #
+    #   2. BACKGROUND-TASK COMPLETION RECORDS. Task notifications
+    #      (commandMode='task-notification') are how CC knows a background shell
+    #      finished. Delete them and the next resume reports every task as having
+    #      "no completion record" and marks them stopped.
+    #
+    # It is cheap anyway (~7k tokens on a 4,000-message session). Not worth it.
+    "queued_command": KEEP_ALL,
+
     # superseded-by-latest: only the newest snapshot describes current state
     "task_reminder": 1,
     "todo_reminder": 1,
@@ -129,7 +149,6 @@ DEFAULT_POLICY = {
     # stale chatter: recent ones may still be relevant, old ones never are
     "hook_success": 2,
     "hook_additional_context": 2,
-    "queued_command": 2,
     "edited_text_file": 3,
 
     # one per turn, never deduped by CC — grows without bound
