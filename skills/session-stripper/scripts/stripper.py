@@ -10,6 +10,7 @@ import argparse
 from lib.analyze import analyze_session, health_check
 from lib.strip_tools import strip_tools
 from lib.strip_thinking import strip_thinking
+from lib.strip_attachments import strip_attachments, list_attachments
 from lib.compact import compact_before
 from lib.persist_tools import show_tool, persist_tool_result, persist_tools_bulk, show_thinking, persist_thinking, persist_thinking_bulk
 from lib.persist_text import persist_text, persist_text_bulk
@@ -153,6 +154,28 @@ def cmd_strip_thinking(args):
                              enabled=not getattr(args, "no_usage_reset", False))
 
 
+def cmd_strip_attachments(args):
+    """Drop superseded attachments (system-reminders) from a session."""
+    if args.list:
+        list_attachments(args.session)
+        return
+    _maybe_fork(args, "strip-attachments")
+    types = None
+    if args.types:
+        types = [t.strip() for t in args.types.split(",")]
+    strip_attachments(
+        args.session,
+        dry_run=args.dry_run,
+        no_backup=args.no_backup,
+        types=types,
+        keep_recent=args.keep_recent,
+        drop_all=args.drop_all,
+        include_free=args.include_free,
+    )
+    _reset_usage_after_strip(args.session, args.dry_run,
+                             enabled=not getattr(args, "no_usage_reset", False))
+
+
 def cmd_strip_all(args):
     """Strip both tool content and thinking blocks."""
     _maybe_fork(args, f"strip-all --from {args.from_pos} --to {args.to_pos}")
@@ -179,6 +202,19 @@ def cmd_strip_all(args):
         from_pos=args.from_pos,
         to_pos=args.to_pos,
     )
+
+    # Superseded attachments are the third big block of re-sent context, and on
+    # long sessions they can outweigh thinking several times over. Opt out with
+    # --keep-attachments. Note this ignores --from/--to: the policy is
+    # "keep the newest of each kind", which is a whole-session notion.
+    if not getattr(args, "keep_attachments", False):
+        print()
+        strip_attachments(
+            args.session,
+            dry_run=args.dry_run,
+            no_backup=True,  # already backed up above
+        )
+
     _reset_usage_after_strip(args.session, args.dry_run,
                              enabled=not getattr(args, "no_usage_reset", False))
 
@@ -464,13 +500,42 @@ def main():
     add_fork_args(p_strip_thinking)
     p_strip_thinking.set_defaults(func=cmd_strip_thinking)
 
+    # strip-attachments
+    p_strip_att = subparsers.add_parser(
+        "strip-attachments",
+        help="Drop superseded attachments (system-reminders re-sent every request)")
+    add_common_args(p_strip_att)
+    add_usage_reset_arg(p_strip_att)
+    add_fork_args(p_strip_att)
+    p_strip_att.add_argument("--list", action="store_true",
+                             help="Show attachments by type with rendered cost and "
+                                  "policy verdict; change nothing")
+    p_strip_att.add_argument("--types", type=str, default=None,
+                             help="Comma-separated attachment types to act on "
+                                  "(default: all reducible types)")
+    p_strip_att.add_argument("--keep-recent", type=int, default=None,
+                             help="Override how many of each type to keep "
+                                  "(default: per-type policy, e.g. 1 task_reminder)")
+    p_strip_att.add_argument("--drop-all", action="store_true",
+                             help="Drop EVERY attachment of the named --types, "
+                                  "ignoring the keep-all policy. Escape hatch: can "
+                                  "remove the capability attachments that tell the "
+                                  "model which tools/skills exist")
+    p_strip_att.add_argument("--include-free", action="store_true",
+                             help="Also drop attachments that render to nothing "
+                                  "(saves no context; shrinks the file only)")
+    p_strip_att.set_defaults(func=cmd_strip_attachments)
+
     # strip-all
-    p_strip_all = subparsers.add_parser("strip-all", help="Strip tools + thinking")
+    p_strip_all = subparsers.add_parser("strip-all", help="Strip tools + thinking + superseded attachments")
     add_common_args(p_strip_all)
     add_range_args(p_strip_all)
     add_tool_filter_args(p_strip_all)
     add_usage_reset_arg(p_strip_all)
     add_fork_args(p_strip_all)
+    p_strip_all.add_argument("--keep-attachments", action="store_true",
+                             help="Don't drop superseded attachments (they are "
+                                  "re-sent on every request; dropped by default)")
     p_strip_all.set_defaults(func=cmd_strip_all)
 
     # reset-usage — fix CC's context gauge without stripping anything

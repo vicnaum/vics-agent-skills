@@ -9,6 +9,7 @@ from collections import Counter, defaultdict
 
 from .chain import load_session, build_uuid_index, walk_active_chain, count_content_chars, estimate_tokens
 from .image_tokens import image_block_tokens
+from .strip_attachments import collect_stats as collect_attachment_stats
 
 
 def _accurate_image_tokens(obj):
@@ -143,8 +144,26 @@ def analyze_session(session_path, show_cut_points=True):
     stats["token_totals"] = token_totals
     stats["image_tokens_naive_chars_div_4"] = image_tokens_naive
 
+    # Attachments (system-reminders) are re-expanded into EVERY request, so they
+    # are part of the prompt even though they carry no message content. Omitting
+    # them used to make this whole report read ~30-50% low on long sessions.
+    attach_rows = collect_attachment_stats(objects)
+    attach_chars = sum(r["chars"] for r in attach_rows.values())
+    attach_tokens = estimate_tokens(attach_chars)
+    stats["attachment_chars"] = attach_chars
+    stats["attachment_tokens"] = attach_tokens
+    stats["attachment_breakdown"] = attach_rows
+
+    totals["attachment"] = attach_chars
+    totals["total"] += attach_chars
+    token_totals["attachment"] = attach_tokens
+    token_totals["total"] += attach_tokens
+
     strippable_keys = {"tool_use", "tool_result", "thinking", "image"}
     strippable_tokens = sum(token_totals[k] for k in strippable_keys)
+    # Attachments are reducible too, but only down to the policy floor (the
+    # newest of each kind has to stay), so they get their own line rather than
+    # being folded into STRIPPABLE.
     stats["strippable_tokens"] = strippable_tokens
 
     grand_total = token_totals["total"] or 1  # avoid division by zero
@@ -155,12 +174,14 @@ def analyze_session(session_path, show_cut_points=True):
     print()
     print(f"  {'Type':<16s} {'Chars':>12s} {'Est. Tokens':>12s} {'%':>7s}  {'Note'}")
     print(f"  {'─' * 16} {'─' * 12} {'─' * 12} {'─' * 7}  {'─' * 12}")
-    for key in ("text", "tool_use", "tool_result", "thinking", "image", "other"):
+    for key in ("text", "tool_use", "tool_result", "thinking", "image", "attachment", "other"):
         chars = totals[key]
         tokens = token_totals[key]
         pct = (tokens / grand_total) * 100
         if key == "image":
             note = "strippable · (w×h)/750 capped 1600"
+        elif key == "attachment":
+            note = "reducible · strip-attachments"
         else:
             note = "strippable" if key in strippable_keys else ""
         print(f"  {key:<16s} {chars:>12,d} {tokens:>12,d} {pct:>6.1f}%  {note}")
@@ -172,6 +193,37 @@ def analyze_session(session_path, show_cut_points=True):
         print(f"  (image col uses Anthropic formula; chars/4 would say {image_tokens_naive:,} — "
               f"over by {delta:,} tokens)")
     print()
+
+    # ── 2b. Attachment breakdown ────────────────────────────────────────
+
+    if attach_rows:
+        from .attachment_cost import KEEP_ALL, policy_for
+
+        print("-" * 72)
+        print("ATTACHMENTS (system-reminders re-sent on EVERY request)")
+        print("-" * 72)
+        print()
+        print(f"  {'Type':<26} {'Count':>6} {'Rendered':>10} {'Est. Tok':>9}  {'Policy'}")
+        print(f"  {'─' * 26} {'─' * 6} {'─' * 10} {'─' * 9}  {'─' * 22}")
+        reducible = 0
+        for t, r in sorted(attach_rows.items(), key=lambda kv: -kv[1]["chars"]):
+            pol = policy_for(t)
+            if pol == KEEP_ALL:
+                verdict = "keep all"
+            else:
+                drop_n = max(0, r["count"] - int(pol))
+                verdict = f"keep last {pol}" + (f", drop {drop_n}" if drop_n else "")
+                if r["count"] > int(pol) and r["chars"]:
+                    reducible += r["chars"] - (r["chars"] // max(1, r["count"])) * int(pol)
+            print(f"  {t:<26} {r['count']:>6,} {r['chars']:>10,} "
+                  f"{estimate_tokens(r['chars']):>9,}  {verdict}")
+        print(f"  {'─' * 26} {'─' * 6} {'─' * 10} {'─' * 9}")
+        print(f"  {'TOTAL':<26} {sum(r['count'] for r in attach_rows.values()):>6,} "
+              f"{attach_chars:>10,} {attach_tokens:>9,}")
+        if reducible > 0:
+            print(f"  {'REDUCIBLE':<26} {'':>6} {'':>10} {estimate_tokens(reducible):>9,}"
+                  f"  → stripper strip-attachments")
+        print()
 
     # ── 3. Token breakdown by tool name ─────────────────────────────────
 
