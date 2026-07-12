@@ -171,7 +171,9 @@ Init context — I want to start a deep work session on this codebase
     /           /         |       |
 ```
 
-CLI tool for trimming Claude Code JSONL sessions that hit "Prompt is too long". Strips tool content (60%+ of context), thinking blocks, images — or persists them to files with AI-generated summaries. 12 commands, no external dependencies (Python 3.8+ stdlib only).
+CLI tool for trimming Claude Code JSONL sessions that hit "Prompt is too long". Strips tool content (60%+ of context), thinking blocks, images, and superseded attachments — or persists them to files with AI-generated summaries. 13 commands, no external dependencies (Python 3.8+ stdlib only).
+
+`strip-attachments` targets the context nobody counts: `attachment` lines are not transcript metadata, they're re-expanded into a `<system-reminder>` on *every* request and never deduped — a long session can carry 100k+ tokens of stale todo snapshots and hook echoes. They're also `parentUuid` chain participants, so deleting them naively leaves a file that parses fine while CC silently loses everything older than the first deleted line; the command re-parents every child.
 
 Full technical deep-dive in [references/surgery-report.md](skills/session-stripper/references/surgery-report.md).
 

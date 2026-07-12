@@ -177,12 +177,25 @@ def save_session(path, objects, create_backup=True):
 
 
 def compute_active_chain_tokens(objects, uuid_index=None):
-    """Estimate the token weight of the active chain's *content* — roughly what
-    CC re-sends to the model on the next turn. Excludes the runtime system prompt
-    and tool schemas (added at send time, unknowable offline), so it is a
-    conversation-only floor, not the exact prompt size."""
+    """Estimate the token weight of the active chain — roughly what CC re-sends
+    to the model on the next turn.
+
+    Counts BOTH message content and `attachment` entries. Attachments are not
+    decoration: CC re-expands each one into a `<system-reminder>` on every
+    request (see lib/attachment_cost.py), and in a long session they can be a
+    six-figure token block. Leaving them out made this estimate — which feeds
+    `reset_usage_metadata()` and therefore CC's context gauge — read far below
+    the real prompt size, so a barely-stripped session would show a reassuring
+    number and then snap back to ~100% on the very next turn.
+
+    Still excludes the runtime system prompt and tool schemas (added at send
+    time, unknowable offline), so it remains a floor, not the exact size.
+    """
+    from .attachment_cost import envelope_rendered_chars
+
     chain = walk_active_chain(objects, uuid_index)
     total_chars = sum(count_content_chars(obj)["total"] for obj in chain)
+    total_chars += sum(envelope_rendered_chars(obj) for obj in chain)
     return estimate_tokens(total_chars)
 
 

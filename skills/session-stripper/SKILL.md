@@ -51,6 +51,10 @@ python3 <skill-dir>/scripts/stripper.py strip-tools <session.jsonl> --tools Bash
 # Strip thinking blocks only
 python3 <skill-dir>/scripts/stripper.py strip-thinking <session.jsonl>
 
+# Drop superseded attachments (system-reminders re-sent on EVERY request)
+python3 <skill-dir>/scripts/stripper.py strip-attachments <session.jsonl> --list   # what's there
+python3 <skill-dir>/scripts/stripper.py strip-attachments <session.jsonl>
+
 # Compact everything before chain position 150
 python3 <skill-dir>/scripts/stripper.py compact <session.jsonl> --before 150
 
@@ -75,7 +79,9 @@ To fix this, `strip-tools`, `strip-thinking`, and `strip-all` now **automaticall
 
 - Opt out with `--no-usage-reset`.
 - Run it standalone with `reset-usage` on an already-stripped session whose meter is still stuck (no need to re-strip). It also accepts `--fork`.
-- The estimate is conversation content only; it excludes the runtime system prompt + tool schemas (added at send time, unknowable offline), so it's a floor — the first live turn corrects it precisely.
+- The estimate counts message content **and attachments** (which CC re-sends every request). It still excludes the runtime system prompt + tool schemas (added at send time, unknowable offline), so it's a floor — the first live turn corrects it precisely.
+
+> **The gauge can only lie in your favour.** Because the reset writes an *estimate* into the JSONL, a session that was barely stripped will still show a reassuring number — and then snap back to ~100% on the first real turn, which is the only number that was ever measured. If a strip freed little, the meter dropping is not evidence that it worked. Check what `analyze` says is left, and treat a real API turn (one with non-zero `cache_read`/`cache_creation`) as the only ground truth. Attachments were excluded from this estimate until they were found to be worth six figures of tokens on long sessions — that omission made the gauge read far below the true prompt size.
 
 ## What Gets Stripped
 
@@ -84,9 +90,50 @@ To fix this, `strip-tools`, `strip-thinking`, and `strip-all` now **automaticall
 | Tool call inputs (`tool_use.input`) | 10-20% of context | `strip-tools --only-inputs` |
 | Tool results (`tool_result.content`) | 40-60% of context | `strip-tools --only-results` |
 | Thinking blocks | 10-20% of context | `strip-thinking` |
+| Superseded attachments (system-reminders) | 5-15% of context, more on long sessions | `strip-attachments` |
 | Images | Variable (can be 50%+) | `strip-tools` (auto) |
 | Images → text transcripts | Variable (often 90%+) | `replace-images` |
 | Everything above | 60-90% of context | `strip-all` |
+
+## Attachments — the context nobody counts
+
+`attachment` lines look like transcript metadata. They are not: **CC re-expands every one of them into a `<system-reminder>` on every single request, forever, and nothing dedupes them.**
+
+- `utils/messages.ts::reorderAttachmentsForAPI()` puts them in the API message array.
+- `normalizeAttachmentForAPI()` expands each into user content at request-build time.
+- `utils/conversationRecovery.ts` restores them from the JSONL on resume.
+
+A long session accumulates hundreds. One real example: 217 `task_reminder` snapshots (of which 182 were byte-identical consecutive repeats), 1,276 `total_tokens_reminder`s, 523 `hook_success` echoes — **~108k tokens re-sent on every turn**, none of it useful.
+
+`strip-attachments` keeps the newest of each kind and drops the superseded rest.
+
+### Three traps this command handles for you
+
+1. **Attachments are chain participants.** CC's `isChainParticipant()` excludes only `progress` — real messages chain *through* attachments (`att → att → user → assistant`). CC resumes by walking `parentUuid` back from the leaf and **stops dead at the first missing uuid**, silently dropping everything older. So attachment lines can't just be deleted; every child is re-parented to its nearest surviving ancestor (exactly how CC's own `progressBridge` handled removing `progress`). Naive deletion leaves a file that parses fine and loses half the conversation.
+
+2. **Some types re-emit if you delete them.** `deferred_tools_delta` / `agent_listing_delta` / `mcp_instructions_delta` compute their delta by replaying the prior delta attachments still in the array. Delete them and CC considers every tool new again, re-emitting a full-size announcement next turn — you get the tokens back, plus a duplicate. Same for `skill_listing`, which sets a `suppressNextSkillListing()` latch on resume. **These are `keep all` / `keep last 1` in the default policy and should stay that way.**
+
+3. **Rendered cost ≠ record size.** A `task_reminder` record carries full task objects including long `description` fields, but the renderer emits only `#{id}. [{status}] {subject}` — descriptions are never sent. Sizing the JSON record over-counts these ~4×. `--list` reports what is actually *rendered*.
+
+Some types render to `[]` (most `hook_success` — only `SessionStart`/`UserPromptSubmit` hooks are sent). Dropping those saves zero context, so the default run skips them rather than rewiring the chain for nothing; `--include-free` drops them anyway to shrink the file.
+
+```bash
+# See what's there and what the policy would do — changes nothing
+stripper strip-attachments <session.jsonl> --list
+
+# Apply the default policy (keep newest of each kind)
+stripper strip-attachments <session.jsonl>
+
+# Only touch specific types / keep more history
+stripper strip-attachments <session.jsonl> --types task_reminder,hook_success --keep-recent 3
+
+# Escape hatch: drop EVERY attachment of the named types, ignoring keep-all.
+# Requires --types precisely because it can remove the capability attachments
+# that tell the model which tools and skills exist.
+stripper strip-attachments <session.jsonl> --types skill_listing --drop-all
+```
+
+**Unknown attachment types are always kept** and sized conservatively. CC adds and renames these between releases (`total_tokens_reminder` became `token_usage`), so the policy never drops what it doesn't recognize.
 
 ## Workflow
 
@@ -346,6 +393,8 @@ Output is a new session file. Resume with `claude -r <session-id>`.
 - **Wrapped thinking is auto-detected.** Any text block whose whole content is a single `<thinking>…</thinking>` or `<think>…</think>` span (e.g. from `convert_to_cli.py --flatten-thinking`, or from open-source models that emit `<think>` tags) is treated as a real thinking block by `analyze`, `show-thinking`, `strip-thinking`, `strip-all`, and `persist-thinking`. No flag needed.
 - Backups are created automatically and **enumerated** (`.bak`, `.bak.1`, `.bak.2`, …) — a fresh one per run, never skipped (use `--no-backup` to opt out)
 - **The context gauge is driven by stored `usage` counts on the last assistant turn, not a live recount** — so stripping auto-resets those counts (or run `reset-usage`), otherwise CC keeps blocking input at the pre-strip size. This is the single most common reason a strip "didn't work."
+- **`strip-thinking` alone is usually a rounding error.** Thinking is often only ~3% of a session. If a session keeps hitting the context limit right after a strip, check *which* strip ran: the `strippedBy` stamp on every forked envelope records the exact operation. A session stripped three times with `strip-thinking` has been stripped ~9%.
+- **Attachments are real context, not metadata** — CC re-expands each into a `<system-reminder>` on every request and never dedupes them. They are also `parentUuid` chain participants, so they cannot simply be deleted; `strip-attachments` re-parents their children. See the attachments section above.
 - No external dependencies -- Python 3.8+ stdlib only
 
 For the full technical deep-dive, see [references/surgery-report.md](references/surgery-report.md).
