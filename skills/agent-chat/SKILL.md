@@ -35,6 +35,7 @@ agent-chat spawn <name> [--dir <path>] [--prompt "task"] [--cmd "claude ..."] [-
                                  # a detached tmux session (--tmux / headless). It inherits this
                                  # session's CLI flags and registers itself as <name>
 agent-chat unregister [<name>]   # leave the chat
+agent-chat web [port]            # local live web viewer (default :8787) — channels, messages, people
 agent-chat setup-codex           # one-time: wire hooks into OpenAI Codex CLI (cross-CLI chat)
 ```
 

@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agent-chat</title>
+<style>
+  :root {
+    --bg: #10141a; --panel: #161c24; --panel2: #131922; --border: #232c37;
+    --text: #d7dee6; --dim: #75828f; --accent: #4dbd7f; --accent-dim: #2c5c42;
+    --dm: #d9a441; --sys: #5d6a77; --me-unread: #e05c5c;
+    --busy: #e0a33c; --idle: #4dbd7f; --waiting: #5f87ff; --stale: #5d6a77;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f4f6f7; --panel: #ffffff; --panel2: #eef1f3; --border: #dde3e8;
+      --text: #22303c; --dim: #74828e; --accent: #22885a; --accent-dim: #bfe3d0;
+      --dm: #a97417; --sys: #97a3ae;
+    }
+  }
+  * { box-sizing: border-box; margin: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 13px/1.45 -apple-system, "SF Pro Text", "Segoe UI", sans-serif;
+    display: grid; grid-template-columns: 230px 1fr 250px; grid-template-rows: 100vh;
+  }
+  .col { display: flex; flex-direction: column; min-height: 0; }
+  .side { background: var(--panel2); border-right: 1px solid var(--border); }
+  .side.right { border-right: 0; border-left: 1px solid var(--border); }
+  .colhead {
+    padding: 12px 14px 8px; font-size: 11px; font-weight: 600; letter-spacing: .08em;
+    text-transform: uppercase; color: var(--dim); flex: none;
+    display: flex; align-items: baseline; justify-content: space-between;
+  }
+  .scroll { overflow-y: auto; flex: 1; min-height: 0; padding-bottom: 12px; }
+
+  /* channels */
+  .chan {
+    display: flex; align-items: center; gap: 8px; padding: 6px 14px; cursor: pointer;
+    color: var(--dim); white-space: nowrap; overflow: hidden;
+  }
+  .chan:hover { color: var(--text); }
+  .chan.active { color: var(--text); background: var(--panel); box-shadow: inset 2px 0 0 var(--accent); }
+  .chan .hash { color: var(--accent); flex: none; }
+  .chan .cname { overflow: hidden; text-overflow: ellipsis; flex: 1; }
+  .chan .cnt { flex: none; font-size: 10px; color: var(--dim); background: var(--panel);
+               border: 1px solid var(--border); border-radius: 8px; padding: 0 6px; }
+
+  /* messages */
+  main { background: var(--bg); }
+  .mainhead {
+    flex: none; padding: 11px 16px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: baseline; gap: 10px; background: var(--panel);
+  }
+  .mainhead .title { font-weight: 650; font-size: 14px; }
+  .mainhead .sub { color: var(--dim); font-size: 12px; }
+  #live { margin-left: auto; font-size: 11px; color: var(--dim); }
+  #live::before { content: "●"; color: var(--accent); margin-right: 5px; }
+  #live.off::before { color: var(--me-unread); }
+  #msgs { padding: 10px 16px; font-family: "SF Mono", ui-monospace, Menlo, monospace; font-size: 12.5px; }
+  .day {
+    text-align: center; color: var(--dim); font-size: 11px; margin: 14px 0 8px;
+    display: flex; align-items: center; gap: 10px;
+    font-family: -apple-system, sans-serif;
+  }
+  .day::before, .day::after { content: ""; flex: 1; border-top: 1px solid var(--border); }
+  .msg { display: flex; gap: 10px; padding: 2.5px 0; align-items: baseline; }
+  .msg .ts { color: var(--dim); flex: none; font-size: 11px; width: 38px; }
+  .msg .from { flex: none; font-weight: 700; }
+  .msg .body { white-space: pre-wrap; word-break: break-word; min-width: 0; }
+  .msg .roomtag, .msg .clitag, .msg .dmtag {
+    flex: none; font-size: 9.5px; border-radius: 3px; padding: 0 4px;
+    font-family: -apple-system, sans-serif; letter-spacing: .02em;
+  }
+  .msg .roomtag { color: var(--dim); border: 1px solid var(--border); }
+  .msg .clitag  { color: var(--bg); background: var(--dim); font-weight: 700; }
+  .msg .dmtag   { color: var(--dm); border: 1px solid var(--dm); }
+  .msg.dm .body { color: var(--dm); }
+  .msg.sys { color: var(--sys); font-style: italic; }
+  .msg.sys .from { color: var(--sys); font-weight: 400; }
+
+  /* people */
+  .person { display: flex; align-items: center; gap: 8px; padding: 7px 14px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--stale); }
+  .dot.busy { background: var(--busy); animation: pulse 1.2s ease-in-out infinite; }
+  .dot.idle { background: var(--idle); }
+  .dot.waiting { background: var(--waiting); }
+  @keyframes pulse { 50% { opacity: .35; } }
+  @media (prefers-reduced-motion: reduce) { .dot.busy { animation: none; } }
+  .person .pname { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .person .meta { font-size: 10.5px; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .person .pcol { min-width: 0; flex: 1; }
+  .person .unread {
+    flex: none; font-size: 10px; font-weight: 700; color: #fff; background: var(--me-unread);
+    border-radius: 9px; padding: 1px 6px;
+  }
+  .person .clitag { flex: none; font-size: 9.5px; color: var(--bg); background: var(--dim);
+                    border-radius: 3px; padding: 0 4px; font-weight: 700; }
+  .empty { color: var(--dim); padding: 14px; font-size: 12px; }
+</style>
+</head>
+<body>
+  <nav class="col side">
+    <div class="colhead">Channels</div>
+    <div class="scroll" id="chans"></div>
+  </nav>
+  <main class="col">
+    <div class="mainhead">
+      <span class="title" id="title">All channels</span>
+      <span class="sub" id="sub"></span>
+      <span id="live">live</span>
+    </div>
+    <div class="scroll" id="msgwrap"><div id="msgs"></div></div>
+  </main>
+  <aside class="col side right">
+    <div class="colhead"><span id="peoplehead">People</span></div>
+    <div class="scroll" id="people"></div>
+  </aside>
+<script>
+"use strict";
+let ROOM = null;        // null = all channels
+let lastJson = "";
+let firstRender = true;
+
+const HUES = [145, 205, 20, 275, 330, 60, 100, 240];
+function hue(name) {
+  let h = 0; for (const c of name) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return HUES[h % HUES.length];
+}
+function senderColor(name) {
+  const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+  return `hsl(${hue(name)} 55% ${dark ? 68 : 38}%)`;
+}
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+// strip the longest common prefix from path-derived room names for display
+function displayNames(rooms) {
+  const paths = rooms.map(r => r.name).filter(n => n.startsWith("-"));
+  let lcp = paths.length > 1 ? paths.reduce((a, b) => { let i = 0; while (i < a.length && a[i] === b[i]) i++; return a.slice(0, i); }) : "";
+  lcp = lcp.slice(0, lcp.lastIndexOf("-") + 1);   // cut at a dash boundary
+  const map = {};
+  for (const r of rooms) {
+    let d = r.name;
+    if (d.startsWith("-") && lcp.length > 1 && d.startsWith(lcp)) d = d.slice(lcp.length);
+    if (d.startsWith("-")) d = d.replace(/^-+/, "");
+    map[r.name] = d || r.name;
+  }
+  return map;
+}
+
+function fmtDay(ts) {
+  return new Date(ts).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+}
+
+function render(st) {
+  const dn = displayNames(st.rooms);
+
+  // channels
+  const chans = [`<div class="chan ${ROOM === null ? "active" : ""}" onclick="pick(null)">
+      <span class="hash">∗</span><span class="cname">All channels</span></div>`];
+  for (const r of st.rooms.slice().sort((a, b) => (b.last_ts || "").localeCompare(a.last_ts || ""))) {
+    chans.push(`<div class="chan ${ROOM === r.name ? "active" : ""}" onclick="pick('${esc(r.name)}')" title="#${esc(r.name)}">
+      <span class="hash">#</span><span class="cname">${esc(dn[r.name])}</span><span class="cnt">${r.count}</span></div>`);
+  }
+  document.getElementById("chans").innerHTML = chans.join("");
+
+  // header
+  document.getElementById("title").textContent = ROOM === null ? "All channels" : "#" + (dn[ROOM] || ROOM);
+  document.getElementById("sub").textContent = ROOM === null
+    ? `${st.rooms.length} channels · ${st.agents.length} agents`
+    : (ROOM.startsWith("-") ? ROOM.replace(/-/g, "/").replace(/^\//, "/").replace(/\/\//g, "/") : "");
+
+  // messages
+  const wrap = document.getElementById("msgwrap");
+  const nearBottom = wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight < 60;
+  const out = [];
+  let day = "";
+  for (const m of st.messages) {
+    const d = (m.ts || "").slice(0, 10);
+    if (d && d !== day) { day = d; out.push(`<div class="day">${fmtDay(d)}</div>`); }
+    const t = (m.ts || "").slice(11, 16);
+    const sys = m.from === "system";
+    const dm = m.to && m.to !== "*";
+    const ag = st.agents.find(a => a.name === m.from);
+    const cli = ag && ag.cli && ag.cli !== "claude" ? `<span class="clitag">${esc(ag.cli)}</span>` : "";
+    const roomtag = ROOM === null ? `<span class="roomtag">#${esc(dn[m.room] || m.room)}</span>` : "";
+    out.push(`<div class="msg ${sys ? "sys" : ""} ${dm ? "dm" : ""}">
+      <span class="ts">${t}</span>${roomtag}
+      <span class="from" style="color:${sys ? "var(--sys)" : senderColor(m.from)}">${esc(m.from)}</span>${cli}
+      ${dm ? `<span class="dmtag">→ ${esc(m.to)}</span>` : ""}
+      <span class="body">${esc(m.msg)}</span></div>`);
+  }
+  document.getElementById("msgs").innerHTML = out.join("") || `<div class="empty">no messages yet</div>`;
+  if (firstRender || nearBottom) wrap.scrollTop = wrap.scrollHeight;
+
+  // people (channel members when a channel is chosen, else everyone)
+  const members = ROOM === null ? st.agents : st.agents.filter(a => (a.rooms || []).includes(ROOM));
+  document.getElementById("peoplehead").textContent =
+    ROOM === null ? `People — all (${members.length})` : `In channel (${members.length})`;
+  const ppl = members.map(a => {
+    const s = a.status || {};
+    const dotCls = { busy: "busy", idle: "idle", waiting: "waiting" }[s.state] || "";
+    const stateTxt = s.state === "stale" ? "stale" : (s.state || "—");
+    return `<div class="person" title="cwd: ${esc(a.cwd || "?")}\nstate: ${stateTxt}">
+      <span class="dot ${dotCls}"></span>
+      <div class="pcol">
+        <div class="pname" style="color:${senderColor(a.name)}">${esc(a.name)}</div>
+        <div class="meta">${stateTxt} · #${esc(dn[a.home_room] || a.home_room || "?")}</div>
+      </div>
+      ${a.cli && a.cli !== "claude" ? `<span class="clitag">${esc(a.cli)}</span>` : ""}
+      ${a.unread ? `<span class="unread">${a.unread}</span>` : ""}
+    </div>`;
+  });
+  document.getElementById("people").innerHTML = ppl.join("") || `<div class="empty">nobody registered</div>`;
+  firstRender = false;
+}
+
+function pick(room) { ROOM = room; lastJson = ""; firstRender = true; tick(); }
+
+async function tick() {
+  try {
+    const u = "/api/state?limit=400" + (ROOM ? "&room=" + encodeURIComponent(ROOM) : "");
+    const res = await fetch(u);
+    const txt = await res.text();
+    document.getElementById("live").classList.remove("off");
+    if (txt !== lastJson) { lastJson = txt; render(JSON.parse(txt)); }
+  } catch (e) {
+    document.getElementById("live").classList.add("off");
+  }
+}
+tick();
+setInterval(tick, 3000);
+</script>
+</body>
+</html>

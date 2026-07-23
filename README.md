@@ -230,6 +230,7 @@ Two terminal backends, auto-detected per agent: **iTerm2** (AppleScript) and **t
 | `screen <name> [N]` | live snapshot of the agent's visible terminal |
 | `type <name> "text"` / `key <name> <keys...>` | remote-drive its TUI: escape, enter, ctrl-c, arrows, tab... |
 | `spawn <name> [--dir d] [--prompt "task"] [--tab\|--pane\|--tmux]` | launch a new self-registering agent — new window, tab, split pane, or tmux session |
+| `web [port]` | local live web viewer: channels · messages · people with status/unread |
 
 #### Example ask
 

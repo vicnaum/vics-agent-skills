@@ -42,6 +42,8 @@
 #                                           --pane = split next to you (or tmux with --tmux / headless),
 #                                           reusing this session CLI flags; it registers itself as <name>
 #   agent-chat unregister [<name>]          leave the chat (default: self)
+#   agent-chat web [port]                   local web viewer (default :8787): channels, live
+#                                           messages, people with status + unread counts
 #   agent-chat setup-codex                  wire delivery/status hooks into OpenAI Codex CLI
 #                                           (~/.codex/hooks.json — same hook contract); Codex
 #                                           agents then join the same rooms as Claude agents
@@ -836,6 +838,16 @@ APPLESCRIPT
   fi
 }
 
+# ---------- web viewer ----------
+
+cmd_web() { # [port] — serve the read-only chat viewer UI on localhost
+  local port="${1:-8787}" self dir
+  self=$(readlink -f "$0" 2>/dev/null || echo "$0")
+  dir=$(dirname "$self")
+  [ -f "$dir/chat-viewer.py" ] || die "chat-viewer.py not found next to $self"
+  exec python3 "$dir/chat-viewer.py" --port "$port"
+}
+
 # ---------- codex setup ----------
 
 cmd_setup_codex() {
@@ -942,8 +954,9 @@ case "$cmd" in
   screen)     cmd_screen "$@";;
   spawn)      cmd_spawn "$@";;
   setup-codex) cmd_setup_codex "$@";;
+  web)        cmd_web "$@";;
   hook)       cmd_hook "$@";;
   help|--help|-h)
-    sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//';;
+    sed -n '2,52p' "$0" | sed 's/^# \{0,1\}//';;
   *) die "unknown command '$cmd' (try: agent-chat help)";;
 esac
