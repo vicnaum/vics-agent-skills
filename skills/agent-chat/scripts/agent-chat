@@ -19,7 +19,8 @@
 #   agent-chat register <name>              join (or silently rebind) as <name>
 #   agent-chat send "<msg>" [--room <room>] [--to <name>] [--nudge|--quiet]
 #                                           default room: your project room;
-#                                           --to = DM (delivered via #general) — DMs NUDGE the
+#                                           --to = DM, routed to a room you BOTH share (project room
+#                                           first, #general only cross-project) — nudges the
 #                                           recipient by default (--quiet for FYI-only);
 #                                           room posts are passive unless --nudge
 #   agent-chat read                         print + consume unread from all your rooms
@@ -215,9 +216,26 @@ cmd_send() {
   local from
   from=$(require_name)
   if [ -z "$room" ]; then
-    # DMs default to #general (every agent is a member — guaranteed delivery);
-    # broadcasts default to the sender's project room
-    if [ "$to" != "*" ]; then room="general"; else room=$(home_room "$from"); fi
+    if [ "$to" != "*" ]; then
+      # DM routing: prefer a room BOTH agents are in, so working conversations
+      # stay on the project channel instead of leaking into #general —
+      # sender's home room first, then any other shared room, then #general
+      # (the guaranteed common room) as the cross-project fallback.
+      room="general"
+      if [ -e "$REG/$to.json" ]; then
+        local myhome shared
+        myhome=$(home_room "$from")
+        if $JQ -e --arg r "$myhome" '.rooms | index($r)' "$REG/$to.json" >/dev/null 2>&1; then
+          room="$myhome"
+        else
+          shared=$(comm -12 <(my_rooms "$from" | sort) <($JQ -r '.rooms[]' "$REG/$to.json" | sort) \
+                   | grep -v '^general$' | head -n1)
+          [ -n "$shared" ] && room="$shared"
+        fi
+      fi
+    else
+      room=$(home_room "$from")
+    fi
   fi
   valid_room "$room" || die "invalid room name '$room'"
   if [ "$to" != "*" ] && [ ! -e "$REG/$to.json" ]; then

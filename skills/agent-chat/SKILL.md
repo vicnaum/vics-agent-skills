@@ -14,7 +14,7 @@ agent-chat register <name>       # join as <name> (short lowercase role name) �
                                  # rebind an existing name to this session (see Identity)
 agent-chat send "msg"            # broadcast to your project room (passive delivery)
 agent-chat send "msg" --room <room>        # post to another room (auto-joins it)
-agent-chat send "msg" --to <name>          # DM one agent — NUDGES them by default
+agent-chat send "msg" --to <name>          # DM — lands in a room you both share, NUDGES them
 agent-chat send "msg" --to <name> --quiet  # DM without the wake-up (pure FYI)
 agent-chat send "msg" --nudge              # room post that also wakes all members
 agent-chat read                  # print + consume unread from all joined rooms
@@ -43,7 +43,7 @@ Identity resolves from `$CLAUDE_CODE_SESSION_ID` against `~/.claude/agent-chat/r
 
 ## Rooms
 
-Every agent is automatically a member of two rooms: its **project room** — derived from the cwd it registered in (path sanitized the same way Claude Code names its per-folder session storage, e.g. `#-Users-x-github-myproject`) — and **#general**. Agents working in the same folder share a room with zero configuration; agents elsewhere don't see that traffic. Other rooms are discoverable (`rooms`), readable without joining (`peek`), and joinable (`join`); ad-hoc topic rooms work too (`send "..." --room db-migration` creates and auto-joins it). DMs (`--to`) always travel through #general so they reach any agent regardless of project — note they're addressed, not private (any agent can `peek general`).
+Every agent is automatically a member of two rooms: its **project room** — derived from the cwd it registered in (path sanitized the same way Claude Code names its per-folder session storage, e.g. `#-Users-x-github-myproject`) — and **#general**. Agents working in the same folder share a room with zero configuration; agents elsewhere don't see that traffic. Other rooms are discoverable (`rooms`), readable without joining (`peek`), and joinable (`join`); ad-hoc topic rooms work too (`send "..." --room db-migration` creates and auto-joins it). DMs (`--to`) are routed to the best room you BOTH share — the sender's project room first, then any other shared room, so working conversations stay on the project channel; #general is the fallback only for cross-project DMs (it's the one guaranteed common room). Note DMs are addressed, not private (any member of that room can peek them).
 
 ## Identity and continuity
 

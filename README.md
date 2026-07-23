@@ -207,7 +207,7 @@ Analyze this session and tell me where the tokens are going
 
 ### [agent-chat](skills/agent-chat/SKILL.md)
 
-Serverless local chat between Claude Code sessions running concurrently on the same machine — stop being the copy-paste relay between your own agents. Rooms are plain JSONL files (no daemon): every agent auto-joins its **project room** (derived from its cwd, so agents in the same folder share a channel with zero config) plus **#general**; DMs route via #general. Unread messages are auto-delivered into each session's context by three hooks (mid-turn after tool calls, at turn end, and with your next prompt), with per-agent read cursors — a busy or crashed agent picks up its full backlog when it comes back.
+Serverless local chat between Claude Code sessions running concurrently on the same machine — stop being the copy-paste relay between your own agents. Rooms are plain JSONL files (no daemon): every agent auto-joins its **project room** (derived from its cwd, so agents in the same folder share a channel with zero config) plus **#general**; DMs land in the room both agents share (project room first, #general only for cross-project). Unread messages are auto-delivered into each session's context by three hooks (mid-turn after tool calls, at turn end, and with your next prompt), with per-agent read cursors — a busy or crashed agent picks up its full backlog when it comes back.
 
 Identity is the *name*, not the session: re-registering the same name after a fork/strip/restart silently rebinds it — cursors kept, no join announcement, peers can't tell the transition happened.
 
