@@ -42,9 +42,12 @@
 #                                           --pane = split next to you (or tmux with --tmux / headless),
 #                                           reusing this session CLI flags; it registers itself as <name>
 #   agent-chat unregister [<name>]          leave the chat (default: self)
-#   agent-chat hook <EventName>             internal: called by Claude Code hooks (stdin = hook JSON)
+#   agent-chat setup-codex                  wire delivery/status hooks into OpenAI Codex CLI
+#                                           (~/.codex/hooks.json — same hook contract); Codex
+#                                           agents then join the same rooms as Claude agents
+#   agent-chat hook <EventName>             internal: called by Claude Code / Codex hooks (stdin = hook JSON)
 #
-# Identity resolves from $CLAUDE_CODE_SESSION_ID; --as <name> overrides (humans/testing).
+# Identity: $CLAUDE_CODE_SESSION_ID (Claude) or $CODEX_THREAD_ID (Codex); --as <name> overrides.
 
 BASE="$HOME/.claude/agent-chat"
 ROOMS="$BASE/rooms"
@@ -80,7 +83,7 @@ valid_room() { printf '%s' "$1" | grep -Eq '^-?[A-Za-z0-9][A-Za-z0-9_-]{0,128}$'
 # ---------- identity ----------
 
 resolve_name() { # [session_id] -> registered name, rc=1 if not registered
-  local sid="${1:-${CLAUDE_CODE_SESSION_ID:-}}"
+  local sid="${1:-${CLAUDE_CODE_SESSION_ID:-${CODEX_THREAD_ID:-}}}"
   [ -n "$AS_NAME" ] && { echo "$AS_NAME"; return 0; }
   [ -z "$sid" ] && return 1
   local files=("$REG"/*.json)
@@ -144,7 +147,12 @@ cmd_register() {
   [ -n "$name" ] || die "usage: agent-chat register <name>"
   printf '%s' "$name" | grep -Eq '^[a-z0-9][a-z0-9_-]{0,31}$' \
     || die "name must be short lowercase [a-z0-9_-], e.g. 'summarizer'"
-  local sid="${CLAUDE_CODE_SESSION_ID:-manual-$$}" proom rooms_json
+  # identity: Claude Code exports CLAUDE_CODE_SESSION_ID, Codex exports
+  # CODEX_THREAD_ID (same UUID as its rollout file and `codex resume`)
+  local sid="${CLAUDE_CODE_SESSION_ID:-${CODEX_THREAD_ID:-manual-$$}}" cli proom rooms_json
+  if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then cli="claude"
+  elif [ -n "${CODEX_THREAD_ID:-}" ]; then cli="codex"
+  else cli="unknown"; fi
   proom=$(proj_room)
   # drop stale entries binding this same session to a different name
   local f oldname
@@ -158,9 +166,9 @@ cmd_register() {
   if [ -e "$REG/$name.json" ]; then
     # existing identity: silent rebind (new session/window/cwd), keep rooms + cursors
     rooms_json=$($JQ -c --arg hr "$proom" '(.rooms + [$hr]) | unique' "$REG/$name.json")
-    $JQ -n --arg name "$name" --arg sid "$sid" --arg tb "$tb" --arg ta "$ta" \
+    $JQ -n --arg name "$name" --arg sid "$sid" --arg tb "$tb" --arg ta "$ta" --arg cli "$cli" \
           --arg cwd "$PWD" --arg ts "$(now)" --arg hr "$proom" --argjson rooms "$rooms_json" \
-          '{name:$name, session_id:$sid, term_backend:$tb, term_addr:$ta, cwd:$cwd, home_room:$hr, rooms:$rooms, registered_at:$ts}' \
+          '{name:$name, session_id:$sid, cli:$cli, term_backend:$tb, term_addr:$ta, cwd:$cwd, home_room:$hr, rooms:$rooms, registered_at:$ts}' \
           > "$REG/$name.json.tmp" && mv "$REG/$name.json.tmp" "$REG/$name.json"
     local r
     while IFS= read -r r; do
@@ -168,9 +176,9 @@ cmd_register() {
     done <<< "$(my_rooms "$name")"
     echo "Rebound '$name' to this session (silent — no join announcement, cursors kept)."
   else
-    $JQ -n --arg name "$name" --arg sid "$sid" --arg tb "$tb" --arg ta "$ta" \
+    $JQ -n --arg name "$name" --arg sid "$sid" --arg tb "$tb" --arg ta "$ta" --arg cli "$cli" \
           --arg cwd "$PWD" --arg ts "$(now)" --arg hr "$proom" \
-          '{name:$name, session_id:$sid, term_backend:$tb, term_addr:$ta, cwd:$cwd, home_room:$hr, rooms:([$hr,"general"] | unique), registered_at:$ts}' \
+          '{name:$name, session_id:$sid, cli:$cli, term_backend:$tb, term_addr:$ta, cwd:$cwd, home_room:$hr, rooms:([$hr,"general"] | unique), registered_at:$ts}' \
           > "$REG/$name.json"
     append_msg "$proom" "system" "*" "$name joined (cwd: $PWD)"
     set_cursor_eof "$name" "$proom"
@@ -328,7 +336,7 @@ cmd_who() {
   for f in "$REG"/*.json; do
     [ -e "$f" ] || break
     found=1
-    $JQ -r '"  \(.name)\thome: #\(.home_room)\trooms: \(.rooms | map("#" + .) | join(", "))\tcwd: \(.cwd)"' "$f"
+    $JQ -r '"  \(.name)\(if .cli and .cli != "claude" then " [" + .cli + "]" else "" end)\thome: #\(.home_room)\trooms: \(.rooms | map("#" + .) | join(", "))\tcwd: \(.cwd)"' "$f"
   done
   [ "$found" = 1 ] || echo "  (nobody registered)"
 }
@@ -486,9 +494,12 @@ APPLESCRIPT
 
 glyph_state() { # title -> busy | idle | unknown  (from the leading status glyph)
   case "$1" in
-    "⠂"*|"⠐"*) echo busy;;      # TITLE_ANIMATION_FRAMES: actively working
-    "✳"*)      echo idle;;      # static prefix: idle OR waiting-for-approval
-    *)         echo unknown;;   # title disabled / non-Claude (e.g. codex ⠋)
+    "⠂"*|"⠐"*) echo busy;;      # Claude Code TITLE_ANIMATION_FRAMES
+    "⠋"*|"⠙"*|"⠹"*|"⠸"*|"⠼"*|"⠴"*|"⠦"*|"⠧"*|"⠇"*|"⠏"*)
+               echo busy;;      # Codex braille spinner (dots) while working
+    "✳"*)      echo idle;;      # Claude Code static prefix: idle OR waiting
+    *)         echo unknown;;   # no glyph: title disabled, or an idle Codex
+                                # (plain title) — resolved via hook stamps
   esac
 }
 
@@ -551,11 +562,18 @@ _combine_state() {
         printf 'idle\tglyph\n'               # stale/absent/non-waiting hook → glyph wins
       fi
       ;;
-    *) # title unreadable — fall back to a fresh hook stamp, else unknown
-      if [ -n "$hstate" ] && [ "$age" -le "$STATUS_TTL" ]; then
-        printf '%s\thook(fresh, title unreadable)\n' "$hstate"
+    *) # no glyph (title disabled, or an idle Codex whose title is plain):
+      # fall back to hook stamps. `idle` is trusted at ANY age — every
+      # transition away from idle (prompt submit, tool use) re-stamps busy,
+      # so an idle stamp only goes stale if the session died (caught by the
+      # liveness layers above). busy/waiting stay TTL-guarded: an interrupted
+      # or crashed turn leaves them behind with nothing to correct them.
+      if [ "$hstate" = "idle" ]; then
+        printf 'idle\thook (glyph-less title)\n'
+      elif [ -n "$hstate" ] && [ "$age" -le "$STATUS_TTL" ]; then
+        printf '%s\thook(fresh, glyph-less title)\n' "$hstate"
       else
-        printf 'unknown\ttitle unreadable, no fresh hook stamp\n'
+        printf 'unknown\tno glyph, no fresh hook stamp\n'
       fi
       ;;
   esac
@@ -818,6 +836,43 @@ APPLESCRIPT
   fi
 }
 
+# ---------- codex setup ----------
+
+cmd_setup_codex() {
+  # Wire agent-chat delivery + status hooks into OpenAI Codex CLI (>= 0.145),
+  # which uses a Claude-Code-compatible hooks system at ~/.codex/hooks.json.
+  local HK="$HOME/.codex/hooks.json" AC="$HOME/.claude/agent-chat/agent-chat"
+  command -v codex >/dev/null || die "codex CLI not found on PATH"
+  [ -x "$AC" ] || die "agent-chat runtime not found at $AC"
+  [ -f "$HK" ] || echo '{"hooks":{}}' > "$HK"
+  cp "$HK" "$HK.bak-agentchat-setup"
+  local ev added=0
+  for ev in UserPromptSubmit PostToolUse Stop PermissionRequest; do
+    if $JQ -e --arg ev "$ev" --arg ac "$AC" \
+        '.hooks[$ev][]?.hooks[]? | select(.command | startswith($ac))' "$HK" >/dev/null 2>&1; then
+      echo "  $ev: already installed"
+      continue
+    fi
+    $JQ --arg ev "$ev" --arg cmd "$AC hook $ev" \
+      '.hooks[$ev] = ((.hooks[$ev] // []) + [{"hooks":[{"type":"command","command":$cmd,"timeout":10}]}])' \
+      "$HK" > "$HK.tmp" && mv "$HK.tmp" "$HK"
+    echo "  $ev: installed"
+    added=1
+  done
+  if ! grep -q '^plugin_hooks *= *true' "$HOME/.codex/config.toml" 2>/dev/null; then
+    echo "WARNING: 'plugin_hooks = true' not found in ~/.codex/config.toml — hooks may not run without it."
+  fi
+  echo
+  if [ "$added" = 1 ]; then
+    echo "Done (backup: $HK.bak-agentchat-setup)."
+    echo "NOTE: Codex requires a one-time interactive approval per new hook —"
+    echo "start/prompt a Codex session and approve the agent-chat hooks when asked."
+  else
+    echo "Nothing to do — all four hooks were already installed."
+  fi
+  echo "Codex agents register with: agent-chat register <name>  (identity via \$CODEX_THREAD_ID)"
+}
+
 # ---------- hook mode ----------
 
 cmd_hook() {
@@ -886,8 +941,9 @@ case "$cmd" in
   key)        cmd_key "$@";;
   screen)     cmd_screen "$@";;
   spawn)      cmd_spawn "$@";;
+  setup-codex) cmd_setup_codex "$@";;
   hook)       cmd_hook "$@";;
   help|--help|-h)
-    sed -n '2,48p' "$0" | sed 's/^# \{0,1\}//';;
+    sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//';;
   *) die "unknown command '$cmd' (try: agent-chat help)";;
 esac

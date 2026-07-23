@@ -59,7 +59,14 @@ else
   die "no supported terminal (need iTerm2 or tmux)"
 fi
 
-[ -n "$SID" ] || SID="${CLAUDE_CODE_SESSION_ID:-}"
+# which CLI is this? Claude Code exports CLAUDE_CODE_SESSION_ID, Codex exports
+# CODEX_THREAD_ID (same UUID `codex resume` takes). Determines the exit method
+# (/exit vs double ctrl-c) and the relaunch form (--resume vs resume).
+if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then CLI="claude"
+elif [ -n "${CODEX_THREAD_ID:-}" ]; then CLI="codex"
+else CLI="claude"; fi
+
+[ -n "$SID" ] || SID="${CLAUDE_CODE_SESSION_ID:-${CODEX_THREAD_ID:-}}"
 [[ "$SID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
   || die "'$SID' does not look like a session id (pass one explicitly)"
 
@@ -108,7 +115,11 @@ build_relaunch() {
   echo "${out[*]}"
 }
 
-if [ -n "$CMD" ]; then
+if [ "$CLI" = "codex" ]; then
+  # codex: resume is a subcommand; flags aren't reliably re-derivable from ps,
+  # so keep it simple (config/profile carries the settings anyway)
+  RELAUNCH="${CMD:-codex} resume $SID"
+elif [ -n "$CMD" ]; then
   RELAUNCH="$CMD --resume $SID"
 else
   TTY_PATH=$(get_tty)
@@ -124,11 +135,11 @@ fi
 WAIT_EXIT=900
 [ -n "$FORCE" ] && WAIT_EXIT=20
 
-nohup "$SCRIPT_DIR/respawn-watcher.sh" "$TB" "$TA" "$SID" "$RELAUNCH" "$KICKOFF" "$GRACE" "$WAIT_EXIT" "$DRY" \
+nohup "$SCRIPT_DIR/respawn-watcher.sh" "$TB" "$TA" "$SID" "$RELAUNCH" "$KICKOFF" "$GRACE" "$WAIT_EXIT" "$DRY" "$CLI" \
   >> "$BASE/respawn.log" 2>&1 &
 disown
 
-echo "Respawn scheduled${DRY:+ (DRY RUN)} on $TB ($TA)."
+echo "Respawn scheduled${DRY:+ (DRY RUN)} on $TB ($TA), cli=$CLI."
 echo "Relaunch command: $RELAUNCH"
 echo "Log: $BASE/respawn.log"
 echo "IMPORTANT: this must be your LAST action — end your turn NOW (the watcher types /exit in ${GRACE}s; if your turn is still running it queues and fires at turn end)."

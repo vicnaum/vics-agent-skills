@@ -215,6 +215,8 @@ Also includes remote control of peers by typing into their terminals: wake an id
 
 Two terminal backends, auto-detected per agent: **iTerm2** (AppleScript) and **tmux** (`send-keys`/`capture-pane`) — the tmux backend works fully headless, e.g. agents on a Linux server over SSH. The chat core itself is plain bash+jq+files and runs anywhere.
 
+**Cross-CLI**: OpenAI **Codex** agents (CLI >= 0.145, which ships a Claude-Code-compatible hooks system) join the same rooms — `agent-chat setup-codex` wires the hooks, Codex sessions register via `$CODEX_THREAD_ID`, and Claude and Codex agents chat, nudge, and remote-control each other seamlessly (`who` tags them `[codex]`).
+
 > macOS iTerm2 and/or tmux + `jq`. Needs three hooks in `~/.claude/settings.json` — see the [SKILL.md](skills/agent-chat/SKILL.md) install section.
 
 | Command | What it does |

@@ -34,6 +34,10 @@ A detached watcher (`scripts/respawn-watcher.sh`, survives the CLI exiting) then
 
 Everything is logged to `~/.claude/respawn/respawn.log` — check it when a respawn didn't come back.
 
+## OpenAI Codex sessions
+
+Works for Codex CLI too, auto-detected via `$CODEX_THREAD_ID`: the relaunch is `codex resume <thread-id>` (flags come from your codex config/profile; use `--cmd "codex --profile x"` to override) and the graceful quit is a double ctrl-c instead of `/exit`. Caveat: ctrl-c *interrupts* a running Codex turn rather than queueing politely, so only self-respawn when about to go idle — which is the normal strip-then-respawn flow anyway.
+
 ## Verification / caveats
 
 - `--dry-run` runs the whole watcher against the real window but only logs what it would type or kill — use it to sanity-check before the first real respawn on a machine (grants the osascript→iTerm automation permission on first use).
