@@ -80,6 +80,7 @@ textarea{flex:1;min-width:260px;background:var(--card2);color:var(--text);border
   border-radius:7px;padding:7px 10px;font-size:13px;min-height:38px;resize:vertical}
 button.send{background:var(--blue);color:#0d1117;border:none;border-radius:7px;padding:6px 14px;
   font-weight:700;cursor:pointer;font-size:12.5px}
+button.send.sub{background:var(--card2);color:var(--muted);border:1px solid var(--line)}
 .saved{color:var(--green);font-size:12px;align-self:center;opacity:0;transition:opacity .2s}
 .saved.show{opacity:1}
 details.ref summary{cursor:pointer;color:var(--muted);font-size:13px;margin:10px 0}
@@ -99,6 +100,7 @@ h3.day{font-size:12px;color:var(--muted);margin:14px 0 2px;text-transform:upperc
 <script>
 let STATE = null;
 let FILTER = "all";
+const DRAFTS = {};   // per-task unsent comment drafts
 const STATES = ["inbox","in-progress","waiting","done","cancelled"];
 
 const esc = s => (s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
@@ -180,16 +182,39 @@ function card(d, reference){
     sel.onchange = ()=>save(d.id,"state",sel.value, div.querySelector(".saved"));
     foot.appendChild(sel);
   }
+  // answering a needs-you task hands it back to the agent: comment + move + nudge in one go
+  const canResume = d.needs_you && d.kind!=="decision" && d.state==="waiting";
   const ta = document.createElement("textarea");
-  ta.placeholder = d.owner ? `Comment — nudges ${d.owner}… (⌘⏎)` : "Comment for the agents… (⌘⏎)";
-  ta.onkeydown = e=>{ if((e.metaKey||e.ctrlKey)&&e.key==="Enter") ta.blur(); };
-  ta.onchange = ()=>{ if(ta.value.trim()){ save(d.id,"comment",ta.value, div.querySelector(".saved")); ta.value=""; } };
-  const btn = document.createElement("button");
-  btn.className="send"; btn.textContent="send";
-  btn.onclick = ()=>ta.onchange();
+  ta.placeholder = canResume
+    ? `Answer${d.owner?` — nudges ${d.owner}`:""}… (⌘⏎ = answer & resume)`
+    : (d.owner ? `Comment — nudges ${d.owner}… (⌘⏎ sends)` : "Comment for the agents… (⌘⏎ sends)");
+  ta.value = DRAFTS[d.id] || "";
+  ta.oninput = ()=>{ DRAFTS[d.id] = ta.value; };  // drafts survive re-renders, never auto-submit
+  const submit = resume => {
+    const v = ta.value.trim(); if (!v) return;
+    delete DRAFTS[d.id]; ta.value = "";
+    save(d.id, "comment", v, div.querySelector(".saved"), resume ? {resume:true} : undefined);
+  };
+  ta.onkeydown = e=>{ if((e.metaKey||e.ctrlKey)&&e.key==="Enter"){ e.preventDefault(); submit(canResume); } };
   const saved = document.createElement("span");
   saved.className="saved"; saved.textContent="saved ✓";
-  foot.append(ta, btn, saved);
+  if (canResume){
+    const btnR = document.createElement("button");
+    btnR.className="send"; btnR.textContent="answer & resume";
+    btnR.title = "append your answer, move the task back to " + (d.owner?"in-progress":"the inbox")
+      + ", and nudge the agent";
+    btnR.onclick = ()=>submit(true);
+    const btn = document.createElement("button");
+    btn.className="send sub"; btn.textContent="just comment";
+    btn.title = "append the comment, keep it waiting on you";
+    btn.onclick = ()=>submit(false);
+    foot.append(ta, btnR, btn, saved);
+  } else {
+    const btn = document.createElement("button");
+    btn.className="send"; btn.textContent="send";
+    btn.onclick = ()=>submit(false);
+    foot.append(ta, btn, saved);
+  }
   div.appendChild(foot);
   return div;
 }

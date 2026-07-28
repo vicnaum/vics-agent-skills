@@ -88,7 +88,11 @@ Binds 127.0.0.1 only.
   - `state` → moves the file (git mv when in a repo); `waiting` also patches
     `waiting-on:` (extra field `waiting_on`, default `you`)
   - `choice` → patches `choice:` into the decision header
-  - `comment` → appends to `## Comments` with author + timestamp
+  - `comment` → appends to `## Comments` with author + timestamp; extra field
+    `resume: true` (only meaningful on a waiting task) additionally moves it back
+    to `in-progress` (inbox if it has no owner) and clears `waiting-on:` — the
+    board's "answer & resume" button sends this
+  - leaving `waiting` by any route removes the `waiting-on:` header line
 
 Every save with an `owner:` differing from the author fires
 `agent-chat send --to <owner> "[tasx:<project>] ..."` in a background thread

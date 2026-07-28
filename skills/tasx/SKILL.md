@@ -76,7 +76,11 @@ on a stable per-project port. Reads nothing but the md files; every edit writes 
 status dropdown physically moves the file (git mv-aware), decision radios write
 `choice:`, comments append to `## Comments` — and each of those **nudges the owning
 agent** through `agent-chat send --to <owner>` (when agent-chat is installed), so
-answering on the board resumes the work. UI shows: pinned **Needs you** section +
+answering on the board resumes the work. Comments send only on an explicit button
+or ⌘⏎ (drafts survive re-renders, nothing fires on blur). On needs-you cards the
+primary action is **answer & resume**: append the answer, move the task back to
+in-progress (inbox if unowned), clear `waiting-on:`, one nudge — the human never
+needs to touch the state dropdown just to hand a question back. UI shows: pinned **Needs you** section +
 count in the tab title, in-progress with owner liveness dots (`agent-chat status`)
 and freshness ages, ⚠ stale chips (in-progress >24h, waiting-on-you >3d, inbox >14d),
 a "since your last visit" digest, and a collapsed done/cancelled archive grouped by day.

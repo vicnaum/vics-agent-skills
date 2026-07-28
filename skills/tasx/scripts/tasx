@@ -290,6 +290,13 @@ def patch_header(path, key, value):
     path.write_text(text, encoding="utf-8")
 
 
+def remove_header(path, key):
+    text = path.read_text(encoding="utf-8")
+    new = re.sub(r"^%s:.*\n?" % re.escape(key), "", text, count=1, flags=re.M)
+    if new != text:
+        path.write_text(new, encoding="utf-8")
+
+
 def append_comment(path, value, author):
     text = path.read_text(encoding="utf-8")
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -309,6 +316,8 @@ def set_state(root, doc, state, waiting_on=None):
     dst = move_file(src, dst_dir)
     if state == "waiting":
         patch_header(dst, "waiting-on", waiting_on or "you")
+    else:
+        remove_header(dst, "waiting-on")
     return dst
 
 
@@ -600,8 +609,17 @@ def make_handler(root):
                             nudge(dep["owner"], msg + " — your task %s can resume" % dep["id"])
                 elif op == "comment" and str(value).strip():
                     append_comment(path, str(value).strip(), author)
+                    resumed = ""
+                    if req.get("resume") and doc["kind"] != "decision" \
+                            and doc["state"] == "waiting":
+                        target = "in-progress" if doc["owner"] else "inbox"
+                        set_state(root, doc, target)
+                        resumed = " — moved back to %s, over to you" % target
                     if doc["owner"] and doc["owner"] != author:
-                        nudge(doc["owner"], "[tasx:%s] %s on %s: %s"
+                        nudge(doc["owner"], "[tasx:%s] %s answered %s: %s%s"
+                              % (proj, author, doc["id"], str(value).strip(), resumed)
+                              if resumed else
+                              "[tasx:%s] %s on %s: %s"
                               % (proj, author, doc["id"], str(value).strip()))
                 else:
                     return self._send(400, '{"error":"bad op"}')
