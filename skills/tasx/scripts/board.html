@@ -1,0 +1,324 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tasx</title>
+<style>
+:root{
+  --bg:#14161a; --card:#1d2026; --card2:#22262d; --text:#e8eaed; --muted:#9aa2ad;
+  --line:#2e333b; --accent:#ffc924; --blue:#42a5ff; --green:#2bde73; --red:#ff4742;
+  --purple:#b18cff;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 -apple-system,"Segoe UI",sans-serif}
+header{padding:16px 26px 8px;display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
+header h1{margin:0;font-size:20px}
+header h1 span{color:var(--accent)}
+header p{margin:0;color:var(--muted);font-size:12px}
+.digest{margin:8px 26px 0;background:#42a5ff18;border:1px solid #42a5ff55;border-radius:9px;
+  padding:8px 14px;font-size:13px;display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+.digest b{color:var(--blue)}
+.digest button{margin-left:auto;background:none;border:1px solid var(--line);color:var(--muted);
+  border-radius:6px;padding:2px 10px;cursor:pointer;font-size:12px}
+.chips{display:flex;flex-wrap:wrap;gap:10px;padding:12px 26px 4px}
+.chip{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:6px 14px;min-width:96px}
+.chip b{display:block;font-size:17px}
+.chip span{font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.chip.warn b{color:var(--purple)}
+.chip.stale b{color:var(--red)}
+.filters{display:flex;gap:8px;padding:8px 26px;flex-wrap:wrap}
+.fchip{border:1px solid var(--line);background:none;color:var(--muted);border-radius:14px;
+  padding:3px 12px;font-size:12px;cursor:pointer}
+.fchip.on{background:var(--accent);border-color:var(--accent);color:#14161a;font-weight:600}
+main{padding:0 26px 60px;max-width:1060px}
+h2.sect{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:24px 0 8px}
+h2.sect.needs{color:var(--purple)}
+.card{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--muted);
+  border-radius:10px;margin:10px 0;padding:13px 18px}
+.card.s-inbox{border-left-color:var(--blue)}
+.card.s-in-progress{border-left-color:var(--accent)}
+.card.s-waiting{border-left-color:var(--red)}
+.card.s-done{border-left-color:var(--green)}
+.card.s-cancelled{border-left-color:#5b6470}
+.card.needs-you{border-left-color:var(--purple)}
+.eyebrow{font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;
+  display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.pill{padding:1px 8px;border-radius:9px;font-weight:700;font-size:10px}
+.pill.inbox{background:#42a5ff33;color:var(--blue)}
+.pill.in-progress{background:#ffc92433;color:var(--accent)}
+.pill.waiting{background:#ff474233;color:var(--red)}
+.pill.done{background:#2bde7333;color:var(--green)}
+.pill.cancelled{background:#5b647033;color:#8b95a1}
+.pill.needs{background:#b18cff33;color:#c9adff}
+.pill.stale{background:#ff474233;color:var(--red)}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:4px;background:#5b6470}
+.dot.busy{background:var(--green);animation:pulse 1.6s infinite}
+.dot.idle{background:var(--blue)}
+.dot.waiting{background:var(--accent)}
+.dot.dead,.dot.offline{background:var(--red)}
+@keyframes pulse{50%{opacity:.35}}
+.meta{color:var(--muted);font-size:11.5px;margin-left:auto}
+.card h3{margin:5px 0 7px;font-size:16px}
+.opts{display:flex;flex-direction:column;gap:6px;margin:10px 0}
+.opt{display:flex;gap:9px;align-items:flex-start;background:var(--card2);border:1px solid var(--line);
+  border-radius:8px;padding:8px 12px;cursor:pointer}
+.opt:hover{border-color:var(--muted)}
+.opt.chosen{border-color:var(--green);background:#2bde7311}
+.opt input{margin-top:3px;accent-color:var(--green)}
+.body{color:#c8cdd4;font-size:13.5px}
+.body h2{font-size:14px;margin:14px 0 6px;color:var(--text)}
+.body h3{font-size:13px;margin:12px 0 4px;color:var(--text)}
+.body ul{margin:4px 0;padding-left:20px}
+.body li{margin:2px 0}
+.body code{background:#00000055;border-radius:4px;padding:0 5px;font-size:12.5px}
+.body a{color:var(--blue)}
+.foot{display:flex;gap:10px;margin-top:12px;align-items:flex-start;flex-wrap:wrap}
+select{background:var(--card2);color:var(--text);border:1px solid var(--line);border-radius:7px;
+  padding:5px 8px;font-size:12.5px}
+textarea{flex:1;min-width:260px;background:var(--card2);color:var(--text);border:1px solid var(--line);
+  border-radius:7px;padding:7px 10px;font-size:13px;min-height:38px;resize:vertical}
+button.send{background:var(--blue);color:#0d1117;border:none;border-radius:7px;padding:6px 14px;
+  font-weight:700;cursor:pointer;font-size:12.5px}
+.saved{color:var(--green);font-size:12px;align-self:center;opacity:0;transition:opacity .2s}
+.saved.show{opacity:1}
+details.ref summary{cursor:pointer;color:var(--muted);font-size:13px;margin:10px 0}
+h3.day{font-size:12px;color:var(--muted);margin:14px 0 2px;text-transform:uppercase;letter-spacing:.05em}
+.empty{color:var(--muted);font-size:13px;margin:8px 0}
+</style>
+</head>
+<body>
+<header>
+  <h1><span>tasx</span> — <span id="proj"></span></h1>
+  <p>markdown files are the source of truth — every change here writes into <code id="rootpath"></code></p>
+</header>
+<div id="digest"></div>
+<div class="chips" id="chips"></div>
+<div class="filters" id="filters"></div>
+<main id="main"></main>
+<script>
+let STATE = null;
+let FILTER = "all";
+const STATES = ["inbox","in-progress","waiting","done","cancelled"];
+
+const esc = s => (s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+function md(src){
+  const lines = esc(src).split("\n");
+  let html = "", inList = false;
+  const inline = t => t
+    .replace(/`([^`]+)`/g,"<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g,"<b>$1</b>")
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g,'<a href="$2" target="_blank">$1</a>');
+  for (const line of lines){
+    const li = line.match(/^\s*- (.*)$/);
+    if (li){ if(!inList){html+="<ul>";inList=true;} html+="<li>"+inline(li[1])+"</li>"; continue; }
+    if (inList){ html+="</ul>"; inList=false; }
+    if (/^### /.test(line)) html+="<h3>"+inline(line.slice(4))+"</h3>";
+    else if (/^## /.test(line)) html+="<h2>"+inline(line.slice(3))+"</h2>";
+    else if (/^# /.test(line)) html+="";
+    else if (line.trim()==="") html+="<div style='height:7px'></div>";
+    else html+="<div>"+inline(line)+"</div>";
+  }
+  if (inList) html+="</ul>";
+  return html;
+}
+const age = s => s<3600 ? Math.floor(s/60)+"m" : s<86400 ? Math.floor(s/3600)+"h" : Math.floor(s/86400)+"d";
+
+async function save(id, op, value, flashEl, extra){
+  const body = Object.assign({id, op, value}, extra||{});
+  const r = await fetch("/api/save",{method:"POST",headers:{"content-type":"application/json"},
+    body:JSON.stringify(body)});
+  if (r.ok && flashEl){ flashEl.classList.add("show"); setTimeout(()=>flashEl.classList.remove("show"),1600); }
+  load(true);
+}
+
+function card(d, reference){
+  const div = document.createElement("div");
+  div.className = "card s-"+d.state + (d.needs_you && d.state!=="done" ? " needs-you" : "");
+  const agent = d.owner ? (STATE.agents||{})[d.owner] : null;
+  div.innerHTML = `
+    <div class="eyebrow">
+      ${d.needs_you && d.state!=="done" ? `<span class="pill needs">needs you</span>` : ``}
+      <span class="pill ${d.state}">${d.kind==="decision" ? (d.choice?"decided":"decision") : d.state}</span>
+      ${d.stale ? `<span class="pill stale">⚠ ${esc(d.stale)}</span>` : ``}
+      ${d.group ? `<span>${esc(d.group)}</span>` : ``}
+      <span>${esc(d.id)}</span>
+      ${d.owner ? `<span>${agent?`<span class="dot ${agent}"></span>`:""}${esc(d.owner)}${agent?` · ${agent}`:""}</span>` : ``}
+      ${d.state==="waiting" && d.waiting_on ? `<span>waiting on: ${esc(d.waiting_on)}</span>` : ``}
+      <span class="meta">${age(d.age_s)} ago</span>
+    </div>
+    <h3>${esc(d.title)}</h3>`;
+  if (d.options && d.options.length){
+    const opts = document.createElement("div");
+    opts.className = "opts";
+    for (const o of d.options){
+      const lab = document.createElement("label");
+      lab.className = "opt" + (d.choice===o.id ? " chosen":"");
+      lab.innerHTML = `<input type="radio" name="opt-${d.id}" ${d.choice===o.id?"checked":""}>
+        <span><b>${esc(o.label)}</b> <span style="color:var(--muted)">(${esc(o.id)})</span></span>`;
+      lab.querySelector("input").onchange = ()=>save(d.id,"choice",o.id, div.querySelector(".saved"));
+      opts.appendChild(lab);
+    }
+    div.appendChild(opts);
+  }
+  const body = document.createElement("div");
+  body.className = "body";
+  body.innerHTML = md(d.body||"");
+  if (reference || (d.body||"").length > 900){
+    const det = document.createElement("details");
+    det.className="ref";
+    det.innerHTML = "<summary>details</summary>";
+    det.appendChild(body);
+    div.appendChild(det);
+  } else div.appendChild(body);
+
+  const foot = document.createElement("div");
+  foot.className = "foot";
+  if (d.kind !== "decision"){
+    const sel = document.createElement("select");
+    sel.innerHTML = STATES.map(s=>`<option ${s===d.state?"selected":""}>${s}</option>`).join("");
+    sel.onchange = ()=>save(d.id,"state",sel.value, div.querySelector(".saved"));
+    foot.appendChild(sel);
+  }
+  const ta = document.createElement("textarea");
+  ta.placeholder = d.owner ? `Comment — nudges ${d.owner}… (⌘⏎)` : "Comment for the agents… (⌘⏎)";
+  ta.onkeydown = e=>{ if((e.metaKey||e.ctrlKey)&&e.key==="Enter") ta.blur(); };
+  ta.onchange = ()=>{ if(ta.value.trim()){ save(d.id,"comment",ta.value, div.querySelector(".saved")); ta.value=""; } };
+  const btn = document.createElement("button");
+  btn.className="send"; btn.textContent="send";
+  btn.onclick = ()=>ta.onchange();
+  const saved = document.createElement("span");
+  saved.className="saved"; saved.textContent="saved ✓";
+  foot.append(ta, btn, saved);
+  div.appendChild(foot);
+  return div;
+}
+
+function snapshotKey(){ return "tasx:"+STATE.root+":seen"; }
+function digest(){
+  const el = document.getElementById("digest");
+  el.innerHTML = "";
+  let seen = {};
+  try { seen = JSON.parse(localStorage.getItem(snapshotKey())||"{}"); } catch(e){}
+  if (!Object.keys(seen).length){ markSeen(); return; }
+  const cur = {}; STATE.docs.forEach(d=>cur[d.id]=d.state);
+  const doneSince = STATE.docs.filter(d=>d.state==="done" && seen[d.id] && seen[d.id]!=="done");
+  const newInbox  = STATE.docs.filter(d=>d.state==="inbox" && !(d.id in seen));
+  const newWait   = STATE.docs.filter(d=>d.needs_you && d.state!=="done" && seen[d.id] && !["waiting"].includes(seen[d.id]) && d.state==="waiting");
+  const bits = [];
+  if (doneSince.length) bits.push(`<b>${doneSince.length} done</b> (${doneSince.slice(0,4).map(d=>esc(d.id)).join(", ")}${doneSince.length>4?"…":""})`);
+  if (newInbox.length) bits.push(`<b>${newInbox.length} new in inbox</b>`);
+  if (newWait.length) bits.push(`<b>${newWait.length} newly waiting on you</b>`);
+  if (!bits.length) return;
+  const div = document.createElement("div");
+  div.className = "digest";
+  div.innerHTML = "Since your last visit: " + bits.join(" · ");
+  const b = document.createElement("button");
+  b.textContent = "dismiss";
+  b.onclick = ()=>{ markSeen(); digest(); };
+  div.appendChild(b);
+  el.appendChild(div);
+}
+function markSeen(){
+  const cur = {}; STATE.docs.forEach(d=>cur[d.id]=d.state);
+  localStorage.setItem(snapshotKey(), JSON.stringify(cur));
+}
+
+function render(){
+  if (!STATE) return;
+  const docs = STATE.docs;
+  document.getElementById("proj").textContent = STATE.project;
+  document.getElementById("rootpath").textContent = STATE.root;
+
+  const needs = docs.filter(d=>d.needs_you && d.state!=="done");
+  const prog  = docs.filter(d=>d.state==="in-progress");
+  const inbox = docs.filter(d=>d.state==="inbox" && !d.needs_you);
+  const waitx = docs.filter(d=>d.state==="waiting" && !d.needs_you);
+  const done  = docs.filter(d=>d.state==="done");
+  const canc  = docs.filter(d=>d.state==="cancelled");
+  const stale = docs.filter(d=>d.stale);
+
+  document.title = (needs.length?`(${needs.length}) `:"") + "tasx — " + STATE.project;
+  document.getElementById("chips").innerHTML = `
+    <div class="chip warn"><b>${needs.length}</b><span>need you</span></div>
+    <div class="chip"><b>${prog.length}</b><span>in progress</span></div>
+    <div class="chip"><b>${inbox.length}</b><span>inbox</span></div>
+    <div class="chip"><b>${done.length}/${docs.filter(d=>d.kind!=="decision").length}</b><span>tasks done</span></div>
+    ${stale.length?`<div class="chip stale"><b>${stale.length}</b><span>stale ⚠</span></div>`:""}`;
+
+  const filters = document.getElementById("filters");
+  const cats = ["all","needs-you","stale","in-progress","inbox","waiting","done"];
+  filters.innerHTML = "";
+  for (const c of cats){
+    const b = document.createElement("button");
+    b.className = "fchip"+(FILTER===c?" on":"");
+    b.textContent = c;
+    b.onclick = ()=>{FILTER=c;render();};
+    filters.appendChild(b);
+  }
+  const match = d => {
+    if (FILTER==="all") return true;
+    if (FILTER==="needs-you") return d.needs_you && d.state!=="done";
+    if (FILTER==="stale") return !!d.stale;
+    return d.state===FILTER;
+  };
+
+  const main = document.getElementById("main");
+  main.innerHTML = "";
+  const section = (title, items, cls, sort) => {
+    items = items.filter(match);
+    if (!items.length) return;
+    const h = document.createElement("h2");
+    h.className = "sect"+(cls?" "+cls:"");
+    h.textContent = `${title} (${items.length})`;
+    main.appendChild(h);
+    items.sort(sort || ((a,b)=>a.seq-b.seq || b.updated-a.updated));
+    items.forEach(d=>main.appendChild(card(d)));
+  };
+  section("Needs you", needs, "needs");
+  section("In progress", prog, null, (a,b)=>b.updated-a.updated);
+  section("Inbox", inbox);
+  section("Waiting — external", waitx);
+
+  const ref = done.concat(canc).filter(match);
+  if (ref.length){
+    const det = document.createElement("details");
+    det.className = "ref";
+    if (FILTER==="done") det.open = true;
+    det.innerHTML = `<summary>Done / cancelled (${ref.length})</summary>`;
+    ref.sort((a,b)=>b.updated-a.updated);
+    const now = STATE.now/1000;
+    let lastBucket = null;
+    for (const d of ref){
+      const days = Math.floor((now-d.updated)/86400);
+      const bucket = days<1?"today":days<2?"yesterday":days<7?"this week":"earlier";
+      if (bucket!==lastBucket){
+        const h = document.createElement("h3"); h.className="day"; h.textContent=bucket;
+        det.appendChild(h); lastBucket = bucket;
+      }
+      det.appendChild(card(d, true));
+    }
+    main.appendChild(det);
+  }
+  if (!main.children.length)
+    main.innerHTML = "<p class='empty'>Nothing here — inbox zero, nothing in flight. Nice.</p>";
+  digest();
+}
+
+let SIG = "";
+async function load(force){
+  const a = document.activeElement;
+  if (!force && a && a.tagName==="TEXTAREA") return; // don't clobber typing
+  const r = await fetch("/api/state");
+  STATE = await r.json();
+  // re-render only when something actually changed — keeps scroll position and
+  // open <details> stable across the poll
+  const sig = JSON.stringify(STATE.docs.map(d=>[d.id,d.state,d.choice,d.stale,d.owner,d.body.length])
+    .concat([STATE.agents]));
+  if (force || sig !== SIG){ SIG = sig; render(); }
+}
+load();
+setInterval(()=>load(false), 5000);
+</script>
+</body>
+</html>

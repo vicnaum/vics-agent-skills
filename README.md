@@ -242,6 +242,39 @@ Register on agent chat as summarizer
 Tell the other agent the DB schema changed — don't touch March 2004 until it confirms
 ```
 
+### [tasx](skills/tasx/SKILL.md)
+
+File-based task tracker for AI-agent projects: **markdown files are the source of truth, the folder is the state.** The root of `tasks/` is the inbox; agents move files between `in-progress/`, `waiting/`, `done/`, `cancelled/` (a status change is just `git mv`), and `decisions/` holds open choices with radio options. No database, no daemon, no dependencies (Python 3.8+ stdlib): `ls tasks/in-progress/` is a kanban.
+
+`tasx serve` gives you a zero-dependency local board over the same files — **Needs you** pinned on top with the count in the tab title, in-progress cards with owner liveness dots (via [agent-chat](skills/agent-chat/SKILL.md) status), ⚠ stale chips (in-progress >24h, waiting-on-you >3d, inbox >14d), a "since your last visit" digest, and a collapsed done archive grouped by day. Every click writes straight back into the md files: the status dropdown physically moves the file, decision radios write `choice:`, comments append to `## Comments` — and each **nudges the owning agent** through agent-chat, so answering a question on the board resumes the work.
+
+The SKILL.md doubles as the agent contract: run `tasx doctor` at session start and reconcile, own what you work on, file blockers as `waiting/` or decisions instead of idling, comment on finish. Reads legacy folders (myhdd-style YAML frontmatter, `blocked/`) as-is.
+
+| Command | What it does |
+|---------|-------------|
+| `tasx init` | create the tasks/ tree + convention README + CLAUDE.md/AGENTS.md pointer |
+| `tasx new "Title"` | new task in the inbox (`--decision --option "a \| Label"` for choices) |
+| `tasx list [--all]` | kanban to stdout: needs-you / in-progress / inbox / waiting |
+| `tasx move <id> <state>` | git-mv-aware state change (`--waiting-on` for waiting) |
+| `tasx comment <id> "..." --as <name>` | timestamped append; nudges the owner via agent-chat |
+| `tasx doctor` | staleness report: stale work, dead owners, duplicate ids |
+| `tasx archive` | roll done/ files older than 30d into done/YYYY-MM/ |
+| `tasx serve` | the board — stable per-project port on 127.0.0.1 |
+
+#### Example ask
+
+```
+Init a tasks folder in this project
+```
+
+```
+What needs me? Serve the task board
+```
+
+```
+You're blocked on my choice — file it as a decision and move on
+```
+
 ### [respawn](skills/respawn/SKILL.md)
 
 Companion to session-stripper: stripping shrinks the session file on disk, but only a CLI restart loads it as the new, smaller context — and an agent can't relaunch itself. This skill can: a detached watcher types `/exit` into the agent's own iTerm window (queues politely if a turn is still running), then relaunches with `--resume <session-id>` and a kickoff prompt so the agent continues where it left off.
