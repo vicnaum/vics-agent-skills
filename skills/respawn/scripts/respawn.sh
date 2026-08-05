@@ -5,17 +5,25 @@
 # its turn; a detached watcher does the rest.
 #
 # Usage:
-#   respawn.sh [<session-id>] [--prompt "kickoff"] [--grace N] [--force] [--cmd "claude ..."] [--dry-run]
+#   respawn.sh [<session-id>] [--swap <pending>] [--prompt "kickoff"] [--grace N] [--force] [--cmd "claude ..."] [--dry-run]
 #
 # <session-id>  session to resume. Default: $CLAUDE_CODE_SESSION_ID (this
 #               session) — correct for in-place strips. Pass the NEW id after
 #               a forked strip.
+# --swap        path to a stripped `<session>.jsonl.pending` copy (made by
+#               session-stripper's copy-first flow). After the CLI process is
+#               confirmed dead — the only moment nothing writes the session
+#               file — the watcher runs `stripper.py apply` to atomically swap
+#               it over the original, then relaunches. If apply refuses or
+#               fails, the session is relaunched UNSTRIPPED (fail-open) and
+#               the kickoff prompt says so. The pending's original must be the
+#               session being resumed.
 # --prompt      first prompt typed into the resumed CLI
 # --grace       seconds the watcher waits before typing /exit (default 15)
 # --force       escalate to SIGTERM after 20s instead of waiting out a long turn
 # --cmd         full relaunch command override, e.g. --cmd "claude --model opus".
 #               Skips ps-based reconstruction; --resume <sid> is appended.
-# --dry-run     watcher logs what it would do, types/kills nothing
+# --dry-run     watcher logs what it would do, types/kills/swaps nothing
 #
 # Terminal backends: tmux pane ($TMUX_PANE) or iTerm2 window ($ITERM_SESSION_ID);
 # tmux wins when both are set. Works headless (e.g. Linux server) under tmux.
@@ -37,13 +45,14 @@ mkdir -p "$BASE"
 
 die() { echo "respawn: $*" >&2; exit 1; }
 
-SID="" KICKOFF="" GRACE=15 FORCE="" DRY="" CMD=""
+SID="" KICKOFF="" GRACE=15 FORCE="" DRY="" CMD="" SWAP=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --prompt) KICKOFF="$2"; shift 2;;
     --grace) GRACE="$2"; shift 2;;
     --force) FORCE=1; shift;;
     --cmd) CMD="$2"; shift 2;;
+    --swap) SWAP="$2"; shift 2;;
     --dry-run) DRY="dry"; shift;;
     -*) die "unknown arg '$1' (see header of $0)";;
     *) [ -n "$SID" ] && die "multiple session ids given"; SID="$1"; shift;;
@@ -69,6 +78,27 @@ else CLI="claude"; fi
 [ -n "$SID" ] || SID="${CLAUDE_CODE_SESSION_ID:-${CODEX_THREAD_ID:-}}"
 [[ "$SID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
   || die "'$SID' does not look like a session id (pass one explicitly)"
+
+# --swap: validate up front so a typo dies HERE, not in the detached watcher.
+STRIPPER=""
+if [ -n "$SWAP" ]; then
+  [ "$CLI" = "claude" ] || die "--swap is for Claude Code sessions only"
+  case "$SWAP" in
+    *.pending) ;;
+    *) die "--swap expects a <session>.jsonl.pending file, got: $SWAP";;
+  esac
+  SWAP="$(cd "$(dirname "$SWAP")" 2>/dev/null && pwd)/$(basename "$SWAP")" \
+    || die "--swap path not found: $SWAP"
+  [ -f "$SWAP" ] || die "--swap pending file not found: $SWAP"
+  ORIG="${SWAP%.pending}"
+  [ -f "$ORIG" ] || die "--swap original not found: $ORIG"
+  ORIG_SID="$(basename "$ORIG" .jsonl)"
+  [ "$ORIG_SID" = "$SID" ] \
+    || die "--swap pending belongs to session $ORIG_SID but resuming $SID — swapping one session's file while resuming another is almost certainly a mistake"
+  STRIPPER="$SCRIPT_DIR/../../session-stripper/scripts/stripper.py"
+  STRIPPER="$(cd "$(dirname "$STRIPPER")" && pwd)/$(basename "$STRIPPER")" 2>/dev/null
+  [ -f "$STRIPPER" ] || die "session-stripper not found next to respawn (needed for --swap): $STRIPPER"
+fi
 
 get_tty() {
   case "$TB" in
@@ -130,16 +160,23 @@ else
   RELAUNCH="$(build_relaunch "$ORIG") --resume $SID"
 fi
 
-[ -n "$KICKOFF" ] || KICKOFF="[respawn] Your CLI was restarted, resuming your session (after a strip). Re-read your recent context and continue exactly where you left off."
+if [ -z "$KICKOFF" ]; then
+  if [ -n "$SWAP" ]; then
+    KICKOFF="[respawn] Your CLI was restarted after a session strip: the stripped pending copy was swapped in while the CLI was dead. The tail of your final pre-restart turn (the stripping commands themselves) was discarded by design — do NOT re-run the strip. Re-read your recent context and continue where you left off."
+  else
+    KICKOFF="[respawn] Your CLI was restarted, resuming your session (after a strip). Re-read your recent context and continue exactly where you left off."
+  fi
+fi
 
 WAIT_EXIT=900
 [ -n "$FORCE" ] && WAIT_EXIT=20
 
-nohup "$SCRIPT_DIR/respawn-watcher.sh" "$TB" "$TA" "$SID" "$RELAUNCH" "$KICKOFF" "$GRACE" "$WAIT_EXIT" "$DRY" "$CLI" \
+nohup "$SCRIPT_DIR/respawn-watcher.sh" "$TB" "$TA" "$SID" "$RELAUNCH" "$KICKOFF" "$GRACE" "$WAIT_EXIT" "$DRY" "$CLI" "$SWAP" "$STRIPPER" \
   >> "$BASE/respawn.log" 2>&1 &
 disown
 
 echo "Respawn scheduled${DRY:+ (DRY RUN)} on $TB ($TA), cli=$CLI."
+[ -n "$SWAP" ] && echo "Swap after exit: $SWAP → ${SWAP%.pending}"
 echo "Relaunch command: $RELAUNCH"
 echo "Log: $BASE/respawn.log"
 echo "IMPORTANT: this must be your LAST action — end your turn NOW (the watcher types /exit in ${GRACE}s; if your turn is still running it queues and fires at turn end)."

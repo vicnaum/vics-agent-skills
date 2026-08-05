@@ -113,14 +113,63 @@ def _maybe_fork(args, operation: str):
     return args.session
 
 
+def _prepare_target(args, operation: str):
+    """Copy-first: mutating commands never write a real session file in place.
+
+    - `--fork`: fork the original (a read of the source) and mutate the fork
+      directly — the fork is a brand-new file no CLI appends to.
+    - target is already a `.pending` copy: mutate it directly.
+    - otherwise: materialize (or reuse) the session's `.pending` snapshot and
+      mutate THAT. The original stays byte-identical until `apply` swaps the
+      copy in atomically — immediately for dead sessions, or via
+      `respawn.sh --swap` for a session stripping itself.
+
+    While mutating a pending copy, per-op .bak files are pointless (the
+    untouched original IS the backup), so backups are disabled; `apply` makes
+    the one real .bak at swap time.
+    """
+    if getattr(args, "fork", False):
+        return _maybe_fork(args, operation)
+    from lib.pending import is_pending, ensure_pending, pending_path
+    if is_pending(args.session):
+        args.no_backup = True
+        return args.session
+    if getattr(args, "dry_run", False) and not pending_path(args.session).exists():
+        # Dry runs write nothing — no point materializing a snapshot. If a
+        # pending copy already exists, preview against IT (falls through),
+        # so the report reflects what the next real mutation would do.
+        return args.session
+    pending, created = ensure_pending(args.session)
+    verb = "Snapshot created" if created else "Reusing pending copy"
+    print(f"{verb}: {pending}")
+    print(f"Original untouched. Swap in when nothing is writing it:")
+    print(f"  stripper.py apply {args.session}")
+    print(f"  (own live session? schedule it: respawn.sh --swap {pending})\n")
+    args.session = str(pending)
+    args.no_backup = True
+    return args.session
+
+
+def _hint_pending(session):
+    """One-line reminder when a pending copy exists for the given session."""
+    from lib.pending import is_pending, pending_path
+    if is_pending(session):
+        return
+    p = pending_path(session)
+    if p.exists():
+        print(f"note: pending copy exists — mutations target it, `apply` swaps "
+              f"it in: {p}\n")
+
+
 def cmd_analyze(args):
     """Run full session analysis with token breakdown and health check."""
+    _hint_pending(args.session)
     analyze_session(args.session)
 
 
 def cmd_strip_tools(args):
     """Strip tool call content from a session."""
-    _maybe_fork(args, f"strip-tools --from {args.from_pos} --to {args.to_pos}")
+    _prepare_target(args, f"strip-tools --from {args.from_pos} --to {args.to_pos}")
     tools = None
     if args.tools:
         tools = [t.strip() for t in args.tools.split(",")]
@@ -142,7 +191,7 @@ def cmd_strip_tools(args):
 
 def cmd_strip_thinking(args):
     """Strip thinking blocks from a session."""
-    _maybe_fork(args, f"strip-thinking --from {args.from_pos} --to {args.to_pos}")
+    _prepare_target(args, f"strip-thinking --from {args.from_pos} --to {args.to_pos}")
     strip_thinking(
         args.session,
         dry_run=args.dry_run,
@@ -159,7 +208,7 @@ def cmd_strip_attachments(args):
     if args.list:
         list_attachments(args.session)
         return
-    _maybe_fork(args, "strip-attachments")
+    _prepare_target(args, "strip-attachments")
     types = None
     if args.types:
         types = [t.strip() for t in args.types.split(",")]
@@ -178,7 +227,7 @@ def cmd_strip_attachments(args):
 
 def cmd_strip_all(args):
     """Strip both tool content and thinking blocks."""
-    _maybe_fork(args, f"strip-all --from {args.from_pos} --to {args.to_pos}")
+    _prepare_target(args, f"strip-all --from {args.from_pos} --to {args.to_pos}")
     tools = None
     if args.tools:
         tools = [t.strip() for t in args.tools.split(",")]
@@ -225,7 +274,7 @@ def cmd_reset_usage(args):
     was already stripped but whose meter is still pinned at the old size."""
     from lib.chain import (load_session, save_session,
                            compute_active_chain_tokens, reset_usage_metadata)
-    _maybe_fork(args, "reset-usage")
+    _prepare_target(args, "reset-usage")
     objects = load_session(args.session)
     est = compute_active_chain_tokens(objects)
     if args.dry_run:
@@ -240,7 +289,7 @@ def cmd_reset_usage(args):
 
 def cmd_compact(args):
     """Compact messages before a given chain position."""
-    _maybe_fork(args, f"compact --before {args.before}")
+    _maybe_fork(args, f"compact --before {args.before}")  # compact writes a NEW file; no in-place write to redirect
     compact_before(
         args.session,
         before_pos=args.before,
@@ -253,8 +302,33 @@ def cmd_compact(args):
 
 def cmd_verify(args):
     """Verify chain integrity of a session file."""
+    _hint_pending(args.session)
     ok = health_check(args.session)
     sys.exit(0 if ok else 1)
+
+
+def cmd_snapshot(args):
+    """Explicitly create (or refresh) the .pending copy of a session."""
+    from lib.pending import create_snapshot
+    try:
+        pending = create_snapshot(args.session, refresh=args.refresh)
+    except (ValueError, FileNotFoundError, FileExistsError) as e:
+        print(f"refused: {e}", file=sys.stderr)
+        sys.exit(2)
+    print(f"Snapshot: {pending}")
+    print(f"Mutating commands on the original will now target this copy.")
+    print(f"Apply with: stripper.py apply {args.session}")
+
+
+def cmd_apply(args):
+    """Atomically swap the pending copy over its original."""
+    from lib.pending import apply_pending, ApplyRefused
+    try:
+        apply_pending(args.session, dry_run=args.dry_run,
+                      no_backup=args.no_backup)
+    except ApplyRefused as e:
+        print(f"refused: {e}", file=sys.stderr)
+        sys.exit(2)
 
 
 def cmd_show_tool(args):
@@ -272,7 +346,7 @@ def cmd_show_tool(args):
 
 def cmd_persist_tool(args):
     """Persist a single tool result to file with optional summary."""
-    _maybe_fork(args, f"persist-tool --id {args.id}")
+    _prepare_target(args, f"persist-tool --id {args.id}")
     persist_tool_result(
         args.session,
         tool_use_id=args.id,
@@ -284,7 +358,7 @@ def cmd_persist_tool(args):
 
 def cmd_persist_tools(args):
     """Bulk persist tool results to files."""
-    _maybe_fork(args, f"persist-tools --from {args.from_pos} --to {args.to_pos}")
+    _prepare_target(args, f"persist-tools --from {args.from_pos} --to {args.to_pos}")
     tools = None
     if args.tools:
         tools = [t.strip() for t in args.tools.split(",")]
@@ -310,7 +384,7 @@ def cmd_show_thinking(args):
 
 def cmd_persist_thinking(args):
     """Persist a single thinking block to file with optional summary."""
-    _maybe_fork(args, f"persist-thinking --pos {args.pos}")
+    _prepare_target(args, f"persist-thinking --pos {args.pos}")
     persist_thinking(
         args.session,
         chain_pos=args.pos,
@@ -322,7 +396,7 @@ def cmd_persist_thinking(args):
 
 def cmd_persist_thinkings(args):
     """Bulk persist all thinking blocks to files."""
-    _maybe_fork(args, f"persist-thinkings --from {args.from_pos} --to {args.to_pos}")
+    _prepare_target(args, f"persist-thinkings --from {args.from_pos} --to {args.to_pos}")
     persist_thinking_bulk(
         args.session,
         dry_run=args.dry_run,
@@ -334,14 +408,14 @@ def cmd_persist_thinkings(args):
 
 def cmd_persist_text(args):
     """Persist a single text block at a chain position."""
-    _maybe_fork(args, f"persist-text --pos {args.pos}")
+    _prepare_target(args, f"persist-text --pos {args.pos}")
     persist_text(args.session, chain_pos=args.pos, summary=args.summary,
                  dry_run=args.dry_run, no_backup=args.no_backup)
 
 
 def cmd_persist_texts(args):
     """Bulk persist text blocks across a chain range."""
-    _maybe_fork(args, f"persist-texts --from {args.from_pos} --to {args.to_pos} "
+    _prepare_target(args, f"persist-texts --from {args.from_pos} --to {args.to_pos} "
                        f"--min-chars {args.min_chars} --keep-recent {args.keep_recent}")
     persist_text_bulk(
         args.session,
@@ -355,7 +429,7 @@ def cmd_persist_texts(args):
 def cmd_persist_message(args):
     """Persist an entire message — all blocks collapse to one marker."""
     from lib.persist_message import LeafPersistRefused
-    _maybe_fork(args, f"persist-message --pos {args.pos}")
+    _prepare_target(args, f"persist-message --pos {args.pos}")
     try:
         persist_message(args.session, chain_pos=args.pos, summary=args.summary,
                         dry_run=args.dry_run, no_backup=args.no_backup)
@@ -367,7 +441,7 @@ def cmd_persist_message(args):
 def cmd_persist_range(args):
     """Dispatcher: persist multiple kinds across a chain range."""
     kinds = tuple(k.strip() for k in (args.kinds or "text,thinking").split(",") if k.strip())
-    _maybe_fork(args, f"persist-range --from {args.from_pos} --to {args.to_pos} "
+    _prepare_target(args, f"persist-range --from {args.from_pos} --to {args.to_pos} "
                        f"--kinds {','.join(kinds)} --min-chars {args.min_chars} "
                        f"--keep-recent {args.keep_recent}")
     persist_range(
@@ -384,7 +458,7 @@ def cmd_persist_range(args):
 
 def cmd_migrate_persisted(args):
     """One-shot migration of pre-persist-everything layouts."""
-    _maybe_fork(args, "migrate-persisted")
+    _prepare_target(args, "migrate-persisted")
     migrate_persisted(args.session, dry_run=args.dry_run, no_backup=args.no_backup)
 
 
@@ -396,7 +470,7 @@ def cmd_fork(args):
 def cmd_compact_range(args):
     """Collapse a range of messages into one survivor with a summary marker."""
     from lib.compact_range import RangeRefused
-    _maybe_fork(args, f"compact-range --from {args.from_pos} --to {args.to_pos}")
+    _prepare_target(args, f"compact-range --from {args.from_pos} --to {args.to_pos}")
     try:
         compact_range(args.session, from_pos=args.from_pos, to_pos=args.to_pos,
                       summary=args.summary,
@@ -413,7 +487,7 @@ def cmd_list_images(args):
 
 def cmd_replace_images(args):
     """Replace image blocks with text transcripts keyed by SHA256."""
-    _maybe_fork(args, f"replace-images --dir {args.dir}")
+    _prepare_target(args, f"replace-images --dir {args.dir}")
     replace_images(
         args.session,
         descriptions_dir=args.dir,
@@ -564,6 +638,35 @@ def main():
     p_verify = subparsers.add_parser("verify", help="Verify chain integrity")
     p_verify.add_argument("session", help="Path to session JSONL file")
     p_verify.set_defaults(func=cmd_verify)
+
+    # snapshot — explicit copy-first entry point (mutating commands also
+    # auto-create this on first use)
+    p_snapshot = subparsers.add_parser(
+        "snapshot",
+        help="Create the .pending copy of a session (mutating commands then "
+             "target it; the original is never written until `apply`)",
+    )
+    p_snapshot.add_argument("session", help="Path to session JSONL file")
+    p_snapshot.add_argument("--refresh", action="store_true",
+                            help="Discard an existing pending copy and "
+                                 "re-snapshot from the current original")
+    p_snapshot.set_defaults(func=cmd_snapshot)
+
+    # apply — the ONE write to a real session file
+    p_apply = subparsers.add_parser(
+        "apply",
+        help="Atomically swap the .pending copy over its original. Refuses if "
+             "the original is being written right now, was rewritten since "
+             "the snapshot, or the pending copy fails verify. Post-snapshot "
+             "appends to the original are discarded by design.",
+    )
+    p_apply.add_argument("session",
+                         help="Path to the session JSONL or its .pending copy")
+    p_apply.add_argument("--dry-run", action="store_true",
+                         help="Run all checks and report; swap nothing")
+    p_apply.add_argument("--no-backup", action="store_true",
+                         help="Skip the .bak of the original at swap time")
+    p_apply.set_defaults(func=cmd_apply)
 
     # show-tool
     p_show_tool = subparsers.add_parser("show-tool", help="Show or list tool calls")

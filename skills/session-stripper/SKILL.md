@@ -25,14 +25,35 @@ python3 "$SKILL" strip-all "$SESS"
 
 When the user names a *specific* session id or file (e.g. "strip session abc123"), use that instead; `current` is only for "strip *this*/*my* session".
 
+## Copy-first: mutations never touch the real session file
+
+**Mutating commands do not write the session file you pass.** They snapshot it to `<session>.jsonl.pending`, mutate only that copy, and print the apply hint. The original stays byte-identical until you run `apply`, which swaps the copy in with one atomic rename:
+
+```bash
+python3 stripper.py strip-all <session.jsonl>     # writes <session.jsonl>.pending, NOT the original
+python3 stripper.py verify  <session.jsonl>.pending
+python3 stripper.py apply   <session.jsonl>       # atomic swap (only write to the real file)
+```
+
+Why (incident 2026-08-05): a running CC CLI flushes appends to its JSONL every 100ms, takes no lock, and `--resume` silently truncates the chain at the first missing `parentUuid`. Any in-place rewrite of a live session races those appends — one live `compact-range` collapsed a 763-message chain to 14. Copy-first makes that impossible at the architecture level: there is no in-place write left to race.
+
+Mechanics:
+
+- Multi-pass strips reuse the same pending copy (`analyze` → `compact-range` → `strip-tools` → …), so iterate freely. `snapshot --refresh` discards it and re-snapshots.
+- `apply` accepts either path (original or `.pending`) and refuses to swap when: the original is **being written right now** (it grew during a 400ms settle check — a live CLI is appending), the original was **rewritten since the snapshot** (prefix-hash mismatch: the copy no longer descends from it — re-snapshot), or the pending copy **fails `verify`**. Refusals leave everything in place.
+- Anything appended to the original *after* the snapshot is **discarded by apply, by design** (counted and reported). In the self-strip flow that tail is the stripping turn itself — noise the session is better off without. Don't snapshot a session mid-way through work you care about.
+- The one `.bak` of the original is made at apply time. While mutating the pending copy no `.bak`s are written — the untouched original *is* the backup.
+- `--fork` is unchanged and needs no apply: the fork is a brand-new file no CLI writes to, so it is mutated directly.
+- A `"Prompt is too long"` session can't run anything, so its file is quiescent even if the stuck CLI is still open — strip + `apply` immediately, then `claude -r <id>`.
+
 ## Restarting into the stripped session (respawn)
 
-Stripping shrinks the file on disk, but the running CLI keeps its pre-strip context until it restarts. If the user implies they want to continue in the lighter session ("strip and continue", "strip and reload", "strip into a fork and respawn"), and the **`respawn` skill** is available, use it to relaunch the CLI:
+Stripping shrinks the pending copy on disk, but the running CLI keeps its pre-strip context until it restarts — and for your OWN session the apply must happen while the CLI is dead. The **`respawn` skill**'s watcher does exactly that: it `/exit`s the CLI, waits for the process to die, applies the swap in that dead window, and relaunches:
 
-- **In-place strip** (same session id): `respawn.sh` with no args resumes the current session.
-- **Forked strip** (new session id from `--fork`): pass that new id — `respawn.sh <new-session-id>`.
+- **In-place strip of the current session**: strip (writes the pending copy), then `respawn.sh --swap <session.jsonl>.pending`. The watcher runs `apply` after process death; if apply refuses, it relaunches the UNSTRIPPED session and says so in the kickoff prompt (fail-open).
+- **Forked strip** (new session id from `--fork`): no swap needed — `respawn.sh <new-session-id>`.
 
-Call `respawn.sh` as the LAST action, then end the turn (see the respawn skill). Without respawn, tell the user to `/exit` and `claude -r <id>` manually — the strip won't take effect until the CLI reloads.
+Call `respawn.sh` as the LAST action, then end the turn (see the respawn skill). Without respawn, tell the user to `/exit`, then run `apply` yourself from any shell, then `claude -r <id>`.
 
 ## Quick Reference
 
@@ -61,6 +82,11 @@ python3 <skill-dir>/scripts/stripper.py compact <session.jsonl> --before 150
 # Verify chain integrity
 python3 <skill-dir>/scripts/stripper.py verify <session.jsonl>
 
+# Copy-first plumbing: explicit snapshot; atomic swap of the pending copy
+python3 <skill-dir>/scripts/stripper.py snapshot <session.jsonl>            # optional — mutating commands auto-create it
+python3 <skill-dir>/scripts/stripper.py apply <session.jsonl>               # THE one write to the real file
+python3 <skill-dir>/scripts/stripper.py apply <session.jsonl> --dry-run     # run all apply checks, swap nothing
+
 # Fix CC's context gauge without stripping (if a session is stripped but still reads ~full)
 python3 <skill-dir>/scripts/stripper.py reset-usage <session.jsonl>
 ```
@@ -69,7 +95,7 @@ All commands support `--dry-run` (report only) and `--no-backup` (skip backup). 
 
 ### Backups are enumerated (never skipped)
 
-Every mutating run that creates a backup writes a *fresh* one: `<session>.jsonl.bak`, then `.bak.1`, `.bak.2`, … It never silently reuses or skips a backup just because one already exists. (The old single-`.bak` scheme would skip the backup when a stale `.bak` was present — letting a strip run with no recovery point. That footgun is gone.) Pass `--no-backup` to opt out.
+`apply` (and any command that writes a real session file, e.g. mutating a `.pending` copy passed explicitly with backups on) writes a *fresh* backup: `<session>.jsonl.bak`, then `.bak.1`, `.bak.2`, … It never silently reuses or skips a backup just because one already exists. While mutating a pending copy no per-op backups are made — the untouched original is the recovery point; `apply` then creates the one real `.bak` at swap time. Pass `--no-backup` to opt out.
 
 ### The context gauge resets automatically after stripping
 
@@ -140,9 +166,10 @@ stripper strip-attachments <session.jsonl> --types skill_listing --drop-all
 ## Workflow
 
 1. **Analyze first** -- Run `analyze` to see token breakdown and identify what to strip
-2. **Strip in-place** -- Run `strip-all` for maximum savings, or use granular flags
-3. **Verify after** -- Run `verify` to confirm chain integrity
+2. **Strip** -- Run `strip-all` for maximum savings, or use granular flags (writes the `.pending` copy; iterate freely, the original is untouched)
+3. **Verify after** -- Run `verify` on the `.pending` copy to confirm chain integrity
 4. **Compact if needed** -- Use `compact --before N` to summarize old work and keep recent work intact
+5. **Apply** -- `apply <session.jsonl>` for a dead/stuck session, or `respawn.sh --swap <session.jsonl>.pending` for your own live one
 
 ## Tool Stripping Options
 

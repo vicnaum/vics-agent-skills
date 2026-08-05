@@ -1,6 +1,6 @@
 ---
 name: respawn
-description: "Restart the current Claude Code CLI in its own terminal (iTerm2 window or tmux pane) and resume a session — the external relaunch step an agent cannot perform on itself. Use when: (1) the session's context is nearly full and was just stripped in place with session-stripper, so the CLI must restart to load the smaller transcript, (2) resuming a forked stripped session under a new session id, (3) the user or the agent says respawn, restart yourself, restart the CLI, reload the session, or resume after strip. Backends: iTerm2 (macOS) and tmux (works headless, e.g. Linux servers)."
+description: "Restart the current Claude Code CLI in its own terminal (iTerm2 window or tmux pane) and resume a session — the external relaunch step an agent cannot perform on itself. Use when: (1) the session's context is nearly full and was just stripped with session-stripper, so the stripped pending copy must be swapped in (--swap) and the CLI restarted to load the smaller transcript, (2) resuming a forked stripped session under a new session id, (3) the user or the agent says respawn, restart yourself, restart the CLI, reload the session, or resume after strip. Backends: iTerm2 (macOS) and tmux (works headless, e.g. Linux servers)."
 ---
 
 # Respawn
@@ -11,15 +11,18 @@ Restarts the Claude Code CLI in the current terminal (iTerm2 window via AppleScr
 
 Run inside the session that needs restarting:
 
-1. **Strip first** — use the `session-stripper` skill, in-place mode with a backup (keeps the session id stable). If stripping forked to a NEW session id instead, note that id for step 2.
+1. **Strip first** — use the `session-stripper` skill. Its mutating commands are copy-first: they write `<session>.jsonl.pending` and never touch the live file, so stripping your own running session is safe. Verify the pending copy. (If stripping forked to a NEW session id instead, note that id for step 2 — forks need no swap.)
 2. **Schedule the respawn** — this must be the LAST tool call of the turn:
 
 ```bash
-<skill-dir>/scripts/respawn.sh                    # in-place strip: resumes this session's id
-<skill-dir>/scripts/respawn.sh <new-session-id>   # forked strip: resume the fork
+<skill-dir>/scripts/respawn.sh --swap <session.jsonl>.pending   # stripped in place: swap + resume this session's id
+<skill-dir>/scripts/respawn.sh <new-session-id>                 # forked strip: resume the fork (no swap)
+<skill-dir>/scripts/respawn.sh                                  # plain restart, nothing to swap
 ```
 
 3. **End the turn immediately** — reply with one short line (e.g. "Respawning now, back shortly") and stop. Do NOT keep working after calling respawn.sh: `/exit` is coming for the window.
+
+`--swap` applies the session surgery at the only race-free moment: after the watcher has confirmed the CLI process is dead, before relaunch. It runs session-stripper's `apply` (atomic rename; refuses on lineage/liveness/verify failures). If apply refuses, the watcher relaunches the UNSTRIPPED session and rewrites the kickoff prompt to say so — fail-open, nothing is lost. Whatever the CLI appended after the snapshot (the stripping turn itself) is discarded by design.
 
 ## How it works
 
@@ -29,8 +32,9 @@ A detached watcher (`scripts/respawn-watcher.sh`, survives the CLI exiting) then
 
 1. Sleeps a grace period (`--grace N`, default 15s).
 2. Types `/exit`. If a turn is still running, the input queues and executes at turn end — the watcher waits up to 15 min for the process to die before escalating to SIGTERM/SIGKILL (`--force` shortens the wait to 20s, for hung CLIs).
-3. Types the relaunch command at the shell prompt (same shell, same cwd → same project), waits for the CLI to boot.
-4. Types the kickoff prompt (`--prompt "..."` to customize).
+3. With `--swap`: now that the process is confirmed dead (nothing can append to the JSONL), runs session-stripper's `apply` to atomically swap the stripped pending copy over the original. On refusal/failure: logs, keeps the original, and rewrites the kickoff to say the session is UNSTRIPPED.
+4. Types the relaunch command at the shell prompt (same shell, same cwd → same project), waits for the CLI to boot.
+5. Types the kickoff prompt (`--prompt "..."` to customize).
 
 Everything is logged to `~/.claude/respawn/respawn.log` — check it when a respawn didn't come back.
 

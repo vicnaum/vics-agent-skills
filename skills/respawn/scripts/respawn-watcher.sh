@@ -3,11 +3,11 @@
 # Exits the Claude Code CLI in one terminal (iTerm session or tmux pane),
 # relaunches it with the given command, and types a kickoff prompt.
 #
-# args: <backend: iterm|tmux> <addr> <session-id> <relaunch-cmd> <kickoff-prompt> <grace-secs> <exit-wait-secs> [dry] [cli: claude|codex]
+# args: <backend: iterm|tmux> <addr> <session-id> <relaunch-cmd> <kickoff-prompt> <grace-secs> <exit-wait-secs> [dry] [cli: claude|codex] [swap-pending-path] [stripper-path]
 
 BASE="$HOME/.claude/respawn"
 LOG="$BASE/respawn.log"
-TB="$1"; TA="$2"; SID="$3"; RELAUNCH="$4"; KICKOFF="$5"; GRACE="${6:-15}"; WAIT_EXIT="${7:-900}"; DRY="${8:-}"; CLI="${9:-claude}"
+TB="$1"; TA="$2"; SID="$3"; RELAUNCH="$4"; KICKOFF="$5"; GRACE="${6:-15}"; WAIT_EXIT="${7:-900}"; DRY="${8:-}"; CLI="${9:-claude}"; SWAP="${10:-}"; STRIPPER="${11:-}"
 
 log() { echo "[$(date '+%F %T')] [$SID] $*" >> "$LOG"; }
 
@@ -131,6 +131,21 @@ if [ -n "$PID" ]; then
   log "CLI exited"
 else
   log "no claude process on tty — going straight to relaunch"
+fi
+
+# Session surgery in the dead window: the process is confirmed gone, so
+# nothing can append to the JSONL — the only moment a swap is race-free.
+# Fail-open: any refusal/error relaunches the session UNSTRIPPED and the
+# kickoff prompt is rewritten to say so.
+if [ -n "$SWAP" ]; then
+  if [ -n "$DRY" ]; then
+    log "DRY: would apply swap: $SWAP"
+  elif python3 "$STRIPPER" apply "$SWAP" >> "$LOG" 2>&1; then
+    log "swap applied: $SWAP → ${SWAP%.pending}"
+  else
+    log "WARN: swap FAILED (stripper apply output above) — relaunching UNSTRIPPED"
+    KICKOFF="[respawn] WARNING: your CLI was restarted but the session strip was NOT applied (apply failed — see ~/.claude/respawn/respawn.log). You are resuming the UNSTRIPPED session; the pending copy is still at $SWAP."
+  fi
 fi
 
 [ -z "$DRY" ] && sleep 2
