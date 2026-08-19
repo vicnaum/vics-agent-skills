@@ -353,6 +353,24 @@ def analyze_session(session_path, show_cut_points=True):
     return stats
 
 
+def _subtree_size(children, root_uuid):
+    """Count records reachable downward from root_uuid (inclusive of its kids)."""
+    total = 0
+    stack = [root_uuid]
+    seen = set()
+    while stack:
+        cur = stack.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        for kid in children.get(cur, []):
+            total += 1
+            ku = kid.get("uuid")
+            if ku:
+                stack.append(ku)
+    return total
+
+
 def _check_chain_health(objects, chain, uuid_index):
     """Run health checks on the session chain.
 
@@ -383,6 +401,35 @@ def _check_chain_health(objects, chain, uuid_index):
             slugs.add(s)
     if len(slugs) > 1:
         issues.append(f"Multiple slugs in active chain: {slugs}")
+
+    # ── Warning: dangling parentUuid anywhere in the FILE ────────────────
+    # The old check only walked the active chain, so a record whose parent had
+    # been deleted simply fell OUT of that walk — and the shortened chain it
+    # left behind was perfectly self-consistent. That is how `verify` printed
+    # PASS on both sides of a break that orphaned 1,139 messages.
+    #
+    # Advisory, not fatal: 2 of 25 real sessions surveyed carry one benign
+    # dangling parent (resume/fork leaves the parent in a previous session
+    # file), so failing on this would block legitimate work. The orphan COUNT is
+    # what distinguishes a harmless stub from a severed history.
+    children = {}
+    for obj in objects:
+        parent = obj.get("parentUuid")
+        if parent is not None:
+            children.setdefault(parent, []).append(obj)
+    chain_uuids = {o.get("uuid") for o in chain}
+    for obj in objects:
+        parent_uuid = obj.get("parentUuid")
+        if parent_uuid is None or parent_uuid in uuid_index:
+            continue
+        if obj.get("uuid") in chain_uuids:
+            continue  # already reported as a hard issue above
+        orphaned = 1 + _subtree_size(children, obj.get("uuid"))
+        warnings.append(
+            f"Dangling parentUuid off the active chain: uuid={obj.get('uuid', '?')} "
+            f"references missing parentUuid={parent_uuid} — {orphaned} record(s) "
+            f"unreachable behind it"
+        )
 
     # ── Warning: timestamp ordering ──────────────────────────────────────
     # Demoted from a hard failure: out-of-order timestamps are NORMAL in
@@ -436,6 +483,8 @@ def health_check(session_path):
         for issue in issues:
             print(f"  [ISSUE] {issue}")
 
+    # Warnings print on PASS too — a severed history shows up here, not in
+    # `issues`, and printing only on failure is how the incident stayed silent.
     for warning in warnings[:10]:
         print(f"  [WARN]  {warning}")
     if len(warnings) > 10:
