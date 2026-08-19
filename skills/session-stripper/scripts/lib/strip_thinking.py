@@ -38,19 +38,45 @@ def strip_thinking(session_path, dry_run=False, no_backup=False, from_pos=None, 
         if uid is not None:
             target_uuids.add(uid)
 
+    # Everything reachable from the leaf. Anything outside it is off-chain:
+    # sidechain/subagent turns, and branches abandoned by an edit or rewind.
+    chain_uuids = {o.get("uuid") for o in chain if o.get("uuid") is not None}
+
     thinking_cleared = 0
     messages_affected = 0
     chars_saved = 0
     uuids_to_drop = set()
+    offchain_thinking = 0
+    offchain_chars = 0
 
     for obj in objects:
         if obj.get("type") != "assistant":
             continue
         uid = obj.get("uuid")
+        content = obj.get("message", {}).get("content") if isinstance(obj.get("message"), dict) else None
         if uid not in target_uuids:
+            # Off-chain thinking is deliberately left alone — it is unreachable
+            # from the leaf, so it costs no context and removing it would only
+            # destroy history. But it must still be COUNTED: reporting a bare
+            # "312 removed" while 71 blocks (248,283 chars) sat untouched read
+            # as if the session had been fully cleaned.
+            if uid not in chain_uuids and isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get("type")
+                    wrapped = wrapped_thinking_text(block)
+                    if btype == "thinking":
+                        offchain_thinking += 1
+                        offchain_chars += len(block.get("thinking", ""))
+                    elif btype == "redacted_thinking":
+                        offchain_thinking += 1
+                        offchain_chars += len(block.get("data", ""))
+                    elif wrapped is not None:
+                        offchain_thinking += 1
+                        offchain_chars += len(block.get("text", ""))
             continue
 
-        content = obj.get("message", {}).get("content") if isinstance(obj.get("message"), dict) else None
         if not isinstance(content, list):
             continue
 
@@ -113,11 +139,13 @@ def strip_thinking(session_path, dry_run=False, no_backup=False, from_pos=None, 
         "parents_rewired": parents_rewired,
         "chars_saved": chars_saved,
         "est_tokens_saved": est_tokens_saved,
+        "offchain_thinking_skipped": offchain_thinking,
+        "offchain_chars_skipped": offchain_chars,
     }
 
     # Print summary
     mode = "[DRY RUN] " if dry_run else ""
-    print(f"{mode}Thinking blocks removed: {thinking_cleared}")
+    print(f"{mode}Thinking blocks removed (on-chain): {thinking_cleared}")
     print(f"{mode}Messages affected: {messages_affected}")
     if messages_removed:
         print(f"{mode}Thinking-only messages dropped: {messages_removed} (parentUuid rewired on {parents_rewired} descendants)")
@@ -126,5 +154,14 @@ def strip_thinking(session_path, dry_run=False, no_backup=False, from_pos=None, 
               f"(payload emptied; a live CLI may still cite their uuid as parentUuid)")
     print(f"{mode}Characters saved: {chars_saved:,}")
     print(f"{mode}Estimated tokens saved: {est_tokens_saved:,}")
+    if offchain_thinking:
+        # Blocks whose `thinking` is already "" (an earlier strip, or CC's own
+        # signature-only records) would otherwise print as "976 (0 chars)",
+        # which reads like a miscount rather than "nothing left to reclaim".
+        detail = (f"{offchain_chars:,} chars" if offchain_chars
+                  else "no text left — already emptied")
+        print(f"{mode}Thinking blocks left off-chain: {offchain_thinking} "
+              f"({detail}) — unreachable from the leaf, so they cost no context "
+              f"and are not touched")
 
     return stats
