@@ -166,11 +166,11 @@ def strip_attachments(session_path, dry_run=False, no_backup=False,
     messages_removed = 0
     parents_rewired = 0
     if uuids and not dry_run:
-        objects, messages_removed, parents_rewired = remove_objects_and_rewire(objects, uuids)
+        objects, messages_removed, parents_rewired, _ = remove_objects_and_rewire(objects, uuids)
         save_session(session_path, objects, create_backup=not no_backup)
     elif uuids:
         # Dry run: still compute the rewire count so the report is honest.
-        _, messages_removed, parents_rewired = remove_objects_and_rewire(
+        _, messages_removed, parents_rewired, _ = remove_objects_and_rewire(
             [dict(o) for o in objects], uuids
         )
 

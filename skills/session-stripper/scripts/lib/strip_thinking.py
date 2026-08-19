@@ -95,8 +95,10 @@ def strip_thinking(session_path, dry_run=False, no_backup=False, from_pos=None, 
 
     messages_removed = 0
     parents_rewired = 0
+    messages_anchored = 0
     if uuids_to_drop:
-        objects, messages_removed, parents_rewired = remove_objects_and_rewire(objects, uuids_to_drop)
+        objects, messages_removed, parents_rewired, messages_anchored = \
+            remove_objects_and_rewire(objects, uuids_to_drop)
 
     if not dry_run:
         save_session(session_path, objects, create_backup=not no_backup)
@@ -107,6 +109,7 @@ def strip_thinking(session_path, dry_run=False, no_backup=False, from_pos=None, 
         "thinking_cleared": thinking_cleared,
         "messages_affected": messages_affected,
         "messages_removed": messages_removed,
+        "messages_anchored": messages_anchored,
         "parents_rewired": parents_rewired,
         "chars_saved": chars_saved,
         "est_tokens_saved": est_tokens_saved,
@@ -118,6 +121,9 @@ def strip_thinking(session_path, dry_run=False, no_backup=False, from_pos=None, 
     print(f"{mode}Messages affected: {messages_affected}")
     if messages_removed:
         print(f"{mode}Thinking-only messages dropped: {messages_removed} (parentUuid rewired on {parents_rewired} descendants)")
+    if messages_anchored:
+        print(f"{mode}Thinking-only messages kept as chain anchors: {messages_anchored} "
+              f"(payload emptied; a live CLI may still cite their uuid as parentUuid)")
     print(f"{mode}Characters saved: {chars_saved:,}")
     print(f"{mode}Estimated tokens saved: {est_tokens_saved:,}")
 
