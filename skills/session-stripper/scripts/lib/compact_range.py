@@ -218,7 +218,7 @@ def compact_range(session_path, from_pos: int, to_pos: int,
             chars_before += len(json.dumps(o, ensure_ascii=False))
 
     if not dry_run:
-        survivors, _, rewired = remove_objects_and_rewire(objects, drop_uuids)
+        survivors, _, rewired, _ = remove_objects_and_rewire(objects, drop_uuids)
         save_session(session_path, survivors, create_backup=not no_backup)
 
     chars_after = len(marker)

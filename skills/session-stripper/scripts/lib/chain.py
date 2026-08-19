@@ -100,19 +100,95 @@ def resolve_range(chain, from_pos=None, to_pos=None):
     return (start, end)
 
 
-def remove_objects_and_rewire(objects, uuids_to_remove):
+# Payload we leave behind on a node that must survive as a chain stepping-stone
+# (see chain_anchor_uuids). Must be NON-EMPTY: the API rejects empty text blocks
+# ("text content blocks must be non-empty").
+CHAIN_ANCHOR_PLACEHOLDER = "[stripped]"
+
+
+def chain_anchor_uuids(objects):
+    """Return uuids that must NEVER be deleted, only emptied.
+
+    A running `claude` process holds the uuid of the last record it wrote as its
+    in-memory conversation head, and cites that uuid as `parentUuid` on its next
+    append — an append this code cannot see or rewire, because it does not exist
+    yet. Delete that node and the append is born dangling: `walk_active_chain`
+    stops dead there and every earlier message is silently orphaned.
+
+    Incident 2026-08-19: `strip-thinking` deleted 311 thinking-only messages,
+    one of which was the live process's head. The next append pointed at the
+    deleted uuid and the chain collapsed from 1,139 messages to 67 — no error,
+    and `verify` reported PASS on both sides of the break because it only walks
+    the (now short) active chain.
+
+    Rewiring cannot fix this, so we prevent it: the node stays as a stepping
+    stone and only its payload is emptied. The saving is unaffected (the bytes
+    are in the payload, not the envelope); all we keep is an addressable uuid.
+
+    Returns the last record in file order plus the active chain's leaf — usually
+    the same record, both cheap to keep.
+    """
+    anchors = set()
+    for obj in reversed(objects):
+        if isinstance(obj, dict) and obj.get("uuid"):
+            anchors.add(obj["uuid"])
+            break
+    chain = walk_active_chain(objects)
+    if chain and chain[-1].get("uuid"):
+        anchors.add(chain[-1]["uuid"])
+    return anchors
+
+
+def _empty_payload(obj, placeholder=CHAIN_ANCHOR_PLACEHOLDER):
+    """Strip an anchored record's payload in place, keeping its envelope.
+
+    Mirrors the "keep the node, empty the payload" trick compact_range already
+    uses for its range survivor. Returns True if a payload was replaced.
+    """
+    # Rebind rather than mutate in place: callers pass shallow copies
+    # (`[dict(o) for o in objects]`, e.g. strip_attachments' dry run), which
+    # share the inner `message` dict with the real objects. Mutating it there
+    # would edit the caller's live data during a DRY RUN.
+    msg = obj.get("message")
+    if isinstance(msg, dict) and msg.get("content") is not None:
+        obj["message"] = {**msg, "content": [{"type": "text", "text": placeholder}]}
+        return True
+    if obj.get("content") is not None:
+        obj["content"] = [{"type": "text", "text": placeholder}]
+        return True
+    return False
+
+
+def remove_objects_and_rewire(objects, uuids_to_remove, protect=None):
     """Remove objects by uuid and rewire parentUuid on descendants to skip them.
 
     When a message is dropped, any child pointing to it is re-parented to the
     nearest surviving ancestor (walking up parentUuid). This keeps the active
     chain unbroken so the API doesn't see dangling references.
 
+    `protect` is the set of uuids that must survive as chain stepping-stones
+    even when asked to remove them — their payload is emptied instead. Defaults
+    to `chain_anchor_uuids(objects)`; pass an empty set to opt out.
+
     Returns:
-        (survivors, removed_count, rewired_count)
+        (survivors, removed_count, rewired_count, anchored_count)
     """
     uuids_to_remove = set(u for u in uuids_to_remove if u is not None)
     if not uuids_to_remove:
-        return objects, 0, 0
+        return objects, 0, 0, 0
+
+    if protect is None:
+        protect = chain_anchor_uuids(objects)
+    # An anchored node is kept (emptied), so it must not be treated as removed.
+    anchored = uuids_to_remove & set(protect)
+    uuids_to_remove -= anchored
+    anchored_count = 0
+    if anchored:
+        for obj in objects:
+            if obj.get("uuid") in anchored and _empty_payload(obj):
+                anchored_count += 1
+    if not uuids_to_remove:
+        return objects, 0, 0, anchored_count
 
     uuid_to_obj = {obj.get("uuid"): obj for obj in objects if obj.get("uuid")}
 
@@ -140,7 +216,7 @@ def remove_objects_and_rewire(objects, uuids_to_remove):
             rewired += 1
         survivors.append(obj)
 
-    return survivors, len(uuids_to_remove), rewired
+    return survivors, len(uuids_to_remove), rewired, anchored_count
 
 
 def _next_backup_path(path):
