@@ -331,18 +331,22 @@ def analyze_session(session_path, show_cut_points=True):
 
     # ── 5. Chain health ─────────────────────────────────────────────────
 
-    issues = _check_chain_health(objects, chain, uuid_index)
+    issues, warnings = _check_chain_health(objects, chain, uuid_index)
     stats["health_issues"] = issues
+    stats["health_warnings"] = warnings
 
     print("-" * 72)
     print("CHAIN HEALTH")
     print("-" * 72)
     print()
-    if not issues:
+    if not issues and not warnings:
         print("  All checks passed.")
-    else:
-        for issue in issues:
-            print(f"  [ISSUE] {issue}")
+    for issue in issues:
+        print(f"  [ISSUE] {issue}")
+    for warning in warnings[:10]:
+        print(f"  [WARN]  {warning}")
+    if len(warnings) > 10:
+        print(f"  [WARN]  ... and {len(warnings) - 10} more warning(s)")
     print()
     print("=" * 72)
 
@@ -350,10 +354,19 @@ def analyze_session(session_path, show_cut_points=True):
 
 
 def _check_chain_health(objects, chain, uuid_index):
-    """Run health checks on the session chain. Return list of issue strings."""
-    issues = []
+    """Run health checks on the session chain.
 
-    # Check parentUuid integrity
+    Returns (issues, warnings).
+
+    `issues` are hard failures — they mean the file is structurally unusable and
+    `apply` must refuse to swap it in. `warnings` are advisory: conditions that
+    occur in healthy, untouched Claude Code sessions and therefore must not gate
+    a strip.
+    """
+    issues = []
+    warnings = []
+
+    # ── Hard: parentUuid integrity along the active chain ────────────────
     for i, obj in enumerate(chain):
         parent_uuid = obj.get("parentUuid")
         if parent_uuid is not None and parent_uuid not in uuid_index:
@@ -362,7 +375,7 @@ def _check_chain_health(objects, chain, uuid_index):
                 f"uuid={obj.get('uuid', '?')} references missing parentUuid={parent_uuid}"
             )
 
-    # Check slug consistency
+    # ── Hard: slug consistency ───────────────────────────────────────────
     slugs = set()
     for obj in chain:
         s = obj.get("slug")
@@ -371,19 +384,32 @@ def _check_chain_health(objects, chain, uuid_index):
     if len(slugs) > 1:
         issues.append(f"Multiple slugs in active chain: {slugs}")
 
-    # Check timestamp ordering
+    # ── Warning: timestamp ordering ──────────────────────────────────────
+    # Demoted from a hard failure: out-of-order timestamps are NORMAL in
+    # untouched Claude Code sessions, so gating on absolute cleanliness blocked
+    # any strip of an already-dirty file (observed: 6 violations in the stripped
+    # copy vs 46 in the untouched original, and apply refused).
+    #
+    # The cause is not millisecond ties — the check uses strict `<`, so ties
+    # already pass — and not chain order diverging from file order. Measured
+    # across 25 real sessions: 418 violations, and in every one file order and
+    # chain order AGREED. CC stamps a record when it is CONSTRUCTED but appends
+    # it after the record it hangs off (71% are user -> attachment pairs where
+    # the attachment is stamped a few ms early), and session resume/fork
+    # re-links records that keep much older timestamps. Neither indicates
+    # corruption, so neither should block a swap.
     prev_ts = None
     for i, obj in enumerate(chain):
         ts = obj.get("timestamp")
         if ts is not None:
             if prev_ts is not None and ts < prev_ts:
-                issues.append(
+                warnings.append(
                     f"Timestamp out of order at chain pos {i}: "
                     f"{ts} < previous {prev_ts}"
                 )
             prev_ts = ts
 
-    return issues
+    return issues, warnings
 
 
 def health_check(session_path):
@@ -399,15 +425,20 @@ def health_check(session_path):
     uuid_index = build_uuid_index(objects)
     chain = walk_active_chain(objects, uuid_index)
 
-    issues = _check_chain_health(objects, chain, uuid_index)
+    issues, warnings = _check_chain_health(objects, chain, uuid_index)
 
     if not issues:
         print("HEALTH CHECK: PASS")
         print(f"  Chain length: {len(chain)} messages")
         print(f"  Total lines:  {len(objects)}")
-        return True
     else:
         print("HEALTH CHECK: FAIL")
         for issue in issues:
             print(f"  [ISSUE] {issue}")
-        return False
+
+    for warning in warnings[:10]:
+        print(f"  [WARN]  {warning}")
+    if len(warnings) > 10:
+        print(f"  [WARN]  ... and {len(warnings) - 10} more warning(s)")
+
+    return not issues
