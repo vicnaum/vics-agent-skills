@@ -298,6 +298,35 @@ def analyze_session(session_path, show_cut_points=True):
 
     print()
 
+    # ── 3b. On-disk-only payload (toolUseResult sidecars) ───────────────
+    # CC writes each tool result twice: the `tool_result` block (counted above,
+    # and sent to the model) and a top-level `toolUseResult` field on the same
+    # record. The sidecar is replay/display metadata — it does NOT enter the
+    # prompt — but it is routinely the largest thing in the file, so leaving it
+    # out of this report made `strip-tools`' savings look far smaller than the
+    # on-disk reduction actually available.
+    sidecar_count = 0
+    sidecar_chars = 0
+    for obj in objects:
+        tur = obj.get("toolUseResult")
+        if tur is None:
+            continue
+        sidecar_count += 1
+        sidecar_chars += len(json.dumps(tur, ensure_ascii=False))
+    stats["tool_use_result_count"] = sidecar_count
+    stats["tool_use_result_chars"] = sidecar_chars
+
+    if sidecar_count:
+        print("-" * 72)
+        print("ON-DISK ONLY (toolUseResult sidecars — never sent to the model)")
+        print("-" * 72)
+        print()
+        print(f"  Records with toolUseResult: {sidecar_count:,}")
+        print(f"  Chars on disk:              {sidecar_chars:,}")
+        print(f"  Not counted in the token totals above (local replay metadata).")
+        print(f"  → stripper strip-tools clears these alongside their tool_result block.")
+        print()
+
     # ── 4. Cut point candidates ─────────────────────────────────────────
 
     if show_cut_points:

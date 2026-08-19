@@ -2,6 +2,18 @@
 
 import json
 
+
+# Claude Code records every tool result TWICE: as a `tool_result` block inside
+# `message.content[]`, and again as a top-level `toolUseResult` field on the
+# same record. Clearing only the block leaves the whole payload on disk — one
+# surveyed session held 33 MB across 2,125 such sidecars, every one of them
+# paired with a `tool_result` block we had already emptied.
+#
+# The sidecar is local-only (replay/display); it is NOT sent to the model. So
+# it is reported on its own line rather than folded into `chars_saved`, which
+# would inflate the context saving the caller thinks they got.
+TOOL_USE_RESULT_PLACEHOLDER = "[stripped by session-stripper]"
+
 from .chain import load_session, build_uuid_index, walk_active_chain, resolve_range, save_session, estimate_tokens
 
 
@@ -88,6 +100,7 @@ def strip_tools(session_path, dry_run=False, no_backup=False,
     if not chain:
         print("No active chain found.")
         return {"tool_use_cleared": 0, "tool_result_cleared": 0, "images_cleared": 0,
+                "tool_use_result_cleared": 0, "sidecar_chars_saved": 0,
                 "chars_saved": 0, "est_tokens_saved": 0, "by_tool": {}}
 
     start, end = resolve_range(chain, from_pos, to_pos)
@@ -103,6 +116,8 @@ def strip_tools(session_path, dry_run=False, no_backup=False,
         "tool_use_cleared": 0,
         "tool_result_cleared": 0,
         "images_cleared": 0,
+        "tool_use_result_cleared": 0,
+        "sidecar_chars_saved": 0,
         "chars_saved": 0,
         "est_tokens_saved": 0,
         "by_tool": {},
@@ -118,6 +133,7 @@ def strip_tools(session_path, dry_run=False, no_backup=False,
             continue
 
         new_content = []
+        cleared_result_tools = []
         for block in content:
             if not isinstance(block, dict):
                 new_content.append(block)
@@ -217,6 +233,7 @@ def strip_tools(session_path, dry_run=False, no_backup=False,
 
                 stats["tool_result_cleared"] += 1
                 stats["chars_saved"] += saved
+                cleared_result_tools.append(tool_name)
 
                 by_tool = stats["by_tool"].setdefault(tool_name, {"cleared": 0, "chars_saved": 0})
                 by_tool["cleared"] += 1
@@ -230,6 +247,22 @@ def strip_tools(session_path, dry_run=False, no_backup=False,
 
         _set_content(obj, new_content)
 
+        # --- toolUseResult sidecar: strip in lockstep with its sibling block ---
+        # Keyed implicitly by tool_use_id: CC writes the sidecar on the very
+        # record that carries the matching tool_result block, so if we cleared a
+        # result here, the sidecar on this record is its duplicate.
+        sidecar = obj.get("toolUseResult")
+        if (cleared_result_tools and sidecar is not None
+                and sidecar != TOOL_USE_RESULT_PLACEHOLDER):
+            old_chars = _content_char_count(sidecar)
+            obj["toolUseResult"] = TOOL_USE_RESULT_PLACEHOLDER
+            saved = max(0, old_chars - len(TOOL_USE_RESULT_PLACEHOLDER))
+            stats["tool_use_result_cleared"] += 1
+            stats["sidecar_chars_saved"] += saved
+            by_tool = stats["by_tool"].setdefault(
+                cleared_result_tools[0], {"cleared": 0, "chars_saved": 0})
+            by_tool["sidecar_chars_saved"] = by_tool.get("sidecar_chars_saved", 0) + saved
+
     stats["est_tokens_saved"] = estimate_tokens(stats["chars_saved"])
 
     # Print summary
@@ -238,6 +271,10 @@ def strip_tools(session_path, dry_run=False, no_backup=False,
     print(f"Images removed:           {stats['images_cleared']}")
     print(f"Characters saved:         {stats['chars_saved']:,}")
     print(f"Est. tokens saved:        {stats['est_tokens_saved']:,}")
+    if stats["tool_use_result_cleared"]:
+        print(f"toolUseResult sidecars:   {stats['tool_use_result_cleared']} cleared, "
+              f"{stats['sidecar_chars_saved']:,} chars (on-disk only — this payload "
+              f"is not sent to the model, so it is NOT in the token figure above)")
     if stats["by_tool"]:
         print("\nBy tool:")
         for name in sorted(stats["by_tool"]):
