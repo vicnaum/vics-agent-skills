@@ -341,6 +341,26 @@ I hit the context limit on this claude.ai chat — help me continue it in Claude
 Export this Claude Desktop conversation and import it into CC
 ```
 
+### [chatgpt-chat-export](skills/chatgpt-chat-export/SKILL.md)
+
+Export a chatgpt.com (ChatGPT web) conversation to disk with full fidelity: the raw `/backend-api/conversation/{id}` JSON, every attachment (user-uploaded images, PDFs), and a readable Markdown transcript with attachments linked inline.
+
+ChatGPT's built-in export mails you a zip of *everything*, hours later. The page's own API returns one conversation instantly — but getting it (and the attachment bytes) out of an authenticated browser is an obstacle course: the MCP extension truncates and DLP-filters JS results, uBlock blocks localhost relays, attachment URLs aren't signed so `curl` fails, and Chrome swallows repeated programmatic downloads. The skill encodes the working paths around all of that — clipboard transport via an injected button + real click for MCP-driven exports, Blob downloads for manual DevTools use — plus `scripts/chatgpt2md.py`, which walks the canonical branch of ChatGPT's mapping *tree* (not a flat list), drops tool/reasoning scaffolding, and strips the private-use-area citation runes.
+
+Output lands as `chat-exports/<conversation-uuid>/` with `conversation.json`, `conversation.md`, `FILES.md`, and `files/`.
+
+> No external Python dependencies — stdlib only (Python 3.9+).
+
+#### Example ask
+
+```
+Please grab this talk from ChatGPT: https://chatgpt.com/c/<uuid> (probably need to use chrome)
+```
+
+```
+Pull this ChatGPT conversation's JSON via the API route, with all the attachments
+```
+
 ## Install / use
 
 ### Cursor
