@@ -1,19 +1,21 @@
 ---
 name: tasx
-description: "File-based task tracker for projects: tasks live as markdown files in a tasks/ folder, state = folder location (root = inbox, in-progress/, waiting/, done/, cancelled/, decisions/ for open choices), agents manage tasks by moving the files; plus a zero-dependency local board UI (tasx serve) where the user changes states, answers decisions, and leaves comments that are written straight back into the md files and nudge the owning agent via agent-chat. Use when: (1) the user asks to set up / init a task tracker or tasks folder in a project, (2) the user or agent needs to create, list, move, complete, cancel, or comment on tasks in a repo that has a tasks/ folder, (3) the user asks 'what's in progress', 'what needs me', 'what's stale', or wants a task board / dashboard served, (4) starting a work session in a repo with tasks/ (run tasx doctor and reconcile), (5) a task is blocked on the user's feedback or on a decision — file it as waiting/ or a decision instead of asking and losing the thread, (6) generalizing/migrating older ad-hoc task folders (myhdd-style) onto the shared convention. Triggers on: tasks folder, task tracker, task board, tasx, kanban, what's in progress, needs my feedback, stale tasks, task dashboard."
+description: "File-based task tracker for projects: tasks live as markdown files in a hidden, git-ignored .tasx/ folder, state = folder location (root = inbox, in-progress/, waiting/, done/, cancelled/, decisions/ for open choices), agents manage tasks by moving the files; plus a zero-dependency local board UI (tasx serve) where the user changes states, answers decisions, and leaves comments that are written straight back into the md files and nudge the owning agent via agent-chat. Use when: (1) the user asks to set up / init a task tracker or tasks folder in a project, (2) the user or agent needs to create, list, move, complete, cancel, or comment on tasks in a repo that has a .tasx/ folder, (3) the user asks 'what's in progress', 'what needs me', 'what's stale', or wants a task board / dashboard served, (4) starting a work session in a repo with .tasx/ or a legacy tasks/ tree (run tasx doctor and reconcile), (5) a task is blocked on the user's feedback or on a decision — file it as waiting/ or a decision instead of asking and losing the thread, (6) generalizing/migrating older ad-hoc task folders (myhdd-style) onto the shared convention. Triggers on: tasks folder, task tracker, task board, tasx, kanban, what's in progress, needs my feedback, stale tasks, task dashboard."
 ---
 
 # tasx — file-based tasks, folder = state
 
 Markdown files are the source of truth; the folder a file sits in IS its state. No
-database, no daemon: `ls tasks/in-progress/` is a kanban, `git mv` is a status change,
-and the board UI is just a viewer/editor over the same files. The CLI lives at
+database, no daemon: `ls .tasx/in-progress/` is a kanban, `mv` is a status change,
+and the board UI is just a viewer/editor over the same files. The folder is hidden and
+git-ignored per repo (`tasx init` adds it to `.git/info/exclude`), so tasks never leak
+into commits of the project you're working in. The CLI lives at
 `scripts/tasx` (installed on PATH as `tasx`).
 
 ## Layout
 
 ```
-tasks/               INBOX — new/untriaged tasks as *.md
+.tasx/               INBOX — new/untriaged tasks as *.md  (git-ignored)
   README.md          the convention doc (written by `tasx init`)
   in-progress/       actively worked — set `owner:` to your agent-chat name
   waiting/           blocked — `waiting-on:` header says on what (see below)
@@ -32,7 +34,9 @@ Full format spec: [references/format.md](references/format.md).
 ## Commands
 
 ```bash
-tasx init                          # create tasks/ tree + README + CLAUDE.md/AGENTS.md pointer
+tasx init [--gitignore]            # create .tasx/ tree + README + CLAUDE.md/AGENTS.md pointer,
+                                   #   git-ignore it (.git/info/exclude; --gitignore = shared .gitignore),
+                                   #   rename a legacy tasks/ tree to .tasx/
 tasx new "Title" [--owner me] [--group area] [--body "..."] [--id slug]
 tasx new "Which renderer?" --decision --option "a | raster" --option "b | webgl"
 tasx list [--all]                  # kanban to stdout (needs-you / in-progress / inbox / waiting)
@@ -43,11 +47,13 @@ tasx archive [--days 30]           # roll old done/ files into done/YYYY-MM/
 tasx serve [--port N]              # board UI on a stable per-project port (127.0.0.1)
 ```
 
-Commands find the nearest `tasks/` walking up from cwd (`$TASX_TASKS` overrides).
+Commands find the nearest `.tasx/` walking up from cwd (`$TASX_TASKS` overrides). A
+pre-rename `tasks/` folder is still found when it looks like a tasx tree (convention
+README or a state subfolder) — `tasx doctor` nags, `tasx init` renames it.
 
 ## Agent contract
 
-Working in a repo that has a `tasks/` folder means playing by these rules:
+Working in a repo that has a `.tasx/` folder means playing by these rules:
 
 1. **Session start**: run `tasx doctor`. Reconcile what you own — finished things go
    to `done`, stalled things get a comment saying why, tasks owned by a dead agent
@@ -93,10 +99,10 @@ then read the port from the log's first line.
 Symlink the skill folder into the agent's skill dirs and put `tasx` on PATH:
 
 ```bash
-ln -s ~/github/skills-creation/skills/tasx ~/.claude/skills/tasx
-ln -s ~/github/skills-creation/skills/tasx ~/.codex/skills/tasx
-ln -s ~/github/skills-creation/skills/tasx ~/.cursor/skills/tasx
-ln -s ~/github/skills-creation/skills/tasx/scripts/tasx ~/bin/tasx   # or any PATH dir
+ln -s ~/github/vics-agent-skills/skills/tasx ~/.claude/skills/tasx
+ln -s ~/github/vics-agent-skills/skills/tasx ~/.codex/skills/tasx
+ln -s ~/github/vics-agent-skills/skills/tasx ~/.cursor/skills/tasx
+ln -s ~/github/vics-agent-skills/skills/tasx/scripts/tasx ~/bin/tasx   # or any PATH dir
 ```
 
 Python 3.8+ stdlib only. agent-chat integration is optional and auto-detected.

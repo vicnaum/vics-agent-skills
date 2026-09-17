@@ -244,7 +244,7 @@ Tell the other agent the DB schema changed — don't touch March 2004 until it c
 
 ### [tasx](skills/tasx/SKILL.md)
 
-File-based task tracker for AI-agent projects: **markdown files are the source of truth, the folder is the state.** The root of `tasks/` is the inbox; agents move files between `in-progress/`, `waiting/`, `done/`, `cancelled/` (a status change is just `git mv`), and `decisions/` holds open choices with radio options. No database, no daemon, no dependencies (Python 3.8+ stdlib): `ls tasks/in-progress/` is a kanban.
+File-based task tracker for AI-agent projects: **markdown files are the source of truth, the folder is the state.** The root of `.tasx/` is the inbox; agents move files between `in-progress/`, `waiting/`, `done/`, `cancelled/` (a status change is just `mv`), and `decisions/` holds open choices with radio options. The folder is hidden and git-ignored per repo (`tasx init` adds it to `.git/info/exclude`), so it never shows up in the project's commits. No database, no daemon, no dependencies (Python 3.8+ stdlib): `ls .tasx/in-progress/` is a kanban.
 
 `tasx serve` gives you a zero-dependency local board over the same files — **Needs you** pinned on top with the count in the tab title, in-progress cards with owner liveness dots (via [agent-chat](skills/agent-chat/SKILL.md) status), ⚠ stale chips (in-progress >24h, waiting-on-you >3d, inbox >14d), a "since your last visit" digest, and a collapsed done archive grouped by day. Every click writes straight back into the md files: the status dropdown physically moves the file, decision radios write `choice:`, comments append to `## Comments` — and each **nudges the owning agent** through agent-chat, so answering a question on the board resumes the work.
 
@@ -252,7 +252,7 @@ The SKILL.md doubles as the agent contract: run `tasx doctor` at session start a
 
 | Command | What it does |
 |---------|-------------|
-| `tasx init` | create the tasks/ tree + convention README + CLAUDE.md/AGENTS.md pointer |
+| `tasx init` | create the `.tasx/` tree + convention README + CLAUDE.md/AGENTS.md pointer; git-ignores it locally (`--gitignore` for the shared file); renames a legacy `tasks/` tree |
 | `tasx new "Title"` | new task in the inbox (`--decision --option "a \| Label"` for choices) |
 | `tasx list [--all]` | kanban to stdout: needs-you / in-progress / inbox / waiting |
 | `tasx move <id> <state>` | git-mv-aware state change (`--waiting-on` for waiting) |

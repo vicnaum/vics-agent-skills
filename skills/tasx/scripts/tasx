@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """tasx — file-based task tracker where markdown files are the source of truth.
 
-State = folder location (survives with zero tooling: `ls tasks/in-progress/` is a kanban).
-  tasks/            inbox (untriaged / not started)
-  tasks/in-progress ... actively worked
-  tasks/waiting     ... blocked on someone/something (waiting-on: header says what)
-  tasks/done        ... completed (archived monthly by `tasx archive`)
-  tasks/cancelled   ... dropped (file says why)
-  tasks/decisions   ... open choices (kind=decision, option: lines; decided = has choice:)
+State = folder location (survives with zero tooling: `ls .tasx/in-progress/` is a kanban).
+  .tasx/            inbox (untriaged / not started)
+  .tasx/in-progress ... actively worked
+  .tasx/waiting     ... blocked on someone/something (waiting-on: header says what)
+  .tasx/done        ... completed (archived monthly by `tasx archive`)
+  .tasx/cancelled   ... dropped (file says why)
+  .tasx/decisions   ... open choices (kind=decision, option: lines; decided = has choice:)
+
+`tasx init` git-ignores the folder per repo (.git/info/exclude; `--gitignore` writes the
+shared .gitignore instead). A legacy `tasks/` tree is still discovered and renamed by init.
 
 Python 3.8+ stdlib only. `tasx help` for commands.
 """
@@ -24,6 +27,9 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+TASKS_DIR = ".tasx"            # canonical folder name: hidden, unique, git-ignored by `tasx init`
+LEGACY_TASKS_DIR = "tasks"     # pre-.tasx name; still discovered when it looks like a tasx tree
+STATE_SUBDIRS = ("in-progress", "waiting", "done", "cancelled", "decisions", "blocked")
 STATES = ["inbox", "in-progress", "waiting", "done", "cancelled"]
 STATE_DIRS = {"in-progress": "in-progress", "waiting": "waiting", "done": "done",
               "cancelled": "cancelled", "inbox": ""}
@@ -49,10 +55,12 @@ SKILL_DIR = Path(__file__).resolve().parent
 TASKS_README = """# Task tracker (tasx)
 
 File-based tasks: **markdown files are the source of truth, the folder is the state.**
-The root of `tasks/` is the INBOX — new/untriaged tasks live here as `*.md`.
-Move a file to change its state (`tasx move <id> <state>`, or plain `git mv`):
+The root of `.tasx/` is the INBOX — new/untriaged tasks live here as `*.md`.
+The folder is git-ignored (`tasx init` adds it to `.git/info/exclude`), so tasks stay
+out of the repo's commits. Move a file to change its state (`tasx move <id> <state>`,
+or plain `mv`):
 
-- `tasks/` (root)   — inbox / not started / untriaged
+- `.tasx/` (root)   — inbox / not started / untriaged
 - `in-progress/`    — actively being worked (set `owner:` to your agent name)
 - `waiting/`        — blocked; the `waiting-on:` header says on what
                       (`you` = needs the human's feedback; `decision <id>`; `external: <thing>`)
@@ -72,9 +80,9 @@ Keep it lightweight.
 AGENTS_POINTER = """
 ## Tasks (tasx)
 
-File-based task tracker in `tasks/` — see `tasks/README.md` for the convention.
+File-based task tracker in `.tasx/` (git-ignored) — see `.tasx/README.md` for the convention.
 State = folder: root = inbox, `in-progress/`, `waiting/` (+`waiting-on:` header),
-`done/`, `cancelled/`, `decisions/` (open choices). Move files with `tasx move` or `git mv`.
+`done/`, `cancelled/`, `decisions/` (open choices). Move files with `tasx move` or `mv`.
 CLI: `tasx list | new | move | comment | doctor`. Board for the human: `tasx serve`.
 At session start run `tasx doctor` and reconcile stale items you own.
 """
@@ -102,24 +110,44 @@ title: {title}
 
 # ---------- root discovery ----------
 
+def looks_like_tasks_tree(d):
+    """A legacy `tasks/` dir only counts when it carries the convention: a README that
+    mentions tasx, or at least one state subfolder. Keeps unrelated `tasks/` folders
+    (source code, fixtures...) from being mistaken for a tracker."""
+    if not d.is_dir():
+        return False
+    readme = d / "README.md"
+    try:
+        if readme.is_file() and "tasx" in readme.read_text(encoding="utf-8", errors="ignore"):
+            return True
+    except OSError:
+        pass
+    return any((d / s).is_dir() for s in STATE_SUBDIRS)
+
+
 def find_tasks_root(start=None):
-    """Nearest tasks/ dir walking up from cwd (or $TASX_TASKS)."""
+    """Nearest .tasx/ dir walking up from cwd (or $TASX_TASKS). At each level a legacy
+    tasks/ dir is accepted too, but only when it looks like a tasx tree."""
     env = os.environ.get("TASX_TASKS")
     if env:
         return Path(env).resolve()
     d = Path(start or os.getcwd()).resolve()
     while True:
-        if d.name == "tasks" and d.is_dir():
+        if d.name == TASKS_DIR and d.is_dir():
             return d
-        if (d / "tasks").is_dir():
-            return d / "tasks"
+        if (d / TASKS_DIR).is_dir():
+            return d / TASKS_DIR
+        if d.name == LEGACY_TASKS_DIR and looks_like_tasks_tree(d):
+            return d
+        if looks_like_tasks_tree(d / LEGACY_TASKS_DIR):
+            return d / LEGACY_TASKS_DIR
         if d.parent == d:
             return None
         d = d.parent
 
 
 def project_name(root):
-    return root.parent.name if root.name == "tasks" else root.name
+    return root.parent.name if root.name in (TASKS_DIR, LEGACY_TASKS_DIR) else root.name
 
 
 # ---------- parsing ----------
@@ -373,29 +401,101 @@ def slugify(title):
     return s[:60] or "task"
 
 
+def git_out(cwd, *args, timeout=10):
+    """stdout of a git command run in cwd, or None when git fails / isn't there."""
+    try:
+        r = subprocess.run(["git", "-C", str(cwd)] + list(args),
+                           capture_output=True, text=True, timeout=timeout)
+        return r.stdout.strip() if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def ensure_git_ignored(proj, shared=False):
+    """Make .tasx/ ignored in the enclosing repo. Default is the repo-local
+    .git/info/exclude (no tracked file changes, nothing to commit); `shared` appends to
+    the project's .gitignore instead. Returns a note for the init summary, or None."""
+    if git_out(proj, "rev-parse", "--is-inside-work-tree") != "true":
+        return None
+    if git_out(proj, "ls-files", "--error-unmatch", TASKS_DIR) is not None:
+        return "%s/ is tracked in git — left as is (ignore rules don't affect tracked files)" % TASKS_DIR
+    if git_out(proj, "check-ignore", "-q", TASKS_DIR) is not None:
+        return None  # already ignored (repo .gitignore, global excludes, or info/exclude)
+    if shared:
+        target, label = proj / ".gitignore", ".gitignore"
+    else:
+        rel = git_out(proj, "rev-parse", "--git-path", "info/exclude")
+        if rel is None:
+            return None
+        target = Path(rel) if os.path.isabs(rel) else proj / rel
+        label = rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    text = target.read_text(encoding="utf-8") if target.exists() else ""
+    if text and not text.endswith("\n"):
+        text += "\n"
+    target.write_text(text + "%s/\n" % TASKS_DIR, encoding="utf-8")
+    return "%s (%s/ ignored%s)" % (label, TASKS_DIR, "" if shared else " locally")
+
+
+def upgrade_pointer(text):
+    """Rewrite `tasks/` -> `.tasx/` inside the '## Tasks (tasx)' section only."""
+    m = re.search(r"^## Tasks \(tasx\)\s*$", text, re.M)
+    if not m:
+        return text
+    nxt = re.search(r"^## ", text[m.end():], re.M)
+    stop = m.end() + nxt.start() if nxt else len(text)
+    section = text[m.end():stop].replace("`%s/" % LEGACY_TASKS_DIR, "`%s/" % TASKS_DIR)
+    return text[:m.end()] + section + text[stop:]
+
+
 def cmd_init(args):
     base = Path(os.getcwd())
-    root = base / "tasks" if base.name != "tasks" else base
+    if base.name == TASKS_DIR or (base.name == LEGACY_TASKS_DIR and looks_like_tasks_tree(base)):
+        base = base.parent  # invoked from inside the tree
+    root = base / TASKS_DIR
+    legacy = base / LEGACY_TASKS_DIR
     made = []
+    if not root.exists() and looks_like_tasks_tree(legacy):
+        # migrate the pre-.tasx folder; git mv when it's tracked so history follows the files
+        if git_out(base, "ls-files", "--error-unmatch", LEGACY_TASKS_DIR) is not None \
+                and git_out(base, "mv", LEGACY_TASKS_DIR, TASKS_DIR, timeout=30) is not None:
+            made.append("%s/ -> %s/ (git mv; files stay tracked)" % (LEGACY_TASKS_DIR, TASKS_DIR))
+        else:
+            legacy.rename(root)
+            made.append("%s/ -> %s/ (legacy folder renamed)" % (LEGACY_TASKS_DIR, TASKS_DIR))
     for d in ["", "in-progress", "waiting", "done", "cancelled", "decisions"]:
         p = root / d if d else root
         if not p.exists():
             p.mkdir(parents=True)
-            made.append(str(p.relative_to(base)) if p != base else ".")
+            made.append(str(p.relative_to(base)))
     readme = root / "README.md"
     if not readme.exists():
         readme.write_text(TASKS_README, encoding="utf-8")
-        made.append("tasks/README.md")
+        made.append("%s/README.md" % TASKS_DIR)
+    else:
+        old = readme.read_text(encoding="utf-8")
+        new = old.replace("`%s/`" % LEGACY_TASKS_DIR, "`%s/`" % TASKS_DIR)
+        if new != old and old.startswith("# Task tracker (tasx)"):
+            readme.write_text(new, encoding="utf-8")
+            made.append("%s/README.md (folder name updated)" % TASKS_DIR)
     # pointer in agents files
-    proj = root.parent
+    proj = base
     targets = [p for p in (proj / "CLAUDE.md", proj / "AGENTS.md") if p.exists()]
     if not targets:
         targets = [proj / "AGENTS.md"]
     for t in targets:
         text = t.read_text(encoding="utf-8") if t.exists() else ""
-        if "## Tasks (tasx)" not in text and "tasks/README.md" not in text:
+        if "## Tasks (tasx)" in text:
+            new = upgrade_pointer(text)
+            if new != text:
+                t.write_text(new, encoding="utf-8")
+                made.append("%s (pointer updated to %s/)" % (t.name, TASKS_DIR))
+        elif "%s/README.md" % TASKS_DIR not in text and "%s/README.md" % LEGACY_TASKS_DIR not in text:
             t.write_text(text.rstrip() + "\n" + AGENTS_POINTER, encoding="utf-8")
             made.append("%s (pointer added)" % t.name)
+    note = ensure_git_ignored(proj, shared=getattr(args, "gitignore", False))
+    if note:
+        made.append(note)
     print("initialized %s" % root)
     for m in made:
         print("  + %s" % m)
@@ -406,7 +506,7 @@ def cmd_init(args):
 def require_root():
     root = find_tasks_root()
     if not root:
-        sys.exit("no tasks/ folder found here or above — run `tasx init` first")
+        sys.exit("no %s/ folder found here or above — run `tasx init` first" % TASKS_DIR)
     return root
 
 
@@ -504,8 +604,11 @@ def cmd_doctor(args):
     statuses = agent_statuses(owners)
     orphans = [d for d in docs if d["state"] == "in-progress" and d["owner"]
                and statuses.get(d["owner"]) in ("dead", "offline")]
+    legacy_hint = ("\nLEGACY FOLDER: this is a `%s/` tree — run `tasx init` in %s to rename it to "
+                   "%s/ and git-ignore it." % (LEGACY_TASKS_DIR, root.parent, TASKS_DIR)
+                   if root.name == LEGACY_TASKS_DIR else "")
     if not (stale or dupes or orphans):
-        print("all fresh — nothing stale in %s" % root)
+        print("all fresh — nothing stale in %s%s" % (root, legacy_hint))
         return
     print("tasx doctor — %s" % root)
     if stale:
@@ -521,7 +624,7 @@ def cmd_doctor(args):
         for k, v in dupes.items():
             print("  %s:\n    %s" % (k, "\n    ".join(v)))
     print("\nReconcile what you own: finish -> `tasx move <id> done`, "
-          "stalled -> comment why, dead owner -> take over or move to inbox.")
+          "stalled -> comment why, dead owner -> take over or move to inbox." + legacy_hint)
 
 
 def cmd_archive(args):
@@ -649,7 +752,10 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd")
 
-    sub.add_parser("init", help="create tasks/ tree + README + CLAUDE.md/AGENTS.md pointer")
+    i = sub.add_parser("init", help="create .tasx/ tree + README + CLAUDE.md/AGENTS.md pointer, "
+                       "git-ignore it locally; renames a legacy tasks/ tree")
+    i.add_argument("--gitignore", action="store_true",
+                   help="ignore .tasx/ via the repo's shared .gitignore instead of .git/info/exclude")
 
     n = sub.add_parser("new", help="create a task (or decision) in the inbox")
     n.add_argument("title")

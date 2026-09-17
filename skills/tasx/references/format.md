@@ -39,7 +39,7 @@ after is body. All header lines are optional — a bare markdown file is a valid
 
 | Folder          | State        | Notes |
 |-----------------|--------------|-------|
-| `tasks/` (root) | inbox        | untriaged / not started |
+| `.tasx/` (root) | inbox        | untriaged / not started |
 | `in-progress/`  | in-progress  | must have an `owner:` |
 | `waiting/`      | waiting      | must have `waiting-on:` (patched in by `tasx move`) |
 | `done/`         | done         | `done/YYYY-MM/` archive subfolders also count |
@@ -52,6 +52,10 @@ picked on the board), `external: <thing>` (world stuff — not your bottleneck).
 
 ## Legacy compatibility (myhdd-era folders)
 
+- `tasks/` (the pre-`.tasx` folder name) is still discovered, but only when it carries
+  the convention: a `README.md` mentioning tasx, or at least one state subfolder. An
+  unrelated `tasks/` folder (source code, fixtures) is ignored. `tasx init` renames a
+  legacy tree to `.tasx/` (`git mv` if it is tracked).
 - `blocked/` is read as `waiting/`.
 - Unknown subfolders (e.g. myhdd `tasks/backup/`): a `status:` header is honored via
   aliases — `done/completed/resolved → done`, `cancelled → cancelled`,
