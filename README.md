@@ -363,14 +363,15 @@ Pull this ChatGPT conversation's JSON via the API route, with all the attachment
 
 ### [slopcheck](skills/slopcheck/SKILL.md)
 
-Keeps an agent's writing readable for one specific reader, as a named list of rule breaks instead of a score. A standard-library Python checker plus four Claude Code hooks:
+Keeps an agent's writing readable for one specific reader, as a named list of rule breaks instead of a score. A standard-library Python checker plus five Claude Code hooks:
 
+- a reminder line with the rules on every prompt, built from the config thresholds
 - one advisory line under every reply of 60 words or more
 - the named list into the agent's context after it writes any document
-- a deny gate on publishing an artifact whose prose has a dash or a semicolon
+- a deny gate on publishing an artifact whose prose has an em-dash or an en-dash
 - a deny gate on Slack, pull-request, Linear and Notion text until the list is empty
 
-Checks sentence length, comma count, semicolons, em-dashes, lists run inline, paragraph and bullet length, fact-carrying parentheses, achievement words for unfinished work, agreement openers, sign-post phrases, contrast frames, and an advisory list of terms whose first use has no gloss. An optional model layer through the Anthropic API adds inflation, unexplained jargon, bare numbers and metaphors.
+Checks sentence length, comma count, semicolon chains, em-dashes and en-dashes, lists run inline, paragraph and bullet length, fact-carrying parentheses, achievement words for unfinished work, agreement openers, sign-post phrases, contrast frames, and an advisory list of terms whose first use has no gloss. An optional model layer, off by default, adds inflation, unexplained jargon, bare numbers and metaphors, through the Anthropic API or the TypeSafe Jev API.
 
 #### Example ask
 
@@ -392,7 +393,7 @@ Style flags:
 
 #### Install
 
-Symlink `skills/slopcheck/scripts/slopcheck` and `scripts/slopmark` onto your PATH, then run `slopcheck install`. It backs up `~/.claude/settings.json` and wires the four hooks. The full steps and the config are in the skill.
+Symlink `skills/slopcheck/scripts/slopcheck` and `scripts/slopmark` onto your PATH, then run `slopcheck install`. It backs up `~/.claude/settings.json` and `~/.claude/CLAUDE.md`, wires the hooks and the reminder, and writes the rules block into CLAUDE.md between markers. The full steps and the config are in the skill.
 
 
 ## Install / use

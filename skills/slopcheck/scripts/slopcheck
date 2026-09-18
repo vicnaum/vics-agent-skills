@@ -6,7 +6,8 @@ Usage:
   slopcheck.py FILE [--surface terminal|doc|external] [--json]
   slopcheck.py --stdin [--surface ...]           # text on stdin
   slopcheck.py hook-stop | hook-post-write | hook-pre-send | hook-pre-publish   # Claude Code hooks, JSON on stdin
-  slopcheck.py install [--dry-run]              # wire the three Claude Code hooks into ~/.claude/settings.json
+  slopcheck.py install [--dry-run] [--no-reminder] [--no-rules]   # hooks + reminder into settings.json, rules block into ~/.claude/CLAUDE.md
+  slopcheck.py rules                            # print the CLAUDE.md rules block, ready to paste
   slopcheck.py uninstall                        # remove them
   slopcheck.py labels                           # summary of ~/.config/slopcheck/labels.jsonl
 
@@ -150,14 +151,15 @@ def check_sentence(s, is_bullet):
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CFG_DIR = os.path.expanduser("~/.config/slopcheck")
-CFG_PATH = os.path.join(CFG_DIR, "config.json")
+CFG_PATH = os.environ.get("SLOPCHECK_CONFIG") or os.path.join(CFG_DIR, "config.json")
 DEFAULTS = {
-    "stop_mode": "advise",              # "advise": one line, never blocks. "block-chars": block once only for a dash or semicolon. "block-once": block once for any rule break.
+    "stop_mode": "advise",              # "advise": one line, never blocks. "block-chars": block once only for a dash. "block-once": block once for any rule break.
     "min_words": 60,                    # below this, the Stop hook stays silent
     "external_min_words": 25,           # Slack/PR text shorter than this is not checked
     "block_external": True,             # deny Slack/PR sends with rule breaks or hard style flags
     "model_check": False,               # semantic judgement by a small Claude model. Off until an API key with billing exists.
-    "model_backend": "api",             # "api": direct Messages API with ANTHROPIC_API_KEY (2 to 3 s). "cli": nested `claude -p` (20 to 70 s, rate-limited, not recommended).
+    "model_backend": "api",             # "api": Anthropic Messages API, Haiku, one JSON judgement (2 to 3 s). "jev": TypeSafe Jev, one narrow question per number, term and sentence (about 1 s per request). "cli": nested `claude -p`, not recommended.
+    "jev_model": "jev-latest",
     "model": "claude-haiku-4-5",
     "model_min_words": {"terminal": 150, "doc": 60, "external": 25},
     "model_timeout": 40,
@@ -168,7 +170,7 @@ DEFAULTS = {
         "max_paragraph_sentences": 3,
         "max_bullet_sentences": 2,
         "inline_list_min_items": 3,
-        "ban_semicolons": True,
+        "max_semicolons_per_sentence": 1,   # more than this is flagged, never denied. Semicolons are normal, chains are not.
         "ban_em_dashes": True,
         "flag_fact_parentheses": True
     },
@@ -237,8 +239,8 @@ def rule_breaks(raw, is_html=False, cfg=None):
                 out.append((f"sentence of {n} words", s[:90]))
             if s.count(",") > R["max_commas"]:
                 out.append((f"{s.count(',')} commas in one sentence", s[:90]))
-            if R["ban_semicolons"] and ";" in s:
-                out.append(("semicolon", s[:90]))
+            if s.count(";") > R.get("max_semicolons_per_sentence", 1):
+                out.append((f"{s.count(';')} semicolons in one sentence", s[:90]))
             if R["ban_em_dashes"] and ("—" in s or "–" in s):
                 out.append(("em-dash or en-dash", s[:90]))
             _, issues, _ = p.check_sentence(s, kind == "bullet")
@@ -338,6 +340,96 @@ def _parse_json_text(txt):
     i, j = txt.find("{"), txt.rfind("}")
     return json.loads(txt[i:j + 1]) if i >= 0 else None
 
+
+# ---------------- Jev backend (TypeSafe System One API), opt-in ----------------
+def _jev_key():
+    k = os.environ.get("TYPESAFE_API_KEY")
+    if k: return k.strip()
+    for p in (os.path.join(CFG_DIR, "typesafe.key"), os.path.expanduser("~/.config/typesafe/.env")):
+        if os.path.exists(p):
+            for line in open(p):
+                line = line.strip()
+                if line.startswith("TYPESAFE_API_KEY="): return line.split("=", 1)[1].strip().strip('"')
+                if line and "=" not in line: return line
+    return None
+
+def _jev_call(key, state, questions, cfg):
+    body = json.dumps({"state": state, "model": cfg.get("jev_model", "jev-latest"), "questions": questions}).encode()
+    req = urllib.request.Request("https://api.typesafe.ai/v1/systemone", data=body, method="POST",
+                                 headers={"content-type": "application/json", "authorization": "Bearer " + key})
+    with urllib.request.urlopen(req, timeout=cfg.get("model_timeout", 25)) as resp:
+        return json.loads(resp.read())["answers"]
+
+def _noul(q, yes, no): return {"type": "noul", "instructions": q, "criteria": {"true": yes, "false": no}}
+
+def _jev_sentences(text):
+    p = ps(); out = []
+    for kind, block in p.paragraphs(strip(text)):
+        if kind in ("heading", "label"): continue
+        out += [x for x in p.sentences(block) if 4 <= p.words(x) <= 60]
+    return out[:70]
+
+def _jev_numbers(sents):
+    items = []
+    for x in sents:
+        cs = re.sub(r"0x[0-9a-fA-F…]+|v\d+(?:\.\d+)+|ERC-\d+|EIP-\d+|#\d+|\b\d{1,2} (?:January|February|March|April|May|June|July|August|September|October|November|December)\b|section \d+", "", x)
+        for m in re.finditer(r"(?<![\w.])\$?\d[\d,]*(?:\.\d+)?\s?(?:%|x|percent|k|M|bps)?(?![\w.])", cs):
+            items.append((x, m.group(0).strip()))
+    return items[:30]
+
+def _jev_terms(text, cfg):
+    t2 = re.sub(r"```.*?```", " ", text, flags=re.S); t2 = re.sub(r"https?://\S+|0x[0-9a-fA-F…]+", " ", t2)
+    wl = set(cfg.get("acronym_whitelist", []))
+    c = set(re.findall(r"\b[A-Z][a-zA-Z0-9]+(?: [A-Z][a-zA-Z0-9]+){1,3}\b", t2)) | set(re.findall(r"\b[A-Z]{3,6}\b", t2)) | set(re.findall(r"\b[A-Z][a-z]+[A-Z][A-Za-z]+\b", t2))
+    starters = ("The ", "Your ", "Our ", "My ", "This ", "That ", "These ", "First ", "Second ", "New ", "Old ")
+    return sorted(x for x in c if x not in wl and not x.startswith(starters) and not re.fullmatch(r"[A-Z][a-z]+", x))[:40]
+
+def jev_check(text, cfg, surface):
+    """Per-span judgements from Jev, folded into the same shape as the Anthropic backend. Never raises."""
+    key = _jev_key()
+    if not key: return {"skipped": "no TYPESAFE_API_KEY, ~/.config/slopcheck/typesafe.key or ~/.config/typesafe/.env"}
+    t0 = time.time(); reader = cfg["reader_profile"]; out = {"sensational_spans": [], "unexplained_terms": [], "bare_numbers": [], "metaphors": [], "coy_references": []}
+    try:
+        S = _jev_sentences(text)
+        for start in range(0, len(S), 35):
+            ch = S[start:start + 35]; q = {}
+            for i in range(len(ch)):
+                q[f"a{i}"] = _noul(f"Does `sentences[{i}]` use words that claim completion, mastery, or achievement for work that may still be in progress: decided, converged, shipped, fully torn down, intel, diligence, nailed, breakthrough?", "At least one such word describes the work.", "Plain verbs, or no work is described.")
+                q[f"m{i}"] = _noul(f"Does `sentences[{i}]` use a decorative metaphor or flourish that a plain engineer would not write, where a literal phrase was available?", "A figurative phrase chosen for effect. Ordinary technical idiom such as a hook fires or a service sits behind a proxy does not count.", "No figurative language beyond ordinary technical idiom.")
+                q[f"d{i}"] = _noul(f"Is `sentences[{i}]` a dramatic label, slogan, or inflated claim rather than a plain statement of fact?", "Dramatic, inflated, or tabloid in tone.", "A plain informative sentence.")
+            a = _jev_call(key, {"sentences": ch}, q, cfg)
+            for i, x in enumerate(ch):
+                if a[f"a{i}"]["noul"] >= 0.5 or a[f"d{i}"]["noul"] >= 0.7: out["sensational_spans"].append(x[:120])
+                if a[f"m{i}"]["noul"] >= 0.5: out["metaphors"].append(x[:120])
+        nums = _jev_numbers(S)
+        if nums:
+            a = _jev_call(key, {"items": [{"sentence": x, "number": n} for x, n in nums]},
+                          {f"n{i}": _noul(f"Does `items[{i}].sentence` say what the number `items[{i}].number` counts, its unit or population, and over what scope, such as a period, market or group?", "The sentence states what the number counts and its scope.", "The number appears without what it counts or without its scope.") for i in range(len(nums))}, cfg)
+            out["bare_numbers"] = [n for i, (x, n) in enumerate(nums) if a[f"n{i}"]["noul"] < 0.4]
+        T = _jev_terms(text, cfg)
+        if T:
+            q = {}
+            for i in range(len(T)):
+                q[f"k{i}"] = _noul(f"Would `reader` already know what `terms[{i}]` means, without it being explained?", "The reader knows this term from general engineering or common English.", "The reader would need it explained: it is company-internal, a product name, slang, or field-specific jargon.")
+                q[f"e{i}"] = _noul(f"Does `text` explain or define `terms[{i}]` at or near the place it first appears, with a gloss, an appositive, a parenthesis, or a sentence saying what it is?", "The text tells the reader what the term means near its first use.", "The term is used as if already understood.")
+            a = _jev_call(key, {"text": text[:12000], "reader": reader, "terms": T}, q, cfg)
+            out["unexplained_terms"] = [T[i] for i in range(len(T)) if a[f"k{i}"]["noul"] < 0.5 and a[f"e{i}"]["noul"] < 0.5]
+        a = _jev_call(key, {"text": text[:12000], "reader": reader}, {
+            "sensational": _noul("Does `text` use dramatic or inflated language: words that make findings sound bigger than they are, or completion claimed for unfinished work?", "Dramatic labels or inflated framing present.", "Flat and factual."),
+            "braggy": _noul("Does `text` praise its own work or inflate its achievements?", "Self-congratulation or inflation present.", "Work is reported without evaluating it."),
+            "named": _noul("Does `text` name the specific company, product, venue, or source it refers to, rather than hinting at it?", "Specific names are given, or nothing needs naming.", "Something is hinted at without being named."),
+            "final_state": _noul("Does `text` report the current state and conclusions rather than the history of how the work went?", "It says what is true now and what follows.", "It narrates what was tried, in order, like a log."),
+            "verdict_first": _noul("Does `text` state its main conclusion, answer, or the thing that was measured within the first two sentences or the first bullet?", "The answer or measured fact comes first.", "Background or reasoning comes first.")}, cfg)
+        out["sensational"] = round(max(a["sensational"]["noul"], a["braggy"]["noul"]), 2)
+        if a["named"]["noul"] < 0.5: out["coy_references"] = ["the text hints at something without naming it (whole-text judgement)"]
+        out["log_not_state"] = round(1 - a["final_state"]["noul"], 2); out["verdict_first"] = round(a["verdict_first"]["noul"], 2)
+        out["_seconds"] = round(time.time() - t0, 1); out["_model"] = cfg.get("jev_model", "jev-latest"); out["_cost_usd"] = None
+        return out
+    except urllib.error.HTTPError as e:
+        return {"skipped": f"TypeSafe API HTTP {e.code}"}
+    except Exception as e:
+        return {"skipped": f"{type(e).__name__}: {str(e)[:100]}"}
+
 def model_check(text, cfg, surface):
     """One structured judgement from a small Claude model. Never raises. Returns dict, or {"skipped": reason}."""
     if not cfg.get("model_check", False): return {"skipped": "model_check off"}
@@ -345,6 +437,7 @@ def model_check(text, cfg, surface):
     words = len(text.split())
     if words < cfg.get("model_min_words", {}).get(surface, 60): return {"skipped": f"under {cfg['model_min_words'][surface]} words"}
     backend = cfg.get("model_backend", "api"); t0 = time.time()
+    if backend == "jev": return jev_check(text, cfg, surface)
     try:
         if backend == "api":
             key = _api_key()
@@ -391,8 +484,9 @@ def check(raw, surface="terminal", is_html=False, cfg=None):
     model = model_check(plain, cfg, surface)
     terms = (terms_to_check(raw, cfg) if surface != "terminal" else terms_to_check(raw, cfg)[:6]) if "skipped" in model else []
     words = len(raw.split())
+    hard_breaks = [b for b in breaks if "semicolons" not in b[0]]
     return {"words": words, "breaks": breaks, "flags": flags, "terms": terms, "model": model,
-            "hard": bool(breaks) or any(h for _, _, h in flags) or model_hard(model)}
+            "hard": bool(hard_breaks) or any(h for _, _, h in flags) or model_hard(model)}
 
 def one_line(r):
     parts = []
@@ -491,7 +585,7 @@ def hook_stop():
         return
     r = check(text, "terminal", cfg=cfg); rep = report(r); _save_last(rep)
     out = {"systemMessage": one_line(r)}
-    chars = [b for b in r["breaks"] if b[0] in ("em-dash or en-dash", "semicolon")]
+    chars = [b for b in r["breaks"] if b[0] == "em-dash or en-dash"]
     mode = cfg.get("stop_mode", "advise")
     if not inp.get("stop_hook_active") and ((mode == "block-once" and r["breaks"]) or (mode == "block-chars" and chars)):
         out["decision"] = "block"
@@ -540,14 +634,12 @@ def _collect_text(obj, depth=0):
     return found
 
 def char_bans(fields, cfg):
-    """Rules that hold at any length: em-dash, en-dash between words, semicolon. Returns list of (kind, key, snippet)."""
+    """The one rule that holds at any length in any field: no em-dash or en-dash. Code spans and fences are ignored. Returns (kind, key, snippet)."""
     R = cfg["rules"]; out = []
     for k, v in fields:
-        body = re.sub(r"`[^`\n]*`", " ", v)
+        body = re.sub(r"```.*?```", " ", v, flags=re.S); body = re.sub(r"`[^`\n]*`", " ", body)
         if R["ban_em_dashes"] and ("—" in body or "–" in body):
             out.append(("em-dash or en-dash", k, v[:90]))
-        if R["ban_semicolons"] and ";" in body:
-            out.append(("semicolon", k, v[:90]))
     return out
 
 def hook_pre_send():
@@ -568,11 +660,11 @@ def hook_pre_send():
     if cfg.get("block_external", True) and (bans or r["hard"]):
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                           "permissionDecisionReason": f"Style check denied this {tool} call. This text goes to other people, so the writing rules apply in full, in every field including titles. Fix the items below in the draft and call the tool again.\n\n{rep}"}}))
-    elif r["flags"] or r["terms"] or (r.get("model") and "skipped" not in r["model"]):
+    elif r["breaks"] or r["flags"] or r["terms"] or (r.get("model") and "skipped" not in r["model"]):
         print(json.dumps({"systemMessage": one_line(r) + " Allowed."}))
 
 def hook_pre_publish():
-    """PreToolUse on the Artifact tool: deny a publish when the file breaks a character rule (dash, semicolon). Other breaks stay advisory."""
+    """PreToolUse on the Artifact tool: deny a publish when the page prose has an em-dash or en-dash. Other breaks stay advisory."""
     cfg = config(); inp = _read_stdin_json()
     if is_off() or os.environ.get("SLOPCHECK_INNER"): return
     ti = inp.get("tool_input") or {}
@@ -582,11 +674,11 @@ def hook_pre_publish():
     text = open(fp, encoding="utf-8", errors="replace").read()
     is_html = fp.lower().endswith((".html", ".htm"))
     r = check(text, "doc", is_html=is_html, cfg=cfg)
-    dashes = [(k, snip) for k, snip in r["breaks"] if k in ("em-dash or en-dash", "semicolon")]
+    dashes = [(k, snip) for k, snip in r["breaks"] if k == "em-dash or en-dash"]
     rep = report(r); _save_last(rep)
     if dashes:
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-                          "permissionDecisionReason": f"Style check denied publishing {os.path.basename(fp)}: {len(dashes)} dash or semicolon breaks in the page text (quoted samples inside <figure> and <table> are not counted). Fix them and publish again.\n\n{rep}"}}))
+                          "permissionDecisionReason": f"Style check denied publishing {os.path.basename(fp)}: {len(dashes)} dash breaks in the page text (quoted samples inside <figure> and <table> are not counted). Fix them and publish again.\n\n{rep}"}}))
     elif r["breaks"] or r["flags"]:
         print(json.dumps({"systemMessage": f"Style check on {os.path.basename(fp)} before publish: {len(r['breaks'])} rule breaks, {len(r['flags'])} style flags. Allowed."}))
 
@@ -614,8 +706,56 @@ def external_matcher(cfg):
     parts = full + ([f"mcp__.*__({'|'.join(suffixes)})"] if suffixes else [])
     return "|".join(parts)
 
-def install(dry_run=False):
-    """Wire hook-stop, hook-post-write and hook-pre-send into ~/.claude/settings.json. Idempotent. Backs up first."""
+def reminder_line(cfg):
+    R = cfg["rules"]
+    return (f"echo 'Writing rules: sentences under {R['max_sentence_words']} words, at most {R['max_commas']} commas, "
+            f"{R['inline_list_min_items']} or more items = a bulleted list under a colon line, paragraphs of at most {R['max_paragraph_sentences']} sentences, "
+            "one idea per paragraph, no em-dashes or en-dashes, at most one semicolon per sentence, no fact-carrying parentheses. "
+            "Explain every internal term once, give every number its scope, name things, plain verbs for unfinished work, mark what is uncertain. "
+            "Before any message over 150 words or any text for other people: pipe the draft through slopcheck --stdin --surface doc and fix what it names.'")
+
+MARK_START = "<!-- slopcheck rules: managed by `slopcheck install`, removed by `slopcheck uninstall` -->"
+MARK_END = "<!-- /slopcheck rules -->"
+
+def rules_text():
+    tpl = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "references", "rules-template.md")
+    if not os.path.exists(tpl): return None
+    t = open(tpl).read(); m = re.search(r"```markdown\n(.*?)\n```", t, re.S)
+    return (m.group(1) if m else t).strip()
+
+def rules_block():
+    """Print the CLAUDE.md rules block from references/rules-template.md, ready to paste."""
+    t = rules_text(); print(t if t else "rules-template.md not found next to the script")
+
+def install_rules(dry_run=False):
+    """Put the rules block into ~/.claude/CLAUDE.md between markers. Keeps a block the user wrote themselves."""
+    cm = os.path.expanduser("~/.claude/CLAUDE.md"); block = rules_text()
+    if not block: return "rules: template not found, nothing written"
+    existing = open(cm).read() if os.path.exists(cm) else ""
+    if MARK_START in existing and MARK_END in existing:
+        new = re.sub(re.escape(MARK_START) + r".*?" + re.escape(MARK_END), MARK_START + "\n" + block + "\n" + MARK_END, existing, flags=re.S)
+        action = "rules: refreshed the managed block in ~/.claude/CLAUDE.md"
+    elif "slopcheck" in existing:
+        return "rules: ~/.claude/CLAUDE.md already mentions slopcheck, left as it is (your own block)"
+    else:
+        new = existing.rstrip("\n") + ("\n\n" if existing.strip() else "") + MARK_START + "\n" + block + "\n" + MARK_END + "\n"
+        action = "rules: appended the managed block to ~/.claude/CLAUDE.md (edit the reader line)"
+    if not dry_run:
+        os.makedirs(os.path.dirname(cm), exist_ok=True)
+        if existing: shutil.copy(cm, cm + ".bak-" + time.strftime("%Y%m%d-%H%M%S"))
+        open(cm, "w").write(new)
+    return action
+
+def uninstall_rules():
+    cm = os.path.expanduser("~/.claude/CLAUDE.md")
+    if not os.path.exists(cm): return
+    t = open(cm).read()
+    if MARK_START in t and MARK_END in t:
+        new = re.sub(r"\n*" + re.escape(MARK_START) + r".*?" + re.escape(MARK_END) + r"\n?", "\n", t, flags=re.S)
+        shutil.copy(cm, cm + ".bak-" + time.strftime("%Y%m%d-%H%M%S")); open(cm, "w").write(new); print("removed the managed rules block from ~/.claude/CLAUDE.md")
+
+def install(dry_run=False, reminder=True, rules=True):
+    """Wire the four hooks and the per-turn reminder into ~/.claude/settings.json. Idempotent. Backs up first."""
     cfg = config()
     me = os.path.abspath(__file__)
     sp = os.path.expanduser("~/.claude/settings.json")
@@ -626,11 +766,17 @@ def install(dry_run=False):
     cmd = lambda sub: {"type": "command", "command": f"python3 {me} {sub}", "timeout": 30}
     hooks["Stop"] = strip_ours(hooks.get("Stop", [])) + [{"hooks": [dict(cmd("hook-stop"), timeout=20, statusMessage="Style check")]}]
     hooks["PostToolUse"] = strip_ours(hooks.get("PostToolUse", [])) + [{"matcher": "Write|Edit", "hooks": [cmd("hook-post-write")]}]
+    ups = hooks.get("UserPromptSubmit", [])
+    has_reminder = any("slopcheck" in h.get("command", "") for e in ups for h in e.get("hooks", []))
+    if reminder and not has_reminder:
+        hooks["UserPromptSubmit"] = ups + [{"hooks": [{"type": "command", "command": reminder_line(cfg)}]}]
     matcher = external_matcher(cfg)
     hooks["PreToolUse"] = strip_ours(hooks.get("PreToolUse", [])) + [{"matcher": matcher, "hooks": [cmd("hook-pre-send")]},
                                                                       {"matcher": "Artifact", "hooks": [cmd("hook-pre-publish")]}]
     n_tools = len(cfg.get("external_tools") or EXTERNAL_TOOLS_DEFAULT)
-    plan = f"settings: {sp}\n  Stop -> hook-stop (advisory line)\n  PostToolUse Write|Edit -> hook-post-write\n  PreToolUse {n_tools} outward tool names under any MCP server -> hook-pre-send (deny, every field including titles)\n  PreToolUse Artifact -> hook-pre-publish (deny on dash or semicolon)\nconfig: {CFG_PATH}"
+    plan = f"settings: {sp}\n  Stop -> hook-stop (advisory line)\n  PostToolUse Write|Edit -> hook-post-write\n  PreToolUse {n_tools} outward tool names under any MCP server -> hook-pre-send (deny, every field including titles)\n  PreToolUse Artifact -> hook-pre-publish (deny on dash or semicolon)\n  UserPromptSubmit -> one reminder line with the rules every turn {'(kept your existing line)' if has_reminder else ''}\nconfig: {CFG_PATH}"
+    rules_msg = install_rules(dry_run) if rules else "rules: skipped (--no-rules)"
+    plan += "\n" + rules_msg
     if dry_run:
         print("dry run, nothing written\n" + plan); return
     if os.path.exists(sp):
@@ -639,6 +785,7 @@ def install(dry_run=False):
     json.dump(d, open(sp, "w"), indent=2)
     print("installed\n" + plan)
     print("Hooks reload live in Claude Code. If the style line does not appear under the next long reply, run /hooks once or restart the session.")
+    print("`slopcheck rules` prints the same block if you want to place it yourself.")
 
 def uninstall():
     sp = os.path.expanduser("~/.claude/settings.json")
@@ -650,14 +797,14 @@ def uninstall():
         n += before - len(d["hooks"][ev])
         if not d["hooks"][ev]: del d["hooks"][ev]
     shutil.copy(sp, sp + ".bak-" + time.strftime("%Y%m%d-%H%M%S")); json.dump(d, open(sp, "w"), indent=2)
-    print(f"removed {n} hook entries")
+    print(f"removed {n} hook entries"); uninstall_rules()
 
 # ---------------- CLI ----------------
 def main(argv):
-    if len(argv) > 1 and argv[1] in ("hook-stop", "hook-post-write", "hook-pre-send", "hook-pre-publish", "labels", "uninstall"):
-        {"hook-stop": hook_stop, "hook-post-write": hook_post_write, "hook-pre-send": hook_pre_send, "hook-pre-publish": hook_pre_publish, "labels": labels_summary, "uninstall": uninstall}[argv[1]](); return 0
+    if len(argv) > 1 and argv[1] in ("hook-stop", "hook-post-write", "hook-pre-send", "hook-pre-publish", "labels", "uninstall", "rules"):
+        {"hook-stop": hook_stop, "hook-post-write": hook_post_write, "hook-pre-send": hook_pre_send, "hook-pre-publish": hook_pre_publish, "labels": labels_summary, "uninstall": uninstall, "rules": rules_block}[argv[1]](); return 0
     if len(argv) > 1 and argv[1] == "install":
-        install(dry_run="--dry-run" in argv); return 0
+        install(dry_run="--dry-run" in argv, reminder="--no-reminder" not in argv, rules="--no-rules" not in argv); return 0
     args = [a for a in argv[1:] if not a.startswith("--")]
     surface = "terminal"
     if "--surface" in argv: surface = argv[argv.index("--surface") + 1]; args = [a for a in args if a != surface]
