@@ -361,6 +361,40 @@ Please grab this talk from ChatGPT: https://chatgpt.com/c/<uuid> (probably need 
 Pull this ChatGPT conversation's JSON via the API route, with all the attachments
 ```
 
+### [slopcheck](skills/slopcheck/SKILL.md)
+
+Keeps an agent's writing readable for one specific reader, as a named list of rule breaks instead of a score. A standard-library Python checker plus four Claude Code hooks:
+
+- one advisory line under every reply of 60 words or more
+- the named list into the agent's context after it writes any document
+- a deny gate on publishing an artifact whose prose has a dash or a semicolon
+- a deny gate on Slack, pull-request, Linear and Notion text until the list is empty
+
+Checks sentence length, comma count, semicolons, em-dashes, lists run inline, paragraph and bullet length, fact-carrying parentheses, achievement words for unfinished work, agreement openers, sign-post phrases, contrast frames, and an advisory list of terms whose first use has no gloss. An optional model layer through the Anthropic API adds inflation, unexplained jargon, bare numbers and metaphors.
+
+#### Example ask
+
+```
+Install slopcheck and enforce my writing rules on final messages, docs and Slack drafts.
+```
+
+#### Example output
+
+```
+Style check: 3 rule breaks: sentence of N words, list of N or more run inline, paragraph of N sentences. 1 style flag: achievement word.
+Rule breaks:
+  - sentence of 41 words: "The new service handles retries, batching, backoff and metrics, and it also owns the schema mi"
+  - list of 3 or more run inline: "The new service handles retries, batching, backoff and metrics, and it also owns the schema mi"
+  - paragraph of 5 sentences: "The rollout starts on Monday."
+Style flags:
+  - achievement word "shipped": "We shipped the migration last week and the dashboards converged"
+```
+
+#### Install
+
+Symlink `skills/slopcheck/scripts/slopcheck` and `scripts/slopmark` onto your PATH, then run `slopcheck install`. It backs up `~/.claude/settings.json` and wires the four hooks. The full steps and the config are in the skill.
+
+
 ## Install / use
 
 ### Cursor
