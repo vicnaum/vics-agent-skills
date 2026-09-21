@@ -275,6 +275,39 @@ def compute_active_chain_tokens(objects, uuid_index=None):
     return estimate_tokens(total_chars)
 
 
+def _context_fields_total(u):
+    return ((u.get("input_tokens") or 0)
+            + (u.get("cache_read_input_tokens") or 0)
+            + (u.get("cache_creation_input_tokens") or 0))
+
+
+def _usage_context_total(u):
+    """Largest context size this usage record claims, top-level or nested.
+
+    CC 2.1.27x reads the gauge from ``usage.iterations[]`` (per-API-call
+    counts), so a record whose top-level fields look small can still pin the
+    meter at the pre-strip size.
+    """
+    total = _context_fields_total(u)
+    for it in u.get("iterations") or []:
+        if isinstance(it, dict):
+            total = max(total, _context_fields_total(it))
+    return total
+
+
+def _pin_usage(u, target):
+    u["input_tokens"] = target
+    u["cache_read_input_tokens"] = 0
+    u["cache_creation_input_tokens"] = 0
+    if "iterations" in u:
+        u["iterations"] = None
+    cc = u.get("cache_creation")
+    if isinstance(cc, dict):
+        for k in cc:
+            if isinstance(cc[k], (int, float)):
+                cc[k] = 0
+
+
 def reset_usage_metadata(objects, target_tokens):
     """Rewrite assistant ``usage`` so CC's context gauge reflects reality.
 
@@ -290,8 +323,9 @@ def reset_usage_metadata(objects, target_tokens):
     ``target_tokens`` down to ``target_tokens`` (it never inflates a smaller
     turn), and pins the active chain's final assistant turn to exactly
     ``target_tokens`` — even if that turn recorded 0 (e.g. a blocked
-    "Prompt is too long" turn). Cache fields are zeroed on touched turns; the
-    next real turn re-establishes accurate counts.
+    "Prompt is too long" turn). Cache fields are zeroed and the nested
+    ``iterations`` list is nulled on touched turns (newer CC builds read the
+    gauge from it); the next real turn re-establishes accurate counts.
 
     Returns the number of usage records modified.
     """
@@ -312,13 +346,8 @@ def reset_usage_metadata(objects, target_tokens):
         u = msg.get("usage")
         if not isinstance(u, dict):
             continue
-        total = ((u.get("input_tokens") or 0)
-                 + (u.get("cache_read_input_tokens") or 0)
-                 + (u.get("cache_creation_input_tokens") or 0))
-        if total > target:
-            u["input_tokens"] = target
-            u["cache_read_input_tokens"] = 0
-            u["cache_creation_input_tokens"] = 0
+        if _usage_context_total(u) > target:
+            _pin_usage(u, target)
             touched.add(id(obj))
 
     if leaf_obj is not None:
@@ -327,9 +356,7 @@ def reset_usage_metadata(objects, target_tokens):
         if not isinstance(u, dict):
             u = {}
             msg["usage"] = u
-        u["input_tokens"] = target
-        u["cache_read_input_tokens"] = 0
-        u["cache_creation_input_tokens"] = 0
+        _pin_usage(u, target)
         u.setdefault("output_tokens", 0)
         touched.add(id(leaf_obj))
 
