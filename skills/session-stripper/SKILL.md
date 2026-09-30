@@ -257,6 +257,7 @@ Preview:
 - Refuses if the range includes the leaf message (would orphan resume).
 - Refuses if the range contains a `tool_use` whose matching `tool_result` lives outside the range (or vice versa).
 - Idempotent: re-running on a survivor that already carries a `<persisted-range>` marker is a no-op.
+- The survivor is always rewritten as a plain **user** message (type/role `user`), whatever the range's first record was. Before 2026-09-30 it kept the first record's envelope; ranges starting at 0 usually begin on a `system/informational` (or `attachment`) record, which CC neither renders nor sends to the model — the fork resumed with the summary invisible to both Victor and the agent. Repair such an old session with `compact-range <session> --from 0 --to 0` (converts the survivor in the `.pending` copy; then `apply`).
 
 **When to use which**:
 

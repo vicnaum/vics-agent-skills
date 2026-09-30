@@ -219,5 +219,77 @@ class TestCompactRangeIdempotency(unittest.TestCase):
             path.unlink(missing_ok=True)
 
 
+def _make_first_system_informational(path: Path):
+    """Rewrite the first envelope as a CC `system/informational` record —
+    the shape real sessions often start with."""
+    envs = _envelopes(path)
+    first = envs[0]
+    text = first["message"]["content"]
+    text = text if isinstance(text, str) else text[0]["text"]
+    first.pop("message", None)
+    first["type"] = "system"
+    first["subtype"] = "informational"
+    first["level"] = "info"
+    first["content"] = [{"type": "text", "text": text}]
+    path.write_text("".join(json.dumps(e) + "\n" for e in envs))
+
+
+class TestCompactRangeSurvivorVisible(unittest.TestCase):
+    """Regression (2026-09-30): a range starting on a system record left the
+    summary on a hidden envelope that CC neither renders nor sends to the
+    model — the forked session resumed with no history at all."""
+
+    def _survivor(self, path):
+        for e in _envelopes(path):
+            if "<persisted-range" in json.dumps(e):
+                return e
+        self.fail("no survivor found")
+
+    def test_system_start_becomes_user_message(self):
+        from lib.compact_range import compact_range
+        path, _ = build_session([
+            ("user", "sys"), ("user", "a"), ("assistant", "b"),
+            ("user", "tail"), ("assistant", "leaf"),
+        ])
+        try:
+            _make_first_system_informational(path)
+            compact_range(str(path), from_pos=0, to_pos=2, summary="S",
+                          no_backup=True)
+            sv = self._survivor(path)
+            self.assertEqual(sv["type"], "user")
+            self.assertEqual(sv["message"]["role"], "user")
+            self.assertIn("Summary: S", sv["message"]["content"][0]["text"])
+            for k in ("subtype", "content", "level"):
+                self.assertNotIn(k, sv)
+            assert_chain_valid(path)
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_rerun_repairs_old_hidden_survivor(self):
+        from lib.compact_range import compact_range
+        path, _ = build_session([
+            ("user", "sys"), ("user", "a"), ("assistant", "b"),
+            ("user", "tail"), ("assistant", "leaf"),
+        ])
+        try:
+            compact_range(str(path), from_pos=0, to_pos=2, summary="S",
+                          no_backup=True)
+            # Simulate the pre-fix output: marker stranded on a system record.
+            envs = _envelopes(path)
+            for e in envs:
+                if "<persisted-range" in json.dumps(e):
+                    e["content"] = e.pop("message")["content"]
+                    e["type"], e["subtype"] = "system", "informational"
+            path.write_text("".join(json.dumps(e) + "\n" for e in envs))
+            res = compact_range(str(path), from_pos=0, to_pos=0,
+                                no_backup=True)
+            self.assertTrue(res.get("converted"))
+            sv = self._survivor(path)
+            self.assertEqual(sv["type"], "user")
+            self.assertIn("Summary: S", sv["message"]["content"][0]["text"])
+        finally:
+            path.unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
     unittest.main()

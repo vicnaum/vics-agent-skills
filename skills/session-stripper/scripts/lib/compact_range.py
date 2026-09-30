@@ -105,6 +105,33 @@ def _excerpt(obj) -> str:
     return f"[{role}] {snippet}"
 
 
+# Envelope keys that only make sense on system / attachment / tool-result /
+# assistant records; dropped when the survivor is rewritten as a user message.
+_NON_USER_KEYS = (
+    "subtype", "content", "level", "attachment", "toolUseID",
+    "toolUseResult", "sourceToolAssistantUUID", "sourceToolUseID",
+    "isMeta", "isCompactSummary", "isVisibleInTranscriptOnly",
+    "requestId", "apiError", "error", "isApiErrorMessage",
+)
+
+
+def _make_user_survivor(obj, marker: str) -> None:
+    """Rewrite `obj` in place as a visible user message carrying `marker`.
+
+    The survivor inherits the range's FIRST record, which is often a
+    `system` (e.g. subtype=informational) or `attachment` envelope. CC never
+    sends those to the model and hides them in the UI, so a summary left
+    there is silently lost on resume (incident 2026-09-30). A user message
+    is always both rendered and sent.
+    """
+    for k in _NON_USER_KEYS:
+        obj.pop(k, None)
+    obj["type"] = "user"
+    obj["message"] = {"role": "user",
+                      "content": [{"type": "text", "text": marker}]}
+    obj.setdefault("userType", "external")
+
+
 def _build_marker(from_pos: int, to_pos: int, count: int,
                   rel_dir: str, summary: str | None,
                   range_objs) -> str:
@@ -149,6 +176,19 @@ def compact_range(session_path, from_pos: int, to_pos: int,
 
     # Idempotency: single-message range that's already a <persisted-range>
     if len(range_objs) == 1 and _is_already_collapsed(range_objs[0]):
+        o = range_objs[0]
+        if o.get("type") != "user":
+            # Survivor from an older build left on a hidden envelope type:
+            # re-home the existing marker onto a user message.
+            _, content = _content_of(o)
+            old_type = o.get("type")
+            _make_user_survivor(o, content[0]["text"])
+            if not dry_run:
+                save_session(session_path, objects, create_backup=not no_backup)
+            print(f"{'[DRY RUN] ' if dry_run else ''}Range already collapsed "
+                  f"— survivor converted from {old_type!r} to user.")
+            return {"collapsed_count": 0, "chars_saved": 0,
+                    "est_tokens_saved": 0, "converted": True}
         if not dry_run:
             print("Range already collapsed — no-op.")
         return {"collapsed_count": 0, "chars_saved": 0, "est_tokens_saved": 0}
@@ -200,8 +240,8 @@ def compact_range(session_path, from_pos: int, to_pos: int,
                            summary, range_objs)
 
     # Compute survivor: the FIRST message in the range. Replace its content
-    # with the marker; leave its envelope metadata (uuid, parentUuid,
-    # timestamp, role) intact so descendants chain through it.
+    # with the marker and turn it into a plain user message; keep uuid,
+    # parentUuid and timestamp so descendants chain through it.
     survivor_uuid = range_objs[0].get("uuid")
 
     # Mutate `objects` in place: rewrite survivor's content, mark others for removal.
@@ -211,9 +251,9 @@ def compact_range(session_path, from_pos: int, to_pos: int,
     for o in objects:
         uid = o.get("uuid")
         if uid == survivor_uuid:
-            msg, content = _content_of(o)
+            _, content = _content_of(o)
             chars_before += len(json.dumps(content, ensure_ascii=False))
-            msg["content"] = [{"type": "text", "text": marker}]
+            _make_user_survivor(o, marker)
         elif uid in drop_uuids:
             chars_before += len(json.dumps(o, ensure_ascii=False))
 
