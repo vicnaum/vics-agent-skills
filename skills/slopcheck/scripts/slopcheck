@@ -170,6 +170,7 @@ DEFAULTS = {
         "max_paragraph_sentences": 3,
         "max_bullet_sentences": 2,
         "inline_list_min_items": 3,
+        "inline_list_bullet_exempt_words": 20,   # a bullet sentence under this many words may enumerate inline (e.g. "two market types, atomic and incremental")
         "max_semicolons_per_sentence": 1,   # more than this is flagged, never denied. Semicolons are normal, chains are not.
         "ban_em_dashes": True,
         "flag_fact_parentheses": True
@@ -222,6 +223,7 @@ def strip(text, is_html=False):
 def rule_breaks(raw, is_html=False, cfg=None):
     """The hard rules, from config. Returns list of (kind, snippet)."""
     p = ps(); out = []; R = (cfg or config())["rules"]
+    bullet_exempt = R.get("inline_list_bullet_exempt_words", 0)
     text = strip(raw, is_html)
     for kind, block in p.paragraphs(text):
         if kind in ("heading", "label"):
@@ -246,6 +248,8 @@ def rule_breaks(raw, is_html=False, cfg=None):
             _, issues, _ = p.check_sentence(s, kind == "bullet")
             for i in issues:
                 if i.startswith("inline list"):
+                    if kind == "bullet" and n < bullet_exempt:
+                        continue   # a short bullet is already a list item, a short enumeration inside it is fine
                     out.append((f"list of {R['inline_list_min_items']} or more run inline", s[:90]))
                 elif i == "long parenthetical" and R["flag_fact_parentheses"]:
                     out.append(("parenthesis carrying a second fact", s[:90]))
@@ -618,7 +622,10 @@ def hook_post_write():
                       "hookSpecificOutput": {"hookEventName": "PostToolUse",
                                              "additionalContext": f"Style check for {os.path.basename(fp)} (fix before publishing or finishing):\n{rep}"}}))
 
-SKIP_KEYS = ("url", "channel", "channel_id", "thread_ts", "ts", "id", "issue_id", "team_id", "project_id", "owner", "repo", "branch", "base", "head", "path", "file_path", "sha", "event", "state", "labels", "assignee")
+# Fields that hold EXISTING text being replaced or located (Notion update_content, selection-based edits).
+# That text is not being written, so it is never checked.
+OLD_TEXT_KEYS = ("old_str", "selection_with_ellipsis")
+SKIP_KEYS = OLD_TEXT_KEYS + ("url", "channel", "channel_id", "thread_ts", "ts", "id", "issue_id", "team_id", "project_id", "owner", "repo", "branch", "base", "head", "path", "file_path", "sha", "event", "state", "labels", "assignee")
 def _collect_text(obj, depth=0):
     """Every string field of the tool input, with its key. Titles and names count: a dash in a title is still a dash."""
     found = []
@@ -642,6 +649,15 @@ def char_bans(fields, cfg):
             out.append(("em-dash or en-dash", k, v[:90]))
     return out
 
+def is_notion_tool(tool_name):
+    return "notion-" in (tool_name or "")
+
+def lines_as_paragraphs(text):
+    """Notion markdown puts every block on its own line with no blank line between blocks.
+    Make each line its own paragraph so separate blocks are not counted as one paragraph. Code fences are left alone."""
+    parts = re.split(r"(```.*?```)", text, flags=re.S)
+    return "".join(x if x.startswith("```") else re.sub(r"\n(?!\n)", "\n\n", x) for x in parts)
+
 def hook_pre_send():
     cfg = config(); inp = _read_stdin_json()
     if os.environ.get("SLOPCHECK_INNER"): return
@@ -651,6 +667,8 @@ def hook_pre_send():
     if not fields: return
     bans = char_bans(fields, cfg)
     long_texts = [v for k, v in fields if len(v.split()) >= cfg["external_min_words"]]
+    if is_notion_tool(inp.get("tool_name")):
+        long_texts = [lines_as_paragraphs(v) for v in long_texts]
     r = check("\n\n".join(long_texts), "external", cfg=cfg) if long_texts else {"words": 0, "breaks": [], "flags": [], "terms": [], "model": {"skipped": "short"}, "hard": False}
     rep = report(r)
     if bans:
