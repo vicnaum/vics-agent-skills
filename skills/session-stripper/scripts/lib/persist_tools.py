@@ -558,6 +558,14 @@ def persist_tools_bulk(session_path, dry_run=False, no_backup=False,
 # ─── Thinking persistence ───────────────────────────────────────────────────
 
 
+def _thinking_weight(thinking_blocks):
+    """Characters the thinking blocks occupy in context: readable text plus the
+    encrypted `signature`. Recent sessions store thinking as near-empty text
+    with a signature of several thousand chars, so sizing by text alone
+    reports ~0 for blocks that are really most of the thinking weight."""
+    return sum(len(b["text"]) + b.get("signature_chars", 0) for b in thinking_blocks)
+
+
 def _extract_thinking_blocks(content):
     """Extract thinking blocks from a content list.
 
@@ -582,15 +590,20 @@ def _extract_thinking_blocks(content):
             continue
         btype = block.get("type")
         if btype == "thinking":
+            # Recent blocks carry near-empty `thinking` text plus an encrypted
+            # `signature` of several thousand chars. Track it separately so
+            # sizing reflects what the block actually costs (_thinking_weight).
             blocks.append({
                 "type": "thinking",
                 "text": block.get("thinking", ""),
+                "signature_chars": len(block.get("signature", "")),
                 "index": i,
             })
         elif btype == "redacted_thinking":
             blocks.append({
                 "type": "redacted_thinking",
                 "text": block.get("data", ""),
+                "signature_chars": len(block.get("signature", "")),
                 "index": i,
             })
         else:
@@ -650,8 +663,10 @@ def show_thinking(session_path, chain_pos=None, context_lines=2):
             if not thinking_blocks:
                 continue
 
-            total_chars = sum(len(b["text"]) for b in thinking_blocks)
+            total_chars = _thinking_weight(thinking_blocks)
             preview = thinking_blocks[0]["text"].replace("\n", " ").strip()[:80]
+            if not preview and any(b.get("signature_chars", 0) for b in thinking_blocks):
+                preview = "[encrypted signature only, no readable text]"
             rows.append({
                 "chain_pos": pos,
                 "thinking_chars": total_chars,
@@ -688,9 +703,13 @@ def show_thinking(session_path, chain_pos=None, context_lines=2):
         print(f"No thinking blocks at chain position {pos}.")
         return None
 
-    total_chars = sum(len(b["text"]) for b in thinking_blocks)
+    text_chars = sum(len(b["text"]) for b in thinking_blocks)
+    total_chars = _thinking_weight(thinking_blocks)
+    sig_chars = total_chars - text_chars
     est_tokens = estimate_tokens(total_chars)
     thinking_text = "\n---\n".join(b["text"] for b in thinking_blocks)
+    if not thinking_text.strip() and sig_chars:
+        thinking_text = "[encrypted signature only, no readable text]"
     message_text = _extract_message_text(content)
 
     # Context before
@@ -738,7 +757,8 @@ def show_thinking(session_path, chain_pos=None, context_lines=2):
             context_after.append(f"{ctype.capitalize()}: {text[:200]}")
 
     # Print formatted report
-    print(f"=== Thinking at chain pos {pos} ({total_chars:,} chars, ~{est_tokens:,} tokens) ===")
+    sig_note = f", of which {sig_chars:,} signature" if sig_chars else ""
+    print(f"=== Thinking at chain pos {pos} ({total_chars:,} chars{sig_note}, ~{est_tokens:,} tokens) ===")
     print()
 
     if context_before:
@@ -804,7 +824,10 @@ def persist_thinking(session_path, chain_pos, summary=None, dry_run=False, no_ba
         return None
 
     msg_uuid = obj.get("uuid", "unknown")
+    # The marker advertises the readable chars (what the sidecar holds); the
+    # savings count everything the deleted blocks occupied, signature included.
     total_chars = sum(len(b["text"]) for b in thinking_blocks)
+    removed_chars = _thinking_weight(thinking_blocks)
     thinking_text = "\n---\n".join(b["text"] for b in thinking_blocks)
 
     # New layout: <sessionId>/persisted/thinking/<msg_uuid>.txt
@@ -814,13 +837,15 @@ def persist_thinking(session_path, chain_pos, summary=None, dry_run=False, no_ba
     marker_text = _build_thinking_marker(rel, total_chars, summary, thinking_text)
 
     print(f"Chain pos {pos} (uuid: {msg_uuid})")
-    print(f"Thinking: {total_chars:,} chars ({len(thinking_blocks)} block(s))")
+    sig_chars = removed_chars - total_chars
+    sig_note = f" + {sig_chars:,} signature chars" if sig_chars else ""
+    print(f"Thinking: {total_chars:,} chars{sig_note} ({len(thinking_blocks)} block(s))")
     print(f"Persist to: {sidecar}")
     if summary:
         print(f"Summary: {summary}")
 
     if dry_run:
-        chars_saved = max(0, total_chars - len(marker_text))
+        chars_saved = max(0, removed_chars - len(marker_text))
         print(f"Would save ~{chars_saved:,} chars")
         print("\n[dry run] No changes written.")
     else:
@@ -843,7 +868,7 @@ def persist_thinking(session_path, chain_pos, summary=None, dry_run=False, no_ba
         "original_chars": total_chars,
         "summary_provided": summary is not None,
         "persist_path": str(sidecar),
-        "chars_saved": max(0, total_chars - len(marker_text)),
+        "chars_saved": max(0, removed_chars - len(marker_text)),
     }
 
 
@@ -894,7 +919,8 @@ def persist_thinking_bulk(session_path, dry_run=False, no_backup=False,
                 continue
 
         msg_uuid = obj.get("uuid", "unknown")
-        total_chars = sum(len(b["text"]) for b in thinking_blocks)
+        total_chars = sum(len(b["text"]) for b in thinking_blocks)  # marker / sidecar
+        removed_chars = _thinking_weight(thinking_blocks)           # leaves context
         thinking_text = "\n---\n".join(b["text"] for b in thinking_blocks)
 
         # Use the new contract dir + relative-path marker.
@@ -917,7 +943,7 @@ def persist_thinking_bulk(session_path, dry_run=False, no_backup=False,
                 content.insert(0, {"type": "text", "text": marker_text})
                 _set_content(obj, content)
 
-        chars_saved = max(0, total_chars - len(marker_text))
+        chars_saved = max(0, removed_chars - len(marker_text))
         stats["persisted_count"] += 1
         stats["chars_saved"] += chars_saved
         stats["persisted_positions"].append(pos)

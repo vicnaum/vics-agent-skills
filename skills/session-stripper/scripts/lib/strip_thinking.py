@@ -91,11 +91,16 @@ def strip_thinking(session_path, dry_run=False, no_backup=False, from_pos=None, 
             block_type = block.get("type")
             wrapped = wrapped_thinking_text(block)
             if block_type in ("thinking", "redacted_thinking"):
-                # Count chars from the text payload
+                # Count the text payload AND the encrypted `signature`. Recent
+                # sessions store thinking as near-empty text plus a signature
+                # of several thousand chars, so counting text alone reported
+                # ~0 saved while the strip removed six figures of characters.
+                # (The off-chain tally above stays text-only on purpose: those
+                # blocks are not removed, see test_strip_thinking_offchain.)
                 if block_type == "thinking":
-                    chars_saved += len(block.get("thinking", ""))
+                    chars_saved += len(block.get("thinking", "")) + len(block.get("signature", ""))
                 elif block_type == "redacted_thinking":
-                    chars_saved += len(block.get("data", ""))
+                    chars_saved += len(block.get("data", "")) + len(block.get("signature", ""))
                 thinking_cleared += 1
                 msg_modified = True
             elif wrapped is not None:
