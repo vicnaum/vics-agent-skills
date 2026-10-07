@@ -128,9 +128,13 @@ def _prepare_target(args, operation: str):
     untouched original IS the backup), so backups are disabled; `apply` makes
     the one real .bak at swap time.
     """
+    from lib.pending import is_pending, ensure_pending, pending_path, original_of
+    # The live file whose history produced the thinking signatures. The
+    # preserved-thinking step compares the result against it (run_command).
+    args._pt_source = str(original_of(args.session) if is_pending(args.session)
+                          else args.session)
     if getattr(args, "fork", False):
         return _maybe_fork(args, operation)
-    from lib.pending import is_pending, ensure_pending, pending_path
     if is_pending(args.session):
         args.no_backup = True
         return args.session
@@ -148,6 +152,79 @@ def _prepare_target(args, operation: str):
     args.session = str(pending)
     args.no_backup = True
     return args.session
+
+
+def _preview_result_via_copy(args):
+    """Dry-run helper: run the same command for real on a throwaway copy of
+    its target, silently, and return the path of the would-be result (plus the
+    temp dir to delete). None when the command cannot run that way."""
+    import contextlib
+    import io
+    import shutil
+    import tempfile
+    tmp = Path(tempfile.mkdtemp(prefix="ss-preview-"))
+    copy_path = tmp / Path(args.session).name
+    shutil.copy2(args.session, copy_path)
+    clone = argparse.Namespace(**vars(args))
+    clone.session = str(copy_path)
+    clone.dry_run = False
+    clone.fork = False
+    clone.no_backup = True
+    clone.no_usage_reset = True
+    if hasattr(clone, "output"):
+        clone.output = None  # compact: write next to the copy, never to a user path
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            clone.func(clone)
+    except BaseException:  # noqa: BLE001 - incl. SystemExit from refusals
+        shutil.rmtree(tmp, ignore_errors=True)
+        return None, None
+    return getattr(clone, "_pt_result", None) or clone.session, tmp
+
+
+def _preserved_thinking_step(args):
+    """After any mutating command: on models with preserved thinking, find the
+    surviving thinking blocks the edit invalidated (the API drops them,
+    unbilled) and, unless --keep-dropped-thinking, remove them from the file
+    so it matches what the model sees. Dry runs only report."""
+    source = getattr(args, "_pt_source", None)
+    if not source:
+        return
+    from lib.preserved_thinking import analyze_paths, format_report
+    keep = getattr(args, "keep_dropped_thinking", False)
+    tmp = None
+    try:
+        if args.dry_run:
+            result, tmp = _preview_result_via_copy(args)
+            if result is None:
+                return
+        else:
+            result = getattr(args, "_pt_result", None) or args.session
+        report = analyze_paths(source, result)
+    finally:
+        if tmp is not None:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+    lines = format_report(report, will_remove=not keep, dry_run=args.dry_run)
+    if not lines:
+        return
+    print()
+    for line in lines:
+        print(line)
+    if args.dry_run or keep:
+        return
+    print()
+    strip_thinking(result, dry_run=False, no_backup=True,
+                   from_pos=report["first_pos"])
+    _reset_usage_after_strip(result, False,
+                             enabled=not getattr(args, "no_usage_reset", False))
+
+
+def run_command(args):
+    """Run a parsed command, then the preserved-thinking step."""
+    args.func(args)
+    _preserved_thinking_step(args)
 
 
 def _hint_pending(session):
@@ -289,8 +366,9 @@ def cmd_reset_usage(args):
 
 def cmd_compact(args):
     """Compact messages before a given chain position."""
+    args._pt_source = args.session  # for the preserved-thinking step
     _maybe_fork(args, f"compact --before {args.before}")  # compact writes a NEW file; no in-place write to redirect
-    compact_before(
+    stats = compact_before(
         args.session,
         before_pos=args.before,
         dry_run=args.dry_run,
@@ -298,6 +376,8 @@ def cmd_compact(args):
         output_path=args.output,
         slug=args.slug,
     )
+    if stats and stats.get("output_path") and not args.dry_run:
+        args._pt_result = stats["output_path"]
 
 
 def cmd_verify(args):
@@ -502,6 +582,11 @@ def add_common_args(parser):
     parser.add_argument("session", help="Path to session JSONL file")
     parser.add_argument("--dry-run", action="store_true", help="Report only, don't modify")
     parser.add_argument("--no-backup", action="store_true", help="Skip .bak backup creation")
+    parser.add_argument("--keep-dropped-thinking", action="store_true",
+                        help="On models with preserved thinking (Fable 5.1, Opus 5.5, "
+                             "Sonnet 5.5, Haiku 5.5), keep the later thinking blocks an "
+                             "edit invalidates. Default: remove them, since the API "
+                             "drops them anyway")
 
 
 def add_fork_args(parser):
@@ -853,7 +938,7 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    args.func(args)
+    run_command(args)
 
 
 if __name__ == "__main__":

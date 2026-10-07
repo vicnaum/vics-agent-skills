@@ -109,6 +109,32 @@ To fix this, `strip-tools`, `strip-thinking`, and `strip-all` now **automaticall
 
 > **The gauge can only lie in your favour.** Because the reset writes an *estimate* into the JSONL, a session that was barely stripped will still show a reassuring number — and then snap back to ~100% on the first real turn, which is the only number that was ever measured. If a strip freed little, the meter dropping is not evidence that it worked. Check what `analyze` says is left, and treat a real API turn (one with non-zero `cache_read`/`cache_creation`) as the only ground truth. Attachments were excluded from this estimate until they were found to be worth six figures of tokens on long sessions — that omission made the gauge read far below the true prompt size.
 
+### Preserved thinking: an edit drops every later thinking block
+
+On Claude Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5, each thinking block's `signature` binds it to the history before it. It also binds it to the previous thinking block.
+
+If you edit an earlier turn, the API drops every later thinking block. Claude Code runs the API in drop mode, so the request still succeeds, unbilled. The model just continues without that reasoning.
+
+**Safe:** removing thinking blocks from the front of the history, as in `strip-thinking --from 0 --to N`.
+
+**Drops every later thinking block:**
+
+- clearing tool results or tool inputs
+- persisting tools, text, messages or ranges
+- dropping attachments
+- compacting a range or the whole front
+- removing a thinking block from the middle
+
+**Every mutating command handles this for you.** The code is in `lib/preserved_thinking.py`, and `run_command` calls it after each command:
+
+- It compares the live original with the result. It prints how many later thinking blocks the API will drop, their size, and the first chain position.
+- Dry runs preview this by running the command silently on a throwaway copy.
+- By default it removes those blocks from the result. The file and the context gauge then match what the model actually sees.
+- `--keep-dropped-thinking` keeps them. They cost no tokens either way.
+- Older models such as Opus 4.8 don't run the check, and neither does Claude Mythos 5.1. The step stays silent for them.
+
+**Practical rule: strip once, and deeply.** Each mid-session strip wipes the reasoning built up since the previous one.
+
 ## What Gets Stripped
 
 | Target | Impact | Command |
