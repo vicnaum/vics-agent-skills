@@ -77,8 +77,26 @@ detect_term() {
   elif [ -n "${ITERM_SESSION_ID:-}" ]; then
     echo "iterm ${ITERM_SESSION_ID#*:}"
   else
-    echo "none -"
+    detect_term_from_ancestors
   fi
+}
+
+# Fallback when our own env was scrubbed (Codex `shell_environment_policy.inherit = "core"`
+# drops ITERM_SESSION_ID/TMUX_PANE from tool shells): walk the parent chain and read the
+# terminal id from the first ancestor that still carries it (the codex/claude process itself,
+# or the Codex app-server daemon, which inherits the TUI's environment).
+detect_term_from_ancestors() {
+  local pid=$$ env depth=0 pane iterm
+  while [ "$pid" -gt 1 ] && [ "$depth" -lt 12 ]; do
+    env=$(ps eww -o command= -p "$pid" 2>/dev/null | tr ' ' '\n')
+    pane=$(printf '%s\n' "$env" | sed -n 's/^TMUX_PANE=//p' | head -n1)
+    if [ -n "$pane" ] && printf '%s\n' "$env" | grep -q '^TMUX='; then echo "tmux $pane"; return; fi
+    iterm=$(printf '%s\n' "$env" | sed -n 's/^ITERM_SESSION_ID=//p' | head -n1)
+    if [ -n "$iterm" ]; then echo "iterm ${iterm#*:}"; return; fi
+    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' '); [ -n "$pid" ] || break
+    depth=$((depth+1))
+  done
+  echo "none -"
 }
 
 valid_room() { printf '%s' "$1" | grep -Eq '^-?[A-Za-z0-9][A-Za-z0-9_-]{0,128}$'; }
@@ -557,8 +575,11 @@ agent_state() {
   read -r tb ta <<< "$(agent_term "$name" 2>/dev/null)" || { printf 'unknown\tno-terminal\n'; return; }
   tty=$(agent_tty "$tb" "$ta")
   [ -n "$tty" ] || { printf 'offline\twindow/pane closed\n'; return; }
-  if ! ps -t "${tty#/dev/}" -o command= 2>/dev/null | grep -qE '^ *(\S*/)?(claude|node)( |$)|claude'; then
-    printf 'dead\tno claude process on tty (crashed/exited)\n'; return
+  # Claude Code shows up as `claude` (or `node .../claude`); Codex as `codex`. Since Codex 0.161
+  # the TUI's helpers live in a detached app-server daemon, so `codex` may be the ONLY process
+  # on the tty — it must match on its own.
+  if ! ps -t "${tty#/dev/}" -o command= 2>/dev/null | grep -qE '^ *(\S*/)?(claude|codex|node)( |$)|claude|codex'; then
+    printf 'dead\tno claude/codex process on tty (crashed/exited)\n'; return
   fi
   title=$(term_title "$tb" "$ta"); g=$(glyph_state "$title")
   hstate=""; if [ -f "$STATUS/$name" ]; then read -r hstate hepoch < "$STATUS/$name"; fi
@@ -889,8 +910,11 @@ cmd_setup_codex() {
     echo "  $ev: installed"
     added=1
   done
-  if ! grep -q '^plugin_hooks *= *true' "$HOME/.codex/config.toml" 2>/dev/null; then
-    echo "WARNING: 'plugin_hooks = true' not found in ~/.codex/config.toml — hooks may not run without it."
+  # Codex >= 0.161 ships hooks as a stable, always-on feature; the old
+  # `plugin_hooks` feature flag is removed and only produces an
+  # "unrecognized configuration setting" warning if left in config.toml.
+  if grep -q '^plugin_hooks *= *true' "$HOME/.codex/config.toml" 2>/dev/null; then
+    echo "NOTE: 'plugin_hooks = true' in ~/.codex/config.toml is a removed flag (Codex >= 0.161) — delete the line to silence the startup warning."
   fi
   echo
   if [ "$added" = 1 ]; then
