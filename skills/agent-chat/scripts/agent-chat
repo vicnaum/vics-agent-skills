@@ -1389,12 +1389,10 @@ cmd_setup_codex() {
     echo "  $ev: installed"
     added=1
   done
-  # Codex >= 0.161 ships hooks as a stable, always-on feature; the old
-  # `plugin_hooks` feature flag is removed and only produces an
-  # "unrecognized configuration setting" warning if left in config.toml.
-  if grep -q '^plugin_hooks *= *true' "$HOME/.codex/config.toml" 2>/dev/null; then
-    echo "NOTE: 'plugin_hooks = true' in ~/.codex/config.toml is a removed flag (Codex >= 0.161) — delete the line to silence the startup warning."
-  fi
+  # No feature flag is needed. `plugin_hooks = true` (which this installer
+  # used to ask for) changes nothing: on Codex 0.154 and 0.162 the hooks panel
+  # lists the same hooks as active with it set to false, and 0.162 raises no
+  # warning about it. An existing line in config.toml can simply stay.
   echo
   if [ "$added" = 1 ]; then
     echo "Done (backup: $HK.bak-agentchat-setup)."
