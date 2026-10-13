@@ -23,6 +23,7 @@ any message over 150 words, or any Slack, PR, doc or artifact text, pipe the dra
 - **Show the shape before the sentences.** The reader should see "six things, three dates, two changes" from the layout.
 - **Content.** The verdict or the measured fact first, then its reasons. Every number with what it counts and over what scope, in the same sentence. Every internal term explained once where it first appears. Name things, never "a well-known vendor". Final state, not the history of the work.
 - **Voice.** People as subjects, "I" and "we". Mark what is uncertain with "I think" or "not sure". Plain verbs for unfinished work: read, drafted, compared, never decided, converged, shipped. Repeat the key word instead of varying it. No agreement openers, no sign-post colons, no "rather than" contrast frames.
+- **Structure items are breaks too.** The check also parses every sentence and names a verbless sentence, a wedged appositive, a noun pile, a heavy subject or a clause hidden in the subject. Fix each one before finishing, the same as a rule break: give the sentence a verb, move the appositive into its own sentence, split the pile, put the subject next to its verb, add "that". A parser misread gets one line saying so, never silence.
 - To record a piece of writing I disliked: `slopmark "<span>" <theme>`.
 ```
 

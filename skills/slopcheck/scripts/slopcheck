@@ -605,7 +605,10 @@ def report(r):
         lines.append(f"  - reads as a log rather than a state: {m.get('log_not_state')}. Verdict first: {m.get('verdict_first')}.")
     elif m.get("skipped") and m["skipped"] not in ("model_check off", "nested") and not m["skipped"].startswith("under"):
         lines.append(f"Model check skipped: {m['skipped']}.")
-    lines.append("Fix: split long sentences, break lists into bullets, one idea per paragraph, plain verbs for unfinished work, gloss each term once where it first appears.")
+    fix = "Fix: split long sentences, break lists into bullets, one idea per paragraph, plain verbs for unfinished work, gloss each term once where it first appears."
+    if sb:
+        fix += " Structure items are breaks too: give every sentence a verb, move an appositive into its own sentence, split a noun pile, put the subject next to its verb, add \"that\" to a hidden clause. Name a parser misread in one line instead of skipping it."
+    lines.append(fix)
     return "\n".join(lines)
 
 # ---------------- hooks ----------------
@@ -795,7 +798,8 @@ def reminder_line(cfg):
             f"{R['inline_list_min_items']} or more items = a bulleted list under a colon line, paragraphs of at most {R['max_paragraph_sentences']} sentences, "
             "one idea per paragraph, no em-dashes or en-dashes, at most one semicolon per sentence, no fact-carrying parentheses. "
             "Explain every internal term once, give every number its scope, name things, plain verbs for unfinished work, mark what is uncertain. "
-            "Before any message over 150 words or any text for other people: pipe the draft through slopcheck --stdin --surface doc and fix what it names.'")
+            + ("Structure items from the check (no verb, wedged appositive, noun pile, heavy subject, hidden clause) are breaks too: fix them before finishing. " if cfg.get("structure_check") else "")
+            + "Before any message over 150 words or any text for other people: pipe the draft through slopcheck --stdin --surface doc and fix what it names.'")
 
 MARK_START = "<!-- slopcheck rules: managed by `slopcheck install`, removed by `slopcheck uninstall` -->"
 MARK_END = "<!-- /slopcheck rules -->"

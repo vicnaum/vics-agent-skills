@@ -103,6 +103,10 @@ class ThroughSlopcheck(unittest.TestCase):
     def test_imperative_is_not_a_fragment(self):
         self.assertNotIn("fragment", rules("Before any message over 150 words, pipe the draft through the checker and fix what it names."))
 
+    def test_fix_line_names_the_structure_fixes(self):
+        p = subprocess.run([sys.executable, SLOPCHECK, "--stdin", "--surface", "doc"], input=GARDEN, capture_output=True, text=True, env=self.env())
+        self.assertIn("Structure items are breaks too", p.stdout.splitlines()[-1])
+
     def test_off_by_default(self):
         p = subprocess.run([sys.executable, SLOPCHECK, "--stdin", "--json"], input=GARDEN, capture_output=True, text=True, env=self.env(structure_check=False))
         r = json.loads(p.stdout)

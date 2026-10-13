@@ -113,6 +113,10 @@ The full report of the last check is always at `~/.config/slopcheck/last.txt`.
 text for other people, pipe the draft through `slopcheck --stdin --surface doc` and fix what it
 names. The Stop hook is advisory, so the improvement has to happen before sending.
 
+Structure items in that report are breaks to fix, the same as the shape rules. The rules template
+says so, and the per-turn reminder repeats it once the structure layer is on. Agents skip advisory
+items they have no instruction for, so the instruction has to exist in all three places.
+
 ## Config
 
 `~/.config/slopcheck/config.json` is created on first run with these keys:
