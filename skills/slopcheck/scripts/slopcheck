@@ -7,6 +7,7 @@ Usage:
   slopcheck.py --stdin [--surface ...]           # text on stdin
   slopcheck.py hook-stop | hook-post-write | hook-pre-send | hook-pre-publish   # Claude Code hooks, JSON on stdin
   slopcheck.py install [--dry-run] [--no-reminder] [--no-rules]   # hooks + reminder into settings.json, rules block into ~/.claude/CLAUDE.md
+  slopcheck.py install-structure [--with-surprisal] [--dry-run]    # venv for the structure layer (spaCy, WordNet, optional GPT-2), then switches it on
   slopcheck.py rules                            # print the CLAUDE.md rules block, ready to paste
   slopcheck.py uninstall                        # remove them
   slopcheck.py labels                           # summary of ~/.config/slopcheck/labels.jsonl
@@ -150,6 +151,7 @@ def check_sentence(s, is_bullet):
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 CFG_DIR = os.path.expanduser("~/.config/slopcheck")
 CFG_PATH = os.environ.get("SLOPCHECK_CONFIG") or os.path.join(CFG_DIR, "config.json")
 DEFAULTS = {
@@ -164,6 +166,12 @@ DEFAULTS = {
     "model_min_words": {"terminal": 150, "doc": 60, "external": 25},
     "model_timeout": 40,
     "reader_profile": "a senior engineer new to this company, who knows the field but not internal names, product names, slang or company history",
+    "structure_check": False,           # parse-based structure layer (scripts/structcheck in its own venv). `slopcheck install-structure` switches it on.
+    "structure_venv": "~/.local/share/slopcheck/venv",
+    "structure_model": "en_core_web_sm",
+    "structure_surprisal": False,       # GPT-2 surprisal spikes, local, needs torch in the venv (`install-structure --with-surprisal`)
+    "structure_deny": [],               # structure rules that deny an outward send, e.g. ["parse-failure", "no-verb"]. Empty: the layer only reports.
+    "structure_timeout": 15,
     "rules": {                          # the hard rules, reported as a named list
         "max_sentence_words": 30,
         "max_commas": 3,
@@ -475,6 +483,40 @@ def model_check(text, cfg, surface):
     except Exception as e:
         return {"skipped": f"{type(e).__name__}: {str(e)[:100]}"}
 
+def structure_python(cfg):
+    return os.path.join(os.path.expanduser(cfg.get("structure_venv") or DEFAULTS["structure_venv"]), "bin", "python")
+
+def structure_check(plain, cfg, surface):
+    """The structure layer: scripts/structcheck run in its own venv. Never raises. Returns dict, or {"skipped": reason}."""
+    if not cfg.get("structure_check", False): return {"skipped": "structure_check off"}
+    if os.environ.get("SLOPCHECK_INNER"): return {"skipped": "nested"}
+    py = structure_python(cfg); script = os.path.join(SCRIPT_DIR, "structcheck")
+    if not os.path.exists(py): return {"skipped": f"no venv at {py}, run slopcheck install-structure"}
+    if not os.path.exists(script): return {"skipped": "structcheck not found next to slopcheck"}
+    cmd = [py, script, "--stdin", "--json", "--model", cfg.get("structure_model") or "en_core_web_sm"]
+    if cfg.get("structure_surprisal"): cmd.append("--surprisal")
+    t0 = time.time()
+    try:
+        p = subprocess.run(cmd, input=plain, capture_output=True, text=True, timeout=cfg.get("structure_timeout", 15),
+                           env=dict(os.environ, SLOPCHECK_INNER="1"))
+    except subprocess.TimeoutExpired:
+        return {"skipped": f"timeout after {cfg.get('structure_timeout', 15)} s"}
+    except Exception as e:
+        return {"skipped": f"{type(e).__name__}: {str(e)[:100]}"}
+    if p.returncode not in (0, 1, 2): return {"skipped": f"structcheck exit {p.returncode}: {p.stderr.strip()[-160:]}"}
+    try:
+        d = json.loads(p.stdout)
+    except Exception:
+        return {"skipped": "structcheck returned no JSON"}
+    deny = set(cfg.get("structure_deny") or [])
+    for b in d.get("breaks", []): b["deny"] = b["rule"] in deny
+    d["_seconds"] = round(time.time() - t0, 1)
+    return d
+
+def structure_breaks(r):
+    st = r.get("structure") or {}
+    return [] if "skipped" in st else st.get("breaks", [])
+
 def model_hard(m):
     """Does the model result justify denying an outward send?"""
     if not m or "skipped" in m: return False
@@ -486,11 +528,13 @@ def check(raw, surface="terminal", is_html=False, cfg=None):
     flags = style_flags(raw, surface, cfg)
     plain = strip(raw, is_html)
     model = model_check(plain, cfg, surface)
+    structure = structure_check(plain if is_html else raw, cfg, surface)   # the layer reads markdown itself: bold leads are labels
     terms = (terms_to_check(raw, cfg) if surface != "terminal" else terms_to_check(raw, cfg)[:6]) if "skipped" in model else []
     words = len(raw.split())
     hard_breaks = [b for b in breaks if "semicolons" not in b[0]]
-    return {"words": words, "breaks": breaks, "flags": flags, "terms": terms, "model": model,
-            "hard": bool(hard_breaks) or any(h for _, _, h in flags) or model_hard(model)}
+    s_deny = [b for b in structure.get("breaks", []) if b.get("deny")] if "skipped" not in structure else []
+    return {"words": words, "breaks": breaks, "flags": flags, "terms": terms, "model": model, "structure": structure,
+            "hard": bool(hard_breaks) or any(h for _, _, h in flags) or model_hard(model) or bool(s_deny)}
 
 def one_line(r):
     parts = []
@@ -503,6 +547,16 @@ def one_line(r):
         parts.append(f"{len(r['flags'])} style flag{'s' if len(r['flags']) > 1 else ''}: " + ", ".join(sorted(set(k.split(' "')[0] for k, _, _ in r["flags"]))[:4]))
     if r["terms"]:
         parts.append("terms to check: " + ", ".join(r["terms"][:5]))
+    sb = structure_breaks(r)
+    if sb:
+        kinds = {}
+        for b in sb:
+            kinds[b["rule"]] = kinds.get(b["rule"], 0) + 1
+        order = sorted(kinds, key=lambda k: (0 if any(b["rule"] == k and b.get("deny") for b in sb) else 1 if any(b["rule"] == k and b["severity"] == "hard" for b in sb) else 2, -kinds[k]))
+        parts.append(f"structure: {len(sb)} item{'s' if len(sb) > 1 else ''}: " + ", ".join(f"{k.replace('-', ' ')}{' x' + str(kinds[k]) if kinds[k] > 1 else ''}" for k in order[:4]))
+    st = r.get("structure") or {}
+    if st.get("skipped") and st["skipped"] not in ("structure_check off", "nested"):
+        parts.append(f"structure check skipped ({st['skipped']})")
     m = r.get("model") or {}
     if m and "skipped" not in m:
         bits = []
@@ -530,6 +584,16 @@ def report(r):
         lines += [f"  - {k}{': \"' + s + '\"' if s else ''}" for k, s, _ in r["flags"][:12]]
     if r["terms"]:
         lines.append("Terms whose first use has no gloss in the sentence (check the reader knows them): " + ", ".join(r["terms"]))
+    sb = structure_breaks(r); st = r.get("structure") or {}
+    if sb:
+        lines.append(f"Structure ({st.get('_model', 'parse')}, {st.get('_seconds')} s), deny items first:")
+        ordered = sorted(sb, key=lambda b: (0 if b.get("deny") else 1 if b["severity"] == "hard" else 2))
+        for b in ordered[:14]:
+            tag = "deny" if b.get("deny") else b["severity"]
+            lines.append(f"  - [{tag}] {b['rule']}: {b['msg']}: \"{b['sentence'][:90]}\"")
+        if len(sb) > 14: lines.append(f"  - and {len(sb) - 14} more")
+    elif st.get("skipped") and st["skipped"] not in ("structure_check off", "nested"):
+        lines.append(f"Structure check skipped: {st['skipped']}.")
     m = r.get("model") or {}
     if m and "skipped" not in m:
         lines.append(f"Model check ({m.get('_model')}, {m.get('_seconds')} s):")
@@ -616,9 +680,10 @@ def hook_post_write():
     r = check(text, "doc", is_html=is_html, cfg=cfg); rep = report(r); _save_last(rep)
     m = r.get("model") or {}
     model_clean = ("skipped" in m) or not any(m.get(k) for k in ("sensational_spans", "unexplained_terms", "bare_numbers", "metaphors", "coy_references"))
-    if not r["breaks"] and not r["flags"] and not r["terms"] and model_clean:
+    sb = structure_breaks(r)
+    if not r["breaks"] and not r["flags"] and not r["terms"] and not sb and model_clean:
         print(json.dumps({"systemMessage": f"Style check on {os.path.basename(fp)}: clean."})); return
-    print(json.dumps({"systemMessage": f"Style check on {os.path.basename(fp)}: {len(r['breaks'])} rule breaks, {len(r['flags'])} style flags.",
+    print(json.dumps({"systemMessage": f"Style check on {os.path.basename(fp)}: {len(r['breaks'])} rule breaks, {len(r['flags'])} style flags" + (f", {len(sb)} structure items" if sb else "") + ".",
                       "hookSpecificOutput": {"hookEventName": "PostToolUse",
                                              "additionalContext": f"Style check for {os.path.basename(fp)} (fix before publishing or finishing):\n{rep}"}}))
 
@@ -678,7 +743,7 @@ def hook_pre_send():
     if cfg.get("block_external", True) and (bans or r["hard"]):
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                           "permissionDecisionReason": f"Style check denied this {tool} call. This text goes to other people, so the writing rules apply in full, in every field including titles. Fix the items below in the draft and call the tool again.\n\n{rep}"}}))
-    elif r["breaks"] or r["flags"] or r["terms"] or (r.get("model") and "skipped" not in r["model"]):
+    elif r["breaks"] or r["flags"] or r["terms"] or structure_breaks(r) or (r.get("model") and "skipped" not in r["model"]):
         print(json.dumps({"systemMessage": one_line(r) + " Allowed."}))
 
 def hook_pre_publish():
@@ -697,8 +762,8 @@ def hook_pre_publish():
     if dashes:
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                           "permissionDecisionReason": f"Style check denied publishing {os.path.basename(fp)}: {len(dashes)} dash breaks in the page text (quoted samples inside <figure> and <table> are not counted). Fix them and publish again.\n\n{rep}"}}))
-    elif r["breaks"] or r["flags"]:
-        print(json.dumps({"systemMessage": f"Style check on {os.path.basename(fp)} before publish: {len(r['breaks'])} rule breaks, {len(r['flags'])} style flags. Allowed."}))
+    elif r["breaks"] or r["flags"] or structure_breaks(r):
+        print(json.dumps({"systemMessage": f"Style check on {os.path.basename(fp)} before publish: {len(r['breaks'])} rule breaks, {len(r['flags'])} style flags, {len(structure_breaks(r))} structure items. Allowed."}))
 
 def labels_summary():
     p = os.path.join(CFG_DIR, "labels.jsonl")
@@ -802,8 +867,51 @@ def install(dry_run=False, reminder=True, rules=True):
     os.makedirs(os.path.dirname(sp), exist_ok=True)
     json.dump(d, open(sp, "w"), indent=2)
     print("installed\n" + plan)
+    if not cfg.get("structure_check"):
+        print("Structure layer (parse-based: hidden clauses, wedged appositives, verbless sentences) is off. `slopcheck install-structure` sets up its venv and switches it on.")
     print("Hooks reload live in Claude Code. If the style line does not appear under the next long reply, run /hooks once or restart the session.")
     print("`slopcheck rules` prints the same block if you want to place it yourself.")
+
+def _update_config(**kv):
+    """Write keys into the user's config.json, keeping everything else."""
+    os.makedirs(CFG_DIR, exist_ok=True)
+    user = json.load(open(CFG_PATH)) if os.path.exists(CFG_PATH) else dict(DEFAULTS)
+    user.update(kv); json.dump(user, open(CFG_PATH, "w"), indent=2)
+
+def install_structure(with_surprisal=False, dry_run=False, python=None):
+    """Create the structure layer's venv, install spaCy + the English model + WordNet (+ torch and GPT-2), self-test, switch it on."""
+    cfg = config(); venv = os.path.expanduser(cfg.get("structure_venv") or DEFAULTS["structure_venv"]); py = os.path.join(venv, "bin", "python")
+    model = cfg.get("structure_model") or "en_core_web_sm"; base = python or sys.executable
+    script = os.path.join(SCRIPT_DIR, "structcheck")
+    pkgs = ["spacy", "nltk"] + (["torch", "transformers"] if with_surprisal else [])
+    plan = (f"venv: {venv} (from {base})\n  pip install {' '.join(pkgs)}\n  spacy model {model}\n  nltk wordnet into the venv\n"
+            + ("  GPT-2 weights into ~/.cache/huggingface (surprisal spikes, local, offline after this)\n" if with_surprisal else "")
+            + f"  selftest: {script} --selftest\nconfig: structure_check true, structure_surprisal {str(with_surprisal).lower()} in {CFG_PATH}")
+    if dry_run: print("dry run, nothing written\n" + plan); return 0
+    print(plan)
+    def run(args, what):
+        print(f"... {what}")
+        p = subprocess.run(args, capture_output=True, text=True)
+        if p.returncode != 0:
+            print(f"FAILED: {what}\n{(p.stderr or p.stdout).strip()[-800:]}"); return False
+        return True
+    if not os.path.exists(py) and not run([base, "-m", "venv", venv], "creating the venv"): return 1
+    if not run([py, "-m", "pip", "install", "-q", "--disable-pip-version-check"] + pkgs, "pip install " + " ".join(pkgs) + " (a few minutes)"): return 1
+    if not run([py, "-m", "spacy", "download", model], f"downloading the spaCy model {model}"): return 1
+    if not run([py, "-c", "import nltk,sys; nltk.download('wordnet', download_dir=sys.prefix + '/nltk_data', quiet=True)"], "downloading WordNet"): return 1
+    if with_surprisal:
+        env = dict(os.environ); env.pop("HF_HUB_OFFLINE", None); env.pop("TRANSFORMERS_OFFLINE", None)
+        print("... downloading GPT-2 weights (about 550 MB)")
+        p = subprocess.run([py, "-c", "from transformers import AutoTokenizer, AutoModelForCausalLM; AutoTokenizer.from_pretrained('gpt2'); AutoModelForCausalLM.from_pretrained('gpt2')"], capture_output=True, text=True, env=env)
+        if p.returncode != 0: print("FAILED: GPT-2 download\n" + (p.stderr or p.stdout).strip()[-800:]); return 1
+    p = subprocess.run([py, script, "--selftest", "--model", model] + (["--surprisal"] if with_surprisal else []), capture_output=True, text=True)
+    print(p.stdout.strip()); 
+    if p.returncode != 0: print("selftest FAILED, structure_check left as it was\n" + p.stderr.strip()[-400:]); return 1
+    _update_config(structure_check=True, structure_surprisal=bool(with_surprisal))
+    print(f"structure layer on: structure_check true, structure_surprisal {str(with_surprisal).lower()} in {CFG_PATH}")
+    deny = cfg.get("structure_deny") or []
+    print(("Deny rules for outward text: " + ", ".join(deny)) if deny else "Nothing denies by default: the layer reports, the agent fixes. structure_deny in the config names rules that refuse an outward send.")
+    return 0
 
 def uninstall():
     sp = os.path.expanduser("~/.claude/settings.json")
@@ -823,6 +931,9 @@ def main(argv):
         {"hook-stop": hook_stop, "hook-post-write": hook_post_write, "hook-pre-send": hook_pre_send, "hook-pre-publish": hook_pre_publish, "labels": labels_summary, "uninstall": uninstall, "rules": rules_block}[argv[1]](); return 0
     if len(argv) > 1 and argv[1] == "install":
         install(dry_run="--dry-run" in argv, reminder="--no-reminder" not in argv, rules="--no-rules" not in argv); return 0
+    if len(argv) > 1 and argv[1] == "install-structure":
+        py = argv[argv.index("--python") + 1] if "--python" in argv else None
+        return install_structure(with_surprisal="--with-surprisal" in argv, dry_run="--dry-run" in argv, python=py)
     args = [a for a in argv[1:] if not a.startswith("--")]
     surface = "terminal"
     if "--surface" in argv: surface = argv[argv.index("--surface") + 1]; args = [a for a in args if a != surface]
@@ -833,7 +944,8 @@ def main(argv):
         text = open(args[0], encoding="utf-8", errors="replace").read(); is_html = args[0].lower().endswith((".html", ".htm"))
     r = check(text, surface, is_html=is_html)
     print(json.dumps(r, indent=1) if as_json else report(r))
-    return 2 if r["breaks"] else (1 if r["flags"] else 0)
+    sb = structure_breaks(r)
+    return 2 if (r["breaks"] or any(b.get("deny") for b in sb)) else (1 if (r["flags"] or sb) else 0)
 
 if __name__ == "__main__":
     try:

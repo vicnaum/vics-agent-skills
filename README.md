@@ -376,6 +376,8 @@ Keeps an agent's writing readable for one specific reader, as a named list of ru
 
 Checks sentence length, comma count, semicolon chains, em-dashes and en-dashes, lists run inline, paragraph and bullet length, fact-carrying parentheses, achievement words for unfinished work, agreement openers, sign-post phrases, contrast frames, and an advisory list of terms whose first use has no gloss. An optional model layer, off by default, adds inflation, unexplained jargon, bare numbers and metaphors, through the Anthropic API or the TypeSafe Jev API.
 
+An optional structure layer parses each sentence with spaCy in its own venv and names faults of structure, from a verbless sentence to a wedged appositive. `slopcheck install-structure --with-surprisal` sets it up and adds GPT-2 surprisal spikes, local and offline. On 54 labelled rewrites it flagged 23 originals and 11 rewrites.
+
 #### Example ask
 
 ```
@@ -396,7 +398,7 @@ Style flags:
 
 #### Install
 
-Symlink `skills/slopcheck/scripts/slopcheck` and `scripts/slopmark` onto your PATH, then run `slopcheck install`. It backs up `~/.claude/settings.json` and `~/.claude/CLAUDE.md`, wires the hooks and the reminder, and writes the rules block into CLAUDE.md between markers. The full steps and the config are in the skill.
+Symlink `skills/slopcheck/scripts/slopcheck`, `scripts/slopmark` and `scripts/structcheck` onto your PATH, then run `slopcheck install`. It backs up `~/.claude/settings.json` and `~/.claude/CLAUDE.md`, wires the hooks and the reminder, and writes the rules block into CLAUDE.md between markers. `slopcheck install-structure` adds the structure layer. The full steps and the config are in the skill.
 
 
 ## Install / use

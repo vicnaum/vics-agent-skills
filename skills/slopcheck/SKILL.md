@@ -1,6 +1,6 @@
 ---
 name: slopcheck
-description: "Keep an AI agent's writing readable for one specific reader, with named rule breaks instead of a score. A standard-library Python checker plus five Claude Code hooks, one of them a per-turn reminder of the rules: an advisory line under every long reply, a report into the agent's context after it writes any document, a deny gate on artifact publishing, and a deny gate on Slack, pull-request, Linear and Notion text until the list is empty. Checks the hard shape rules (sentence length, comma count, semicolons, em-dashes, lists run inline, paragraph and bullet length, fact-carrying parentheses), the tone tells regex can see (achievement words for unfinished work, agreement openers, sign-post phrases, contrast frames, filler words), and an advisory list of terms whose first use has no gloss. Optional model layer, off by default, through the Anthropic API or the TypeSafe Jev API, for inflation, unexplained jargon, bare numbers and metaphors. Use when: (1) the user complains about walls of text, jargon, sensational or inflated wording, or 'AI slop' in the agent's output, (2) the user wants their writing rules enforced on final messages, docs, artifacts or outward messages, (3) installing or tuning the hooks, (4) checking a draft before sending (slopcheck --stdin), (5) labelling a bad span for the dataset (slopmark). Triggers on: slopcheck, slopmark, writing rules, readability hook, style check, wall of text, AI slop, jargon, sensationalism, em-dashes, inline list."
+description: "Keep an AI agent's writing readable for one specific reader, with named rule breaks instead of a score. A standard-library Python checker plus five Claude Code hooks, one of them a per-turn reminder of the rules: an advisory line under every long reply, a report into the agent's context after it writes any document, a deny gate on artifact publishing, and a deny gate on Slack, pull-request, Linear and Notion text until the list is empty. Checks the hard shape rules (sentence length, comma count, semicolons, em-dashes, lists run inline, paragraph and bullet length, fact-carrying parentheses), the tone tells regex can see (achievement words for unfinished work, agreement openers, sign-post phrases, contrast frames, filler words), and an advisory list of terms whose first use has no gloss. Optional model layer, off by default, through the Anthropic API or the TypeSafe Jev API, for inflation, unexplained jargon, bare numbers and metaphors. Optional structure layer, installed by `slopcheck install-structure`, that parses each sentence with spaCy in its own venv and names what regex cannot see: a sentence the parser cannot read, no verb, an appositive wedged between subject and verb, four nouns in a row, a seven-word subject, and GPT-2 surprisal spikes on request. Use when: (1) the user complains about walls of text, jargon, sensational or inflated wording, or 'AI slop' in the agent's output, (2) the user wants their writing rules enforced on final messages, docs, artifacts or outward messages, (3) installing or tuning the hooks, (4) checking a draft before sending (slopcheck --stdin), (5) labelling a bad span for the dataset (slopmark), (6) a sentence is grammatical but unreadable: garden path, hidden clause, wedged appositive, noun pile, no verb. Triggers on: slopcheck, slopmark, structcheck, writing rules, readability hook, style check, structure check, wall of text, AI slop, jargon, sensationalism, em-dashes, inline list, garden path, appositive."
 ---
 
 # slopcheck: named rule breaks, four surfaces, no score
@@ -49,6 +49,8 @@ library Python, no dependencies, and makes no network calls unless the model lay
 pattern in the same sentence. Noisy on capitalised names, so it is a prompt to the agent, not a verdict.
 
 **Model layer, off by default.** A small model judges what regex cannot, through the Anthropic API or the TypeSafe Jev API. See "Model layer" below.
+
+**Structure layer, off by default.** A dependency parse of each sentence names faults of structure, from a verbless sentence to a wedged appositive. It runs in its own venv and never touches the network, see "Structure layer" below.
 
 ## The four surfaces
 
@@ -101,6 +103,8 @@ slopcheck FILE --surface external       # judge as text for other people
 slopcheck FILE --json                   # machine-readable
 slopmark "the offending phrase" jargon  # label a bad span; themes: jargon, wall, tone, long, log, compressed, dash, metaphor, other
 slopcheck labels                        # count labels by theme
+slopcheck install-structure [--with-surprisal]   # venv with spaCy, WordNet and optionally GPT-2, then the structure layer is on
+structcheck FILE                        # the structure layer alone, exit 0 clean, 1 advisory, 2 hard breaks
 ```
 
 The full report of the last check is always at `~/.config/slopcheck/last.txt`.
@@ -126,6 +130,12 @@ names. The Stop hook is advisory, so the improvement has to happen before sendin
 - After editing `external_tools`, run `slopcheck install` again.
 - `reader_profile`: one sentence about who reads the text. Used by the model layer.
 - `model_check` and the other `model_*` keys: the model layer, described below.
+- `structure_check`: the structure layer, described below. `slopcheck install-structure` switches it on.
+- `structure_venv`: where that layer's venv lives. Default `~/.local/share/slopcheck/venv`.
+- `structure_model`: the spaCy model it parses with. Default `en_core_web_sm`.
+- `structure_surprisal`: GPT-2 surprisal spikes, local and offline. Needs the `--with-surprisal` install.
+- `structure_deny`: the structure rules that deny an outward send. Default: none, the layer only reports.
+- `structure_timeout`: seconds before a hook gives up on the layer and goes on without it. Default 15.
 
 Kill switch: `SLOPCHECK_OFF=1` in the environment, or an empty file at `~/.config/slopcheck/off`.
 
@@ -147,6 +157,65 @@ What either backend reports:
 To switch on: set `model_check` to true and `model_backend` to `"api"` or `"jev"`, and provide the key. The layer runs on documents of 60 words or more and outward text of 25 words or more. An outward send is denied at a sensational score of 0.5 or higher, and also at three or more quoted spans. Every failure path returns "skipped" and never blocks.
 
 `model_backend: "cli"` runs a nested `claude -p` on the user's subscription instead of an API key. We measured 6 to 70 seconds per call and frequent timeouts, so it is kept as an option and not recommended.
+
+## Structure layer
+
+Regex counts words and commas. It cannot see that "Items this work needs ship now" hides a clause inside its subject, or that an appositive sits between a subject and its verb. A dependency parser can.
+
+The layer lives in `scripts/structcheck` and runs in its own venv, so slopcheck itself stays standard-library. It is off until installed.
+
+**Install.** `slopcheck install-structure` creates the venv, installs spaCy with the small English model and WordNet, runs a self-test and sets `structure_check` to true. With `--with-surprisal` it also installs torch and caches the GPT-2 weights, about 1 GB in all. Nothing leaves the machine afterwards: the layer runs with the Hugging Face offline flags set, so a missing model is an error, never a download.
+
+Hard rules, listed first in the report:
+
+- parse-failure: the parser found no well-formed reading. The example sentence above gets this.
+- no-verb and no-finite-verb: the sentence has no verb, or only a participle.
+- fragment: a finite verb with no subject.
+- appositive-wedged: three or more words between a subject and its verb, or between a verb and its complement.
+- appositive-in-list: an appositive inside a comma list.
+- noun-pile: four nouns in a row.
+- heavy-subject: seven or more words before the verb.
+
+Advisory rules:
+
+- center-embedding and zero-relative: a clause inside the subject with no "that" and no comma.
+- subject-verb-gap and passive.
+- bare-present-plan: "the fix lands before the upgrade", a rule written as a prediction.
+- ambiguous-subordinator: "now, while", where "now" primes the time reading.
+- adverb-as-modifier and bare-noun-subject: "a now value", "Owner lane names the team".
+- surprisal-spike, described next.
+
+Nothing denies by default. The layer reports and the agent fixes, like the terms list. The key `structure_deny` names rules that refuse an outward send, and the study below is too small to trust one with that.
+
+The small parser also misreads some clean sentences, such as "the first prints every rule" with "prints" as a noun. That is the other reason the layer only reports.
+
+Three exemptions keep the verb rules honest. A bullet or a bold lead line under 15 words may be a noun phrase, and a line with a colon label such as "Gate: none" is not a sentence. Quoted spans are replaced by a placeholder noun before parsing, because a quoted word is a mention, not prose.
+
+**Surprisal spikes.** With `structure_surprisal` on, GPT-2 scores every word by how unexpected it is, in bits. A word far above its sentence's level and above 16 bits is reported, at most eight per text. Domain names spike too, so read the list as words a newcomer may stumble on.
+
+**What it measured.** One reader rewrote 54 sentences on one page and labelled each fault. The layer ran on both versions of every pair:
+
+| | original | rewrite |
+| --- | --- | --- |
+| pairs with a deny or hard break | 23 of 54 | 11 of 54 |
+| pairs with any break | 34 of 54 | 20 of 54 |
+| the side with the higher mean surprisal | 44 of 54 | 10 of 54 |
+
+The misses are the semantic faults, about 12 of the 54. Those belong to the model layer. The spikes landed on the complained-about word in about half of the lexical faults, such as a verb used as a noun.
+
+The semantic faults in that reader's labels:
+
+- vague
+- unclear
+- meaning inverted
+- an instruction written as a fact
+- a rule written as a prediction
+
+Thresholds were tuned on these same pairs, so expect a smaller gap on new text. Rules that fired as often on the rewrite as on the original were dropped: prepositional attachment, coined hyphen compounds, three-noun piles. The scripts are in `research/structure`, and the pairs stay with their owner.
+
+**Cost and limits.** About 2 seconds per check for the parse and 5 with surprisal, most of it loading models. A hook gives up on the layer after `structure_timeout` seconds and reports the rest.
+
+Every rule depends on the parse, and the small spaCy model misparses some clean sentences. The transformer model needs a Rust toolchain on Python 3.14 and was not tested.
 
 ## Design notes, from the research behind this
 
