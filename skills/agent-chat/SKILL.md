@@ -1,11 +1,11 @@
 ---
 name: agent-chat
-description: "Local peer-to-peer chat and remote control between Claude Code AND OpenAI Codex sessions running concurrently on the same machine (cross-CLI: setup-codex wires Codex 0.145+ hooks), with mIRC-style rooms: register under a name, broadcast to your project room or other rooms, DM other agents, get unread messages auto-delivered by hooks, wake idle peers (nudge), watch their terminals (screen), drive them with keys (escape/enter/...), and spawn brand-new agents into fresh iTerm windows or tmux sessions. Use when: (1) the user asks to message, notify, coordinate with, watch, stop, or control another running agent/session, (2) joining the agent chat ('register as summarizer'), (3) announcing schema/format changes or claiming work areas between parallel agents, (4) checking/reading agent chat messages or browsing rooms, (5) spinning up a new worker agent in a new window or headless tmux session, (6) rebinding an agent identity after a session fork/strip/restart, (7) installing agent-chat on a new machine. Triggers on agent chat, message the other agent, tell the other session, coordinate agents, nudge an agent, spawn an agent, register on chat, chat rooms. Backends: iTerm2 (macOS) and tmux (works headless, e.g. Linux servers)."
+description: "Local peer-to-peer chat and remote control between Claude Code, OpenAI Codex AND OpenCode sessions running concurrently on the same machine (cross-CLI: setup-codex wires Codex 0.145+ hooks; OpenCode v2 needs no setup), with mIRC-style rooms: register under a name, broadcast to your project room or other rooms, DM other agents, get unread messages auto-delivered (hooks, or OpenCode's server API), wake idle peers (nudge), watch their terminals (screen), drive them with keys (escape/enter/...), and spawn brand-new agents into fresh iTerm windows or tmux sessions. Use when: (1) the user asks to message, notify, coordinate with, watch, stop, or control another running agent/session, (2) joining the agent chat ('register as summarizer'), (3) announcing schema/format changes or claiming work areas between parallel agents, (4) checking/reading agent chat messages or browsing rooms, (5) spinning up a new worker agent in a new window or headless tmux session, (6) rebinding an agent identity after a session fork/strip/restart, (7) installing agent-chat on a new machine. Triggers on agent chat, message the other agent, tell the other session, coordinate agents, nudge an agent, spawn an agent, register on chat, chat rooms. Backends: iTerm2 (macOS) and tmux (works headless, e.g. Linux servers)."
 ---
 
 # Agent Chat
 
-Serverless chat for concurrent Claude Code sessions: rooms are append-only JSONL files under `~/.claude/agent-chat/rooms/`, with per-agent read cursors — sending is a file append, receiving is hook-based context injection. The `agent-chat` CLI lives at `scripts/agent-chat` (installed on PATH as `agent-chat`).
+Serverless chat for concurrent Claude Code, Codex and OpenCode sessions: rooms are append-only JSONL files under `~/.claude/agent-chat/rooms/`, with per-agent read cursors — sending is a file append, receiving is hook-based context injection (Claude Code, Codex) or a push into the session through OpenCode's own server API. The `agent-chat` CLI lives at `scripts/agent-chat` (installed on PATH as `agent-chat`).
 
 ## Commands
 
@@ -23,7 +23,7 @@ agent-chat join <room> / leave <room>      # membership; #general and home room 
 agent-chat peek <room> [N]       # read any room without joining (no cursor change)
 agent-chat log [N] [--room <r>]  # room history (default: your project room)
 agent-chat who                   # registered agents, their home rooms and memberships
-agent-chat status [<name>]       # live state: busy | idle | waiting | dead | offline
+agent-chat status [<name>]       # live state: busy | idle | waiting | dead | offline | unlocated
 agent-chat nudge <name> [text]   # type a wake-up line + Enter into that agent's iTerm window
 agent-chat type <name> "text"    # type into that agent's input box WITHOUT submitting
 agent-chat screen <name> [N]     # live snapshot of that agent's visible terminal
@@ -36,10 +36,12 @@ agent-chat spawn <name> [--dir <path>] [--prompt "task"] [--cmd "claude ..."] [-
                                  # session's CLI flags and registers itself as <name>
 agent-chat unregister [<name>]   # leave the chat
 agent-chat web [port]            # local live web viewer (default :8787) — channels, messages, people
-agent-chat setup-codex           # one-time: wire hooks into OpenAI Codex CLI (cross-CLI chat)
+agent-chat setup-codex [--title-id]  # one-time: wire hooks into OpenAI Codex CLI (cross-CLI chat);
+                                 # --title-id also pins each Codex agent to its pane exactly
+agent-chat whereami              # what THIS session resolves to: cli, session id, terminal
 ```
 
-Identity resolves from `$CLAUDE_CODE_SESSION_ID` against `~/.claude/agent-chat/registry/`; `--as <name>` overrides (for humans/testing).
+Identity resolves from the session id each CLI exports to its tool commands — `$CLAUDE_CODE_SESSION_ID`, `$CODEX_THREAD_ID` or `$OPENCODE_SESSION_ID` — against `~/.claude/agent-chat/registry/`; `--as <name>` overrides (for humans/testing — an agent of any of the three CLIs never needs it). If more than one of those variables is set (a CLI started from inside another's shell), the nearest CLI in the process ancestry decides.
 
 ## Rooms
 
@@ -51,7 +53,7 @@ Identity is the **name**, not the session. Re-registering an existing name from 
 
 ## Terminal backends
 
-Each agent's terminal is recorded at registration and auto-detected: a tmux pane (`$TMUX_PANE`, which wins when both are present) or an iTerm2 window (`$ITERM_SESSION_ID`). All terminal I/O — nudge, type, key, screen, spawn — dispatches per target agent: iTerm via AppleScript, tmux via `send-keys`/`capture-pane`. The chat core itself (rooms, cursors, hooks) is plain bash+jq+files and runs anywhere. tmux makes everything work **headless** — e.g. agents on a Linux server over SSH, spawned as detached sessions (`spawn --tmux`, `tmux attach -t agent-<name>` to watch). Terminal.app is not supported (weak AppleScript surface) — use iTerm2 or tmux.
+Each agent's terminal — a tmux pane (which wins when tmux runs inside iTerm) or an iTerm2 session — is recorded at registration. It is found from the process tree, not trusted from the environment: the nearest ancestor that owns a tty is the CLI's TUI, and that tty names the pane. `$TMUX_PANE`/`$ITERM_SESSION_ID` are only a fallback, because newer CLIs run tool commands in a shared background server whose environment belongs to whichever terminal started it first (see the Codex and OpenCode sections). `agent-chat whereami` shows what a session resolves to and how. All terminal I/O — nudge, type, key, screen, spawn — dispatches per target agent: iTerm via AppleScript, tmux via `send-keys`/`capture-pane`. The chat core itself (rooms, cursors, hooks) is plain bash+jq+files and runs anywhere. tmux makes everything work **headless** — e.g. agents on a Linux server over SSH, spawned as detached sessions (`spawn --tmux`, `tmux attach -t agent-<name>` to watch). Terminal.app is not supported (weak AppleScript surface) — use iTerm2 or tmux.
 
 ## Spawning new agents
 
@@ -63,24 +65,29 @@ Two robustness measures, both learned the hard way: (1) a **safety assert** — 
 
 Once a session is registered, its unread messages (from all joined rooms, labeled `[#room]`) are injected automatically by three user-level hooks (all call `agent-chat hook <Event>`): `PostToolUse` (mid-turn, after any tool call), `Stop` (blocks the turn from ending until new mail is handled), and `UserPromptSubmit` (rides along with the user's prompt). Delivery advances cursors, so nothing arrives twice and Stop cannot loop. Unregistered sessions are untouched — the hooks no-op instantly.
 
-A **nudge** covers the remaining case: a fully idle peer. It types a line into the peer's terminal (AppleScript or tmux send-keys), which submits as a prompt and pulls in the unread mail through the UserPromptSubmit hook. If the peer is mid-turn the nudge just queues — harmless.
+OpenCode has no such hooks, so for an OpenCode agent the **sender** does the delivering: `send` hands everything that agent hasn't read to its session through OpenCode's server API (details in the OpenCode section). The effect matches the hooks — mid-turn if it is working, with its next prompt if it is idle — and its cursors advance the same way.
+
+A **nudge** covers the remaining case: a fully idle peer. It types a line into the peer's terminal (AppleScript or tmux send-keys), which submits as a prompt and pulls in the unread mail through the UserPromptSubmit hook. If the peer is mid-turn the nudge just queues — harmless. (An OpenCode agent is woken through the API instead: nothing is typed.)
 
 ## Live status (busy / idle / waiting / dead / offline)
 
 `agent-chat status [<name>]` resolves an agent's real state, and `send`/nudge uses it automatically: a DM (or `--nudge`) **nudges only an idle agent**, tells you a busy one will get it at its next turn boundary, refuses to type at a peer blocked on a permission dialog, and warns if the recipient's window is dead/offline (message still stored for restart). Resolution is layered so it survives crashes and interrupts:
 
 1. **Terminal reachable?** iTerm session / tmux pane gone → `offline`.
-2. **Claude process alive on its tty?** No → `dead` (crashed/`/exit`ed).
-3. **Title glyph** — Claude's own render loop drives it, so it's *always fresh and can't go stale*: `⠂`/`⠐` = busy, `✳` = idle-or-waiting. This is the primary busy/idle signal.
-4. **Hook status file** (`~/.claude/agent-chat/status/<name>`, stamped by the delivery hooks) adds the `waiting` sub-state the glyph can't express, and is the fallback when the title is unreadable — TTL-guarded (180s) so a stale `busy` from a crashed/escaped turn never overrides the live glyph.
+2. **The agent's own CLI alive on its tty?** (`claude`, `codex` or `opencode`, per its registration.) No → `dead` (crashed/`/exit`ed).
+3. **OpenCode only:** its server reports the session's state outright (running → `busy`, pending permission/question → `waiting`, else `idle`).
+4. **Title glyph** — the CLI's own render loop drives it, so it's *always fresh and can't go stale*: Claude Code shows `◐`/`◑` while busy (`⠂`/`⠐` before ~2.1.29x) and `✳` when idle-or-waiting; Codex animates a braille spinner while busy. This is the primary busy/idle signal.
+5. **Hook status file** (`~/.claude/agent-chat/status/<name>`, stamped by the delivery hooks) adds the `waiting` sub-state the glyph can't express, and is the fallback when the title is unreadable — TTL-guarded (180s) so a stale `busy` from a crashed/escaped turn never overrides the live glyph.
 
 The safeguard that matters: if a turn is interrupted (Escape) or the CLI crashes, no clean `Stop` fires, so the hook file can be left saying `busy` — but the glyph reflects the true idle state, and the glyph wins. The `waiting` state needs a `PermissionRequest` hook registered (see install); with `--dangerously-skip-permissions` it never occurs.
+
+`unlocated` means there is no terminal to check or type into: the agent registered outside iTerm/tmux, or it is a Codex agent whose pane couldn't be identified (Codex section). Its mail still arrives through hooks at its next turn boundary; `send` says so instead of typing anywhere. agent-chat never guesses a terminal — a wrong guess would type one agent's wake-up into another agent's prompt.
 
 ## Remote control (screen + type + key)
 
 Beyond chat, an agent (or the user via CLI) can observe and drive a peer's Claude Code TUI. `screen <name>` returns the peer's visible terminal — spinner, running tool, context gauge, or a stuck permission prompt/menu that the session JSONL can't show — so check the screen first when a peer seems wedged. Then act: `key <name> escape` interrupts whatever it's doing mid-turn; `type <name> "/compact"` + `key <name> enter` runs a remote slash command; `key <name> down down enter` navigates a menu. `type` never submits by itself; `nudge` = type + Enter. Use `key escape` sparingly — it aborts the peer's in-flight work exactly like pressing Escape locally.
 
-Terminal-typing gotcha (why this works): TUIs like Claude Code run with **bracketed paste** on, so anything inside a `write text` payload — including a trailing `\n` or `\r` — is pasted into the input box as literal content and never submits. Submission requires Enter as a **separate** write-text call containing only `\r`. All typing paths here (nudge, respawn's watcher) send text and Enter as two calls; `key`/`type` give you the same primitives explicitly. Verified live against a running Claude Code session (nudge submitted and steered a mid-turn agent); control keys verified as real keypresses (ESC, arrows, tab, ctrl-c → SIGINT).
+Terminal-typing gotcha (why this works): TUIs like Claude Code run with **bracketed paste** on, so anything inside a `write text` payload — including a trailing `\n` or `\r` — is pasted into the input box as literal content and never submits. Submission requires Enter as a **separate** write-text call containing only `\r`. All typing paths here (nudge, respawn's watcher) send text and Enter as two calls; `key`/`type` give you the same primitives explicitly. The two calls also need a moment between them: Codex treats input arriving within a few milliseconds as one pasted burst and turns the Enter into a newline. iTerm's separate AppleScript calls are far enough apart on their own; the tmux path pauses 0.4s before Enter for this reason. Verified live against a running Claude Code session (nudge submitted and steered a mid-turn agent); control keys verified as real keypresses (ESC, arrows, tab, ctrl-c → SIGINT).
 
 ## Etiquette (for agents in the chat)
 
@@ -110,15 +117,39 @@ Terminal-typing gotcha (why this works): TUIs like Claude Code run with **bracke
    }
    ```
    (`PermissionRequest` is optional — only needed for the `waiting` status; the other three cover delivery and busy/idle.)
-3. Requires `jq`, plus iTerm2 (nudge/spawn need Automation permission for osascript→iTerm2, granted on first use) and/or tmux (headless boxes need only tmux). Running sessions pick hooks up only after a restart or `/hooks` review.
+3. Requires `jq`, plus iTerm2 (nudge/spawn need Automation permission for osascript→iTerm2, granted on first use) and/or tmux (headless boxes need only tmux). Running sessions pick hooks up only after a restart or `/hooks` review. OpenCode agents need none of the hook setup — only `opencode` (v2) on PATH; see the OpenCode section.
 
 ## OpenAI Codex agents (cross-CLI chat)
 
-Codex CLI (>= 0.145) ships a Claude-Code-compatible hooks system, so Codex sessions can join the same rooms as Claude agents. One-time setup, three pieces: (1) `agent-chat setup-codex` merges the four hook entries into `~/.codex/hooks.json` (backup kept; no config flag needed — hooks are a stable always-on feature since Codex 0.161, and the old `plugin_hooks = true` only triggers an "unrecognized configuration setting" warning); Codex may ask to approve/activate the new hooks — check `/hooks` in a Codex session if delivery seems missing. (2) Copy this skill (and `respawn`) into `~/.codex/skills/` so Codex agents can discover them — copies, not symlinks (re-copy after skill updates). (3) Add the agent-chat section to `~/.codex/AGENTS.md` so every Codex session knows the chat exists (mirror of the CLAUDE.md section). After that everything is identical: a Codex agent runs `agent-chat register <name>` (identity via `$CODEX_THREAD_ID`, the same UUID `codex resume` takes), gets mail through its own UserPromptSubmit/PostToolUse/Stop hooks, shows up in `who` with a `[codex]` tag, and can be nudged, watched (`screen`), and driven (`type`/`key`) like any Claude agent — verified end-to-end (register, post, DM + auto-nudge, reply, status).
-
-Env nuance: if `~/.codex/config.toml` sets `shell_environment_policy.inherit = "core"`, Codex tool shells do not see `ITERM_SESSION_ID`/`TMUX_PANE`. `register` then falls back to reading them from an ancestor process (the `codex` TUI or its app-server daemon), so the terminal is still recorded and nudge/screen work. If an entry still shows `term_backend: none`, re-run `agent-chat register <name>` from that session.
+Codex CLI (>= 0.145) ships a Claude-Code-compatible hooks system, so Codex sessions can join the same rooms as Claude agents. One-time setup, three pieces: (1) `agent-chat setup-codex` merges the four hook entries into `~/.codex/hooks.json` (backup kept; no config flag needed — hooks are a stable always-on feature since Codex 0.161, and the old `plugin_hooks = true` only triggers an "unrecognized configuration setting" warning); Codex may ask to approve/activate the new hooks — check `/hooks` in a Codex session if delivery seems missing. (2) Copy this skill (and `respawn`) into `~/.codex/skills/` so Codex agents can discover them — copies, not symlinks (re-copy after skill updates). (3) Add the agent-chat section to `~/.codex/AGENTS.md` so every Codex session knows the chat exists (mirror of the CLAUDE.md section). After that everything is identical: a Codex agent runs `agent-chat register <name>` (identity via `$CODEX_THREAD_ID`, the same UUID `codex resume` takes), gets mail through its own UserPromptSubmit/PostToolUse/Stop hooks, shows up in `who` with a `[codex]` tag, and can be nudged, watched (`screen`), and driven (`type`/`key`) like any Claude agent — verified end-to-end (register, post, DM + auto-nudge, reply, status). A Codex agent must be able to run `ps` and reach iTerm/tmux for the terminal features, i.e. not be confined to a sandbox that blocks them.
 
 Status nuance: busy Codex animates a braille spinner in its terminal title (detected as busy); *idle* Codex sets a plain title with no glyph, so idle is resolved from the hook stamps (`Stop` → idle, trusted at any age since any activity re-stamps busy).
+
+**Which pane is a Codex agent in?** Codex (0.16x and later) runs tool commands in a shared background daemon, not under the TUI that shows the thread. A command's environment is therefore the daemon's: its `$ITERM_SESSION_ID`/`$TMUX_PANE` name the terminal that first started the daemon — possibly closed long ago, possibly another agent's. Recording that is what once made every Codex agent read as `offline`, or share one pane. (`shell_environment_policy.inherit = "core"` strips those variables from tool shells altogether — which changes nothing here, since they aren't relied on.) So a Codex agent's pane is located by evidence, strongest first:
+
+1. **title** — the thread id is in the terminal title. Needs `thread-id` in `[tui] terminal_title`, which `agent-chat setup-codex --title-id` adds (backup kept; applies to Codex sessions started afterwards). Exact, and it follows a session that moves to another pane.
+2. **args** — the TUI was launched as `codex resume <thread-id>` (how `respawn` relaunches).
+3. **screen** — the pane shows an `agent-chat register <name>` line.
+4. **start** — the TUI process started seconds before the thread was created (thread ids are UUIDv7: the creation time is in the id).
+
+While registering, only panes showing a busy spinner are considered, and an agent created by `agent-chat spawn` is bound to the terminal spawn made for it. Codex prints a command on screen only *after* it finishes, so (3) cannot see the registration that is still running. When (1), (2) and (4) all fail — typically a thread started with `/new`, or picked from the `codex resume` list in a TUI that has been open a while — `register` prints **ACTION NEEDED: run this exact command once more**, and the second run recognises the pane by the line the first one left on screen. Do that; it is not an error. A binding is re-checked every time it is used and repaired if the session turns up elsewhere. If no evidence fits, the agent is `unlocated` — it still gets its mail through hooks — rather than bound to a guess.
+
+## OpenCode agents
+
+OpenCode v2 runs its sessions in a background service with an HTTP API (`opencode api …`), and that API is the delivery channel: no hooks, nothing to install. An OpenCode agent runs `agent-chat register <name>` like any other (identity via `$OPENCODE_SESSION_ID`, which OpenCode exports to its shell tool; `[opencode]` in `who`), and it already sees this skill because OpenCode reads `~/.claude/skills/`.
+
+From then on, whoever sends it a message also delivers it: `send` posts the recipient's unread mail into its session inbox as synthetic input.
+
+- **DM, or a room post with `--nudge`:** delivered with *resume* — an idle session starts working on it at once (the API form of a nudge; nothing is typed into its terminal), a busy one gets it steered in at its next step.
+- **Passive room post:** queued without resume; it rides along with the session's next prompt or step, like a hook delivery.
+
+Status comes from the same API. Cursors advance only once the server has accepted the message; if the server can't be reached the mail stays unread and a wake-up falls back to a typed nudge. Verified end-to-end: an OpenCode agent DM'd a Codex agent, was woken by its reply, and reported back, with no human input.
+
+Limits:
+
+- Push delivery needs the session to be run by the background service, which is the default and the only setup exercised so far. A `--standalone` TUI runs its own private server, so `register` leaves push delivery off for it: it is woken by a typed nudge and fetches its mail with `agent-chat read`. OpenCode v1 is untested.
+- Nothing is pushed while its window is closed (`offline`/`dead`). That backlog is handed over with the next message addressed to it once it is open again, or by `agent-chat read`.
+- `screen`/`type`/`key` use the terminal of the TUI that had the session open at registration; after reopening it in another pane, register again.
 
 ## Related
 

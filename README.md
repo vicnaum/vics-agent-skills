@@ -207,7 +207,7 @@ Analyze this session and tell me where the tokens are going
 
 ### [agent-chat](skills/agent-chat/SKILL.md)
 
-Serverless local chat between Claude Code sessions running concurrently on the same machine — stop being the copy-paste relay between your own agents. Rooms are plain JSONL files (no daemon): every agent auto-joins its **project room** (derived from its cwd, so agents in the same folder share a channel with zero config) plus **#general**; DMs land in the room both agents share (project room first, #general only for cross-project). Unread messages are auto-delivered into each session's context by three hooks (mid-turn after tool calls, at turn end, and with your next prompt), with per-agent read cursors — a busy or crashed agent picks up its full backlog when it comes back.
+Serverless local chat between Claude Code, OpenAI Codex and OpenCode sessions running concurrently on the same machine — stop being the copy-paste relay between your own agents. Rooms are plain JSONL files (no daemon): every agent auto-joins its **project room** (derived from its cwd, so agents in the same folder share a channel with zero config) plus **#general**; DMs land in the room both agents share (project room first, #general only for cross-project). Unread messages are auto-delivered into each session's context by three hooks (mid-turn after tool calls, at turn end, and with your next prompt), with per-agent read cursors — a busy or crashed agent picks up its full backlog when it comes back.
 
 Identity is the *name*, not the session: re-registering the same name after a fork/strip/restart silently rebinds it — cursors kept, no join announcement, peers can't tell the transition happened.
 
@@ -215,7 +215,9 @@ Also includes remote control of peers by typing into their terminals: wake an id
 
 Two terminal backends, auto-detected per agent: **iTerm2** (AppleScript) and **tmux** (`send-keys`/`capture-pane`) — the tmux backend works fully headless, e.g. agents on a Linux server over SSH. The chat core itself is plain bash+jq+files and runs anywhere.
 
-**Cross-CLI**: OpenAI **Codex** agents (CLI >= 0.145, which ships a Claude-Code-compatible hooks system) join the same rooms — `agent-chat setup-codex` wires the hooks, Codex sessions register via `$CODEX_THREAD_ID`, and Claude and Codex agents chat, nudge, and remote-control each other seamlessly (`who` tags them `[codex]`).
+**Cross-CLI**: OpenAI **Codex** agents (CLI >= 0.145, which ships a Claude-Code-compatible hooks system) join the same rooms — `agent-chat setup-codex` wires the hooks, Codex sessions register via `$CODEX_THREAD_ID`, and Claude and Codex agents chat, nudge, and remote-control each other seamlessly (`who` tags them `[codex]`). **OpenCode** (v2) agents join with no setup at all: they register via `$OPENCODE_SESSION_ID`, and since OpenCode has no hooks, whoever sends them a message delivers it straight into their session through OpenCode's server API — which also wakes an idle one without typing anything.
+
+Codex and OpenCode both run tool commands in a shared background server, so a session's environment says nothing reliable about which terminal it is in. agent-chat finds each agent's pane from evidence instead (process ancestry; for Codex the thread id in the title or launch command, what the pane shows, when the TUI started) and never binds to a guess; `setup-codex --title-id` makes the Codex case exact.
 
 > macOS iTerm2 and/or tmux + `jq`. Needs three hooks in `~/.claude/settings.json` — see the [SKILL.md](skills/agent-chat/SKILL.md) install section.
 
@@ -230,6 +232,7 @@ Two terminal backends, auto-detected per agent: **iTerm2** (AppleScript) and **t
 | `screen <name> [N]` | live snapshot of the agent's visible terminal |
 | `type <name> "text"` / `key <name> <keys...>` | remote-drive its TUI: escape, enter, ctrl-c, arrows, tab... |
 | `spawn <name> [--dir d] [--prompt "task"] [--tab\|--pane\|--tmux]` | launch a new self-registering agent — new window, tab, split pane, or tmux session |
+| `status [name]` / `whereami` | live state of an agent (busy · idle · waiting · dead · offline); what this session resolves to |
 | `web [port]` | local live web viewer: channels · messages · people with status/unread |
 
 #### Example ask

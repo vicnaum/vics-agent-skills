@@ -59,21 +59,43 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# terminal backend of this very session
-if [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ]; then
-  TB="tmux"; TA="$TMUX_PANE"
-elif [ -n "${ITERM_SESSION_ID:-}" ]; then
-  TB="iterm"; TA="${ITERM_SESSION_ID#*:}"
-else
-  die "no supported terminal (need iTerm2 or tmux)"
-fi
-
 # which CLI is this? Claude Code exports CLAUDE_CODE_SESSION_ID, Codex exports
 # CODEX_THREAD_ID (same UUID `codex resume` takes). Determines the exit method
 # (/exit vs double ctrl-c) and the relaunch form (--resume vs resume).
 if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then CLI="claude"
 elif [ -n "${CODEX_THREAD_ID:-}" ]; then CLI="codex"
 else CLI="claude"; fi
+
+# terminal backend of this very session
+TB="" TA=""
+if [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ]; then
+  TB="tmux"; TA="$TMUX_PANE"
+elif [ -n "${ITERM_SESSION_ID:-}" ]; then
+  TB="iterm"; TA="${ITERM_SESSION_ID#*:}"
+fi
+
+# Codex (>= 0.16x) runs tool commands in a shared background daemon, so the
+# environment above is the DAEMON's: it names whichever terminal first started
+# it, not this session's. Sending the quit keys there would kill a different
+# agent's CLI. It is only this session's terminal if an ancestor of this
+# process is attached to a tty (Codex running tools in-process); otherwise ask
+# agent-chat, which locates the real pane by evidence.
+if [ "$CLI" = "codex" ]; then
+  own_tty=""; p=$PPID; hops=0
+  while [ -n "$p" ] && [ "$p" -gt 1 ] 2>/dev/null && [ "$hops" -lt 30 ]; do
+    pp=""; read -r pp tt <<< "$(ps -o ppid=,tty= -p "$p" 2>/dev/null)"
+    [ -n "$pp" ] || break
+    case "$tt" in ''|'?'|'??'|'-') ;; *) own_tty="$tt"; break;; esac
+    p="$pp"; hops=$((hops + 1))
+  done
+  if [ -z "$own_tty" ]; then
+    TB="" TA=""
+    AC="$(command -v agent-chat 2>/dev/null || echo "$HOME/.claude/agent-chat/agent-chat")"
+    [ -x "$AC" ] && read -r _ _ TB TA _ <<< "$("$AC" whereami --porcelain 2>/dev/null)"
+    { [ -n "$TB" ] && [ "$TB" != "none" ]; } || die "can't tell which terminal this Codex session is in (Codex runs commands in a shared background daemon, so \$ITERM_SESSION_ID/\$TMUX_PANE describe the daemon, not you). Register on agent-chat first ('agent-chat register <name>', twice if it asks), or make it exact for new sessions with 'agent-chat setup-codex --title-id'."
+  fi
+fi
+[ -n "$TB" ] || die "no supported terminal (need iTerm2 or tmux)"
 
 [ -n "$SID" ] || SID="${CLAUDE_CODE_SESSION_ID:-${CODEX_THREAD_ID:-}}"
 [[ "$SID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \

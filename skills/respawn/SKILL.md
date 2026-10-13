@@ -42,6 +42,8 @@ Everything is logged to `~/.claude/respawn/respawn.log` — check it when a resp
 
 Works for Codex CLI too, auto-detected via `$CODEX_THREAD_ID`: the relaunch is `codex resume <thread-id>` (flags come from your codex config/profile; use `--cmd "codex --profile x"` to override) and the graceful quit is a double ctrl-c instead of `/exit`. Caveat: ctrl-c *interrupts* a running Codex turn rather than queueing politely, so only self-respawn when about to go idle — which is the normal strip-then-respawn flow anyway.
 
+Finding the window: Codex (0.16x and later) runs tool commands in a shared background daemon, so `$ITERM_SESSION_ID`/`$TMUX_PANE` describe the terminal that first started that daemon, not the session calling `respawn.sh` — the quit keys would land in someone else's CLI. `respawn.sh` therefore trusts the environment for Codex only when an ancestor of the command owns a tty (Codex running tools in-process); otherwise it asks `agent-chat whereami`, which locates the pane by evidence (see the agent-chat skill's Codex section), and refuses to proceed if the pane can't be identified. In practice: a Codex session should be registered on agent-chat before it respawns itself.
+
 ## Verification / caveats
 
 - `--dry-run` runs the whole watcher against the real window but only logs what it would type or kill — use it to sanity-check before the first real respawn on a machine (grants the osascript→iTerm automation permission on first use).

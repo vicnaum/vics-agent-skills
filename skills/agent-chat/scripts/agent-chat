@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# agent-chat — local peer-to-peer chat between Claude Code sessions on this machine.
+# agent-chat — local peer-to-peer chat between Claude Code, OpenAI Codex and
+# OpenCode sessions on this machine.
 #
 # No server: rooms are append-only JSONL files under ~/.claude/agent-chat/rooms/,
 # with per-agent read cursors. Registered sessions get unread messages
-# auto-delivered via Claude Code hooks (UserPromptSubmit, PostToolUse, Stop).
+# auto-delivered: Claude Code and Codex pull them through their hooks
+# (UserPromptSubmit, PostToolUse, Stop); OpenCode has them pushed into the
+# session by the sender through OpenCode's own server API.
 # `nudge` wakes an idle session by typing into its iTerm window (AppleScript).
 #
 # Rooms (mIRC-style): every agent is a member of its project room (derived from
@@ -45,14 +48,18 @@
 #   agent-chat unregister [<name>]          leave the chat (default: self)
 #   agent-chat web [port]                   local web viewer (default :8787): channels, live
 #                                           messages, people with status + unread counts
-#   agent-chat setup-codex                  wire delivery/status hooks into OpenAI Codex CLI
+#   agent-chat setup-codex [--title-id]     wire delivery/status hooks into OpenAI Codex CLI
 #                                           (~/.codex/hooks.json — same hook contract); Codex
-#                                           agents then join the same rooms as Claude agents
+#                                           agents then join the same rooms as Claude agents.
+#                                           --title-id also puts the thread id in Codex's terminal
+#                                           title, which pins each agent to its pane exactly
+#   agent-chat whereami                     what this session resolves to: cli, session id, terminal
 #   agent-chat hook <EventName>             internal: called by Claude Code / Codex hooks (stdin = hook JSON)
 #
-# Identity: $CLAUDE_CODE_SESSION_ID (Claude) or $CODEX_THREAD_ID (Codex); --as <name> overrides.
+# Identity: $CLAUDE_CODE_SESSION_ID (Claude), $CODEX_THREAD_ID (Codex) or
+# $OPENCODE_SESSION_ID (OpenCode); --as <name> overrides.
 
-BASE="$HOME/.claude/agent-chat"
+BASE="${AGENT_CHAT_HOME:-$HOME/.claude/agent-chat}"
 ROOMS="$BASE/rooms"
 REG="$BASE/registry"
 CUR="$BASE/cursors"
@@ -70,42 +77,68 @@ now() { date +"%Y-%m-%dT%H:%M:%S%z"; }
 
 proj_room() { printf '%s' "$PWD" | sed 's/[^a-zA-Z0-9]/-/g'; }
 
-# terminal backend for this process: "tmux <pane-id>" | "iterm <uuid>" | "none -"
-detect_term() {
-  if [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ]; then
-    echo "tmux ${TMUX_PANE}"
-  elif [ -n "${ITERM_SESSION_ID:-}" ]; then
-    echo "iterm ${ITERM_SESSION_ID#*:}"
-  else
-    detect_term_from_ancestors
-  fi
-}
-
-# Fallback when our own env was scrubbed (Codex `shell_environment_policy.inherit = "core"`
-# drops ITERM_SESSION_ID/TMUX_PANE from tool shells): walk the parent chain and read the
-# terminal id from the first ancestor that still carries it (the codex/claude process itself,
-# or the Codex app-server daemon, which inherits the TUI's environment).
-detect_term_from_ancestors() {
-  local pid=$$ env depth=0 pane iterm
-  while [ "$pid" -gt 1 ] && [ "$depth" -lt 12 ]; do
-    env=$(ps eww -o command= -p "$pid" 2>/dev/null | tr ' ' '\n')
-    pane=$(printf '%s\n' "$env" | sed -n 's/^TMUX_PANE=//p' | head -n1)
-    if [ -n "$pane" ] && printf '%s\n' "$env" | grep -q '^TMUX='; then echo "tmux $pane"; return; fi
-    iterm=$(printf '%s\n' "$env" | sed -n 's/^ITERM_SESSION_ID=//p' | head -n1)
-    if [ -n "$iterm" ]; then echo "iterm ${iterm#*:}"; return; fi
-    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' '); [ -n "$pid" ] || break
-    depth=$((depth+1))
-  done
-  echo "none -"
-}
-
 valid_room() { printf '%s' "$1" | grep -Eq '^-?[A-Za-z0-9][A-Za-z0-9_-]{0,128}$'; }
+
+# ---------- which CLI is running this command ----------
+
+US=$'\037'   # field separator for internal records (never appears in titles/paths)
+
+real_tty() { case "$1" in ''|'?'|'??'|'-') return 1;; esac; return 0; }
+
+ancestry() { # this process's ancestors, nearest first: "pid<TAB>tty<TAB>command"
+  local p="$PPID" pp tt cmd i=0
+  while [ -n "$p" ] && [ "$p" -gt 1 ] 2>/dev/null && [ "$i" -lt 30 ]; do
+    pp=""
+    read -r pp tt cmd <<< "$(ps -o ppid=,tty=,command= -p "$p" 2>/dev/null)"
+    [ -n "$pp" ] || break
+    printf '%s\t%s\t%s\n' "$p" "$tt" "$cmd"
+    p="$pp"; i=$((i + 1))
+  done
+}
+
+# command line -> claude|codex|opencode, judged by the PROGRAM it runs (never by
+# its arguments: a tool shell's command line contains the agent's whole command,
+# message text included). rc 1 if it is none of them.
+cli_of_cmd() {
+  local a b rest
+  read -r a b rest <<< "$1"
+  a="${a#-}"
+  case "${a##*/}" in node|nodejs|bun) a="$b";; esac
+  case "${a##*/}" in
+    claude|claude.js)     echo claude;;
+    codex|codex.js)       echo codex;;
+    opencode|opencode.js) echo opencode;;
+    *) case "$a" in *claude-code*|*@anthropic-ai*) echo claude;; *) return 1;; esac;;
+  esac
+}
+
+# self_identity -> "cli session-id" of the CLI running this command (rc 1: none).
+# Each CLI exports its own id into its tool commands. More than one can be set
+# when a CLI was started from inside another one's shell, or by a tmux server /
+# background daemon that inherited one — then the NEAREST CLI ancestor decides.
+self_identity() {
+  local c="${CLAUDE_CODE_SESSION_ID:-}" x="${CODEX_THREAD_ID:-}" o="${OPENCODE_SESSION_ID:-}" n=0 cli="" _ cmd
+  [ -n "$c" ] && n=$((n + 1)); [ -n "$x" ] && n=$((n + 1)); [ -n "$o" ] && n=$((n + 1))
+  if [ "$n" -gt 1 ]; then
+    cli=$(ancestry | while IFS=$'\t' read -r _ _ cmd; do cli_of_cmd "$cmd" && break; done)
+  fi
+  case "$cli" in
+    claude)   [ -n "$c" ] && { echo "claude $c"; return 0; };;
+    codex)    [ -n "$x" ] && { echo "codex $x"; return 0; };;
+    opencode) [ -n "$o" ] && { echo "opencode $o"; return 0; };;
+  esac
+  if   [ -n "$c" ]; then echo "claude $c"
+  elif [ -n "$x" ]; then echo "codex $x"
+  elif [ -n "$o" ]; then echo "opencode $o"
+  else return 1; fi
+}
 
 # ---------- identity ----------
 
 resolve_name() { # [session_id] -> registered name, rc=1 if not registered
-  local sid="${1:-${CLAUDE_CODE_SESSION_ID:-${CODEX_THREAD_ID:-}}}"
+  local sid="${1:-}"
   [ -n "$AS_NAME" ] && { echo "$AS_NAME"; return 0; }
+  if [ -z "$sid" ]; then sid=$(self_identity) || return 1; sid="${sid#* }"; fi
   [ -z "$sid" ] && return 1
   local files=("$REG"/*.json)
   [ -e "${files[0]}" ] || return 1
@@ -150,10 +183,28 @@ deliver() {
     case "$cursor" in (*[!0-9]*|'') cursor=0;; esac
     [ "$total" -le "$cursor" ] && continue
     chunk=$(tail -n +"$((cursor + 1))" "$f" | $JQ -r --arg me "$name" --arg room "$room" "$FMT_ADDRESSED")
-    echo "$total" > "$curfile"
+    # $DELIVER_PENDING defers the cursor moves to commit_delivery, for callers
+    # that hand the text to something that can fail (oc_push)
+    if [ -n "${DELIVER_PENDING:-}" ]; then printf '%s\t%s\n' "$curfile" "$total" >> "$DELIVER_PENDING"
+    else echo "$total" > "$curfile"; fi
     [ -n "$chunk" ] && out="${out}${chunk}"$'\n'
   done <<< "$(my_rooms "$name")"
   printf '%s' "$out"
+}
+
+commit_delivery() { # <pending-file> — apply the cursor moves a deferred deliver recorded
+  local cf total
+  while IFS=$'\t' read -r cf total; do
+    [ -n "$cf" ] && echo "$total" > "$cf"
+  done < "$1"
+  rm -f "$1"
+}
+
+mail_payload() { # name text — the block an agent is shown when mail reaches it
+  printf '%s' "📨 agent-chat — new message(s) for you ('$1'):
+$2
+
+If a reply or coordination is needed, respond with: agent-chat send \"...\" (add --to <sender> for a DM, --room <room> to answer in that room). If purely informational, take note and continue."
 }
 
 set_cursor_eof() { # name room
@@ -169,11 +220,11 @@ cmd_register() {
   printf '%s' "$name" | grep -Eq '^[a-z0-9][a-z0-9_-]{0,31}$' \
     || die "name must be short lowercase [a-z0-9_-], e.g. 'summarizer'"
   # identity: Claude Code exports CLAUDE_CODE_SESSION_ID, Codex exports
-  # CODEX_THREAD_ID (same UUID as its rollout file and `codex resume`)
-  local sid="${CLAUDE_CODE_SESSION_ID:-${CODEX_THREAD_ID:-manual-$$}}" cli proom rooms_json
-  if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then cli="claude"
-  elif [ -n "${CODEX_THREAD_ID:-}" ]; then cli="codex"
-  else cli="unknown"; fi
+  # CODEX_THREAD_ID (same UUID as its rollout file and `codex resume`),
+  # OpenCode exports OPENCODE_SESSION_ID (ses_…, what `opencode -s` takes)
+  local sid cli proom rooms_json
+  if sid=$(self_identity); then cli="${sid%% *}"; sid="${sid#* }"
+  else cli="unknown"; sid="manual-$$"; fi
   proom=$(proj_room)
   # drop stale entries binding this same session to a different name
   local f oldname
@@ -182,30 +233,54 @@ cmd_register() {
     oldname=$($JQ -r --arg sid "$sid" 'select(.session_id == $sid) | .name' "$f")
     if [ -n "$oldname" ] && [ "$oldname" != "$name" ]; then rm -f "$f" "$CUR/$oldname"@*; fi
   done
-  local tb ta
-  read -r tb ta <<< "$(detect_term)"
+  local tb ta tsrc delivery=""
+  read -r tb ta tsrc <<< "$(detect_term "$cli" "$sid" "$name")"
+  # OpenCode running under its background service: mail is pushed into the
+  # session through the server API (no hooks to pull it, no typing needed)
+  if [ "$cli" = opencode ] && ! has_tty_ancestor && oc_knows_session "$sid"; then delivery="api"; fi
+  # OpenCode's TUI hands its own environment to the session it shows; a session
+  # nobody opened in a TUI still has the service's, which names an unrelated
+  # terminal — only keep it if an opencode really runs there
+  if [ "$cli" = opencode ] && [ "$tsrc" = env ] && ! tty_has_cli "$(agent_tty "$tb" "$ta")" opencode; then
+    tb="none"; ta="-"; tsrc="none"
+  fi
   if [ -e "$REG/$name.json" ]; then
     # existing identity: silent rebind (new session/window/cwd), keep rooms + cursors
     rooms_json=$($JQ -c --arg hr "$proom" '(.rooms + [$hr]) | unique' "$REG/$name.json")
-    $JQ -n --arg name "$name" --arg sid "$sid" --arg tb "$tb" --arg ta "$ta" --arg cli "$cli" \
-          --arg cwd "$PWD" --arg ts "$(now)" --arg hr "$proom" --argjson rooms "$rooms_json" \
-          '{name:$name, session_id:$sid, cli:$cli, term_backend:$tb, term_addr:$ta, cwd:$cwd, home_room:$hr, rooms:$rooms, registered_at:$ts}' \
-          > "$REG/$name.json.tmp" && mv "$REG/$name.json.tmp" "$REG/$name.json"
+    $JQ -n --arg name "$name" --arg sid "$sid" --arg tb "$tb" --arg ta "$ta" --arg tsrc "$tsrc" --arg cli "$cli" \
+          --arg dl "$delivery" --arg cwd "$PWD" --arg ts "$(now)" --arg hr "$proom" --argjson rooms "$rooms_json" \
+          '{name:$name, session_id:$sid, cli:$cli, term_backend:$tb, term_addr:$ta, term_src:$tsrc, cwd:$cwd, home_room:$hr, rooms:$rooms, registered_at:$ts}
+           + (if $dl != "" then {delivery:$dl} else {} end)' \
+          > "$REG/$name.json.tmp.$$" && mv "$REG/$name.json.tmp.$$" "$REG/$name.json"
     local r
     while IFS= read -r r; do
       [ -n "$r" ] && [ ! -f "$CUR/$name@$r" ] && set_cursor_eof "$name" "$r"
     done <<< "$(my_rooms "$name")"
     echo "Rebound '$name' to this session (silent — no join announcement, cursors kept)."
   else
-    $JQ -n --arg name "$name" --arg sid "$sid" --arg tb "$tb" --arg ta "$ta" --arg cli "$cli" \
-          --arg cwd "$PWD" --arg ts "$(now)" --arg hr "$proom" \
-          '{name:$name, session_id:$sid, cli:$cli, term_backend:$tb, term_addr:$ta, cwd:$cwd, home_room:$hr, rooms:([$hr,"general"] | unique), registered_at:$ts}' \
+    $JQ -n --arg name "$name" --arg sid "$sid" --arg tb "$tb" --arg ta "$ta" --arg tsrc "$tsrc" --arg cli "$cli" \
+          --arg dl "$delivery" --arg cwd "$PWD" --arg ts "$(now)" --arg hr "$proom" \
+          '{name:$name, session_id:$sid, cli:$cli, term_backend:$tb, term_addr:$ta, term_src:$tsrc, cwd:$cwd, home_room:$hr, rooms:([$hr,"general"] | unique), registered_at:$ts}
+           + (if $dl != "" then {delivery:$dl} else {} end)' \
           > "$REG/$name.json"
     append_msg "$proom" "system" "*" "$name joined (cwd: $PWD)"
     set_cursor_eof "$name" "$proom"
     set_cursor_eof "$name" "general"
     echo "Registered as '$name' (project room: #$proom, also in #general)."
   fi
+  case "$tb" in
+    none)
+      if [ "$cli" = codex ]; then
+        echo "ACTION NEEDED: run this exact command once more — 'agent-chat register $name'. Registration worked, but agent-chat couldn't yet tell which terminal this Codex session is in (Codex runs commands in a shared background daemon, and only prints a command on screen after it finishes). The second run recognises this pane by the line the first one just left on screen. Until then chat reaches you through hooks, but peers can't wake or watch you. (If a second run still says this, 'agent-chat setup-codex --title-id' makes it exact for new Codex sessions.)" >&2
+      elif [ "$delivery" = api ]; then
+        echo "Mail delivery: OpenCode server API (no iTerm/tmux terminal found, so peers can't watch or drive this session — messages and wake-ups still arrive)."
+      else
+        echo "note: no iTerm/tmux terminal found for this session — chat works, but peers can't wake (nudge), watch or drive it."
+      fi;;
+    *) echo "Terminal: $tb $ta (found via $tsrc)$([ "$delivery" = api ] && echo '; mail delivery: OpenCode server API')";;
+  esac
+  [ "$cli" = opencode ] && [ "$delivery" != api ] && \
+    echo "note: this OpenCode session isn't run by the background service, so mail can't be pushed into it — peers wake you by typing a nudge; run 'agent-chat read' to fetch messages."
   echo "Agents currently registered:"
   cmd_who
 }
@@ -272,33 +347,64 @@ cmd_send() {
   # is ACTIVE, so an idle agent would otherwise never see the message
   # (--quiet opts out for pure FYIs). Room posts stay passive unless --nudge.
   if [ "$to" != "*" ] && [ "$quiet" = 0 ]; then nudge=1; fi
-  if [ "$nudge" = 1 ]; then
-    local f name st state src
-    for f in "$REG"/*.json; do
-      [ -e "$f" ] || break
-      name=$($JQ -r .name "$f")
-      [ "$name" = "$from" ] && continue
-      [ "$to" != "*" ] && [ "$name" != "$to" ] && continue
-      if [ "$to" = "*" ] && ! $JQ -e --arg r "$room" '.rooms | index($r)' "$f" >/dev/null; then continue; fi
-      # state-aware delivery: only wake an agent that won't otherwise see it
+  # everyone registered, in one pass: name<US>delivery<US>is-a-member-of-this-room
+  local name dl member st state src rc
+  while IFS="$US" read -r name dl member <&3; do
+    [ -n "$name" ] || continue
+    [ "$name" = "$from" ] && continue
+    [ "$to" != "*" ] && [ "$name" != "$to" ] && continue
+    if [ "$member" != true ]; then
+      # not in this room: a broadcast isn't for it; an explicit --room DM to a
+      # non-member can still wake it (it'll read the room when it joins)
+      { [ "$to" = "*" ] || [ "$nudge" = 0 ]; } && continue
+    fi
+    # push-delivered agents (OpenCode) have no hooks to pull mail with, so every
+    # message for them — passive room posts too — is handed to their session now
+    if [ "$dl" = api ]; then
       st=$(agent_state "$name"); state="${st%%$'\t'*}"; src="${st#*$'\t'}"
       case "$state" in
-        busy)
-          echo "  → $name is busy — hooks will deliver at its next turn boundary (not nudging)";;
-        waiting)
-          echo "  → $name is blocked on a prompt/dialog — NOT typing (would hit a button). It'll see the message when it resumes. Inspect: agent-chat screen $name";;
-        idle)
-          do_nudge "$name" "[agent-chat] new message from $from in #$room — run: agent-chat read" && \
-            echo "  → $name was idle — nudged" || true;;
         dead|offline)
-          echo "  → $name is $state ($src) — message stored; it'll be delivered when that session restarts and re-registers";;
-        *)
-          # unknown: nudge anyway (best-effort), typing is harmless at an idle prompt
-          do_nudge "$name" "[agent-chat] new message from $from in #$room — run: agent-chat read" && \
-            echo "  → $name state unknown ($src) — nudged best-effort" || true;;
+          [ "$nudge" = 1 ] && echo "  → $name is $state ($src) — message stored; it'll be delivered when that session is open again"
+          continue;;
       esac
-    done
-  fi
+      oc_push "$name" "$nudge"; rc=$?
+      case "$rc" in
+        0) if [ "$nudge" = 1 ]; then
+             case "$state" in
+               busy)    echo "  → $name is busy — handed to its session, it'll see it at its next step";;
+               waiting) echo "  → $name is blocked on a prompt/dialog — queued in its session, it'll see it when it resumes. Inspect: agent-chat screen $name";;
+               *)       echo "  → $name was idle — delivered and woken";;
+             esac
+           fi
+           continue;;
+        1) [ "$nudge" = 1 ] && echo "  → $name has nothing unread from this (is it a member of #$room?)"
+           continue;;
+      esac
+      [ "$nudge" = 1 ] && echo "  → $name: OpenCode server didn't accept the message — falling back to a terminal nudge" >&2
+    fi
+    [ "$nudge" = 1 ] || continue
+    # state-aware delivery: only wake an agent that won't otherwise see it
+    st=$(agent_state "$name"); state="${st%%$'\t'*}"; src="${st#*$'\t'}"
+    case "$state" in
+      busy)
+        echo "  → $name is busy — hooks will deliver at its next turn boundary (not nudging)";;
+      waiting)
+        echo "  → $name is blocked on a prompt/dialog — NOT typing (would hit a button). It'll see the message when it resumes. Inspect: agent-chat screen $name";;
+      idle)
+        do_nudge "$name" "[agent-chat] new message from $from in #$room — run: agent-chat read" && \
+          echo "  → $name was idle — nudged" || true;;
+      dead|offline)
+        echo "  → $name is $state ($src) — message stored; it'll be delivered when that session restarts and re-registers";;
+      unlocated)
+        echo "  → $name: $src — NOT typing (no terminal to type into). Message stored; it sees it at its next turn boundary. To make it reachable, have it run: agent-chat register $name";;
+      *)
+        # unknown: nudge anyway (best-effort), typing is harmless at an idle prompt
+        do_nudge "$name" "[agent-chat] new message from $from in #$room — run: agent-chat read" && \
+          echo "  → $name state unknown ($src) — nudged best-effort" || true;;
+    esac
+  done 3<<< "$($JQ -r --arg r "$room" \
+    '[.name, (.delivery // ""), (((.rooms // []) | index($r)) != null)] | map(tostring) | join("\u001f")' \
+    "$REG"/*.json 2>/dev/null)"
 }
 
 cmd_read() {
@@ -379,18 +485,331 @@ cmd_who() {
   [ "$found" = 1 ] || echo "  (nobody registered)"
 }
 
-agent_term() { # name -> "backend addr" from the registry (legacy entries fall back to iterm)
-  local f="$REG/$1.json"
-  [ -e "$f" ] || die "no agent named '$1' is registered"
-  local tb ta
-  tb=$($JQ -r '.term_backend // empty' "$f")
-  ta=$($JQ -r '.term_addr // empty' "$f")
-  if [ -z "$tb" ]; then
+# ---------- finding an agent's terminal ----------
+#
+# The terminal is NOT simply $ITERM_SESSION_ID / $TMUX_PANE: those describe the
+# process that exported them, and newer CLIs run tool commands in a shared
+# background server (Codex's app-server daemon, OpenCode's service) whose
+# environment belongs to whichever terminal happened to start it first. So:
+#   1. nearest ancestor that owns a tty  -> that tty's pane   (Claude Code, and
+#      any CLI that runs tools in-process)
+#   2. Codex under its daemon            -> codex_locate (evidence-based)
+#   3. otherwise the environment         (OpenCode's TUI forwards its own env
+#      to the server for the session it shows, so there it IS the TUI's)
+
+_term_list_raw() {
+  if command -v tmux >/dev/null 2>&1; then
+    tmux list-panes -a -F "tmux${US}#{pane_id}${US}#{pane_tty}${US}#{pane_title}" 2>/dev/null
+  fi
+  # (check it's running first: `tell application "iTerm2"` would LAUNCH iTerm on
+  #  a tmux-only box. Not pgrep — on macOS it hides its own ancestors, and
+  #  iTerm is the ancestor of every shell it hosts.)
+  if command -v osascript >/dev/null 2>&1 && ps -axo comm= 2>/dev/null | grep -q '/iTerm2$'; then
+    osascript <<'APPLESCRIPT' 2>/dev/null
+set us to (ASCII character 31)
+set out to ""
+tell application "iTerm2"
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        set out to out & "iterm" & us & (id of s as text) & us & (tty of s) & us & (name of s) & linefeed
+      end repeat
+    end repeat
+  end repeat
+end tell
+return out
+APPLESCRIPT
+  fi
+}
+
+# every reachable terminal, one per line: backend<US>addr<US>tty<US>title
+# (tmux panes first, so a pane wins over the iTerm session tmux runs in).
+# `warm_terms` snapshots it once for commands that resolve many agents.
+term_list() {
+  if [ -n "${_TERM_LIST+x}" ]; then printf '%s\n' "$_TERM_LIST"; else _term_list_raw; fi
+}
+warm_terms() { _TERM_LIST=$(_term_list_raw); _CODEX_CANDS=$(_codex_cands_raw); }
+
+term_by_tty() { # /dev/ttyX -> "backend addr"
+  local b a t _
+  while IFS="$US" read -r b a t _; do
+    [ -n "$t" ] && [ "$t" = "$1" ] && { printf '%s %s' "$b" "$a"; return 0; }
+  done <<< "$(term_list)"
+  return 1
+}
+
+has_tty_ancestor() { # is this command a descendant of something attached to a terminal?
+  local _ t
+  while IFS=$'\t' read -r _ t _; do real_tty "$t" && return 0; done <<< "$(ancestry)"
+  return 1
+}
+
+uuid7_epoch() { # UUIDv7 -> the creation time embedded in it (unix seconds); rc 1 if not v7
+  local h="${1//-/}"
+  [ "${#h}" = 32 ] && [ "${h:12:1}" = 7 ] || return 1
+  case "${h:0:12}" in *[!0-9a-fA-F]*) return 1;; esac
+  echo $(( 16#${h:0:12} / 1000 ))
+}
+
+iso_epoch() { # our own timestamps (2026-10-12T21:06:10+0200) -> unix seconds; 0 if unparsable
+  date -j -f '%Y-%m-%dT%H:%M:%S%z' "$1" +%s 2>/dev/null || date -d "$1" +%s 2>/dev/null || echo 0
+}
+
+lstart_epoch() { # ps lstart in the C locale ("Mon Oct 12 21:05:52 2026") -> unix seconds
+  LC_ALL=C date -j -f '%a %b %d %T %Y' "$1" +%s 2>/dev/null || LC_ALL=C date -d "$1" +%s 2>/dev/null
+}
+
+# every terminal whose tty hosts a Codex TUI, one per line:
+# backend<US>addr<US>title<US>process-start(epoch)<US>command
+codex_cands() {
+  if [ -n "${_CODEX_CANDS+x}" ]; then printf '%s\n' "$_CODEX_CANDS"; else _codex_cands_raw; fi
+}
+_codex_cands_raw() {
+  local list procs b a t title tt d1 d2 d3 d4 d5 cmd
+  list=$(term_list); [ -n "$list" ] || return 0
+  procs=$(LC_ALL=C ps -axo tty=,lstart=,command= 2>/dev/null | grep -i codex)
+  [ -n "$procs" ] || return 0
+  while IFS="$US" read -r b a t title; do
+    [ -n "$t" ] || continue
+    while read -r tt d1 d2 d3 d4 d5 cmd; do
+      [ "/dev/$tt" = "$t" ] || continue
+      [ "$(cli_of_cmd "$cmd")" = codex ] || continue
+      case " $cmd " in *" app-server "*|*" exec "*|*" mcp-server "*) continue;; esac
+      printf '%s\n' "${b}${US}${a}${US}${title}${US}$(lstart_epoch "$d1 $d2 $d3 $d4 $d5")${US}${cmd}"
+    done <<< "$procs"
+  done <<< "$list"
+}
+
+# codex_unclaimed <name> — is there a Codex TUI that no OTHER registered agent
+# is verifiably bound to? If not, an agent we can't locate has nowhere left to
+# be: it is gone, not merely hidden.
+codex_unclaimed() {
+  local cands claimed b a _
+  cands=$(codex_cands); [ -n "$cands" ] || return 1
+  claimed=$($JQ -r --arg me "$1" \
+    'select(.cli == "codex" and .name != $me and ((.term_src // "") | IN("title","args","screen","start","ancestry","spawn")))
+     | "\(.term_backend) \(.term_addr)"' "$REG"/*.json 2>/dev/null)
+  while IFS="$US" read -r b a _; do
+    [ -n "$b" ] || continue
+    printf '%s\n' "$claimed" | grep -qxF -- "$b $a" || return 0
+  done <<< "$cands"
+  return 1
+}
+
+# codex_locate <thread-id> [<name>] [live] -> "backend addr src"; rc 1 if not found.
+#
+# Finds the terminal whose Codex TUI is showing this thread, strongest evidence
+# first — and returns nothing rather than a guess:
+#   title  — the thread id is in the terminal title ([tui] terminal_title has
+#            "thread-id"; `setup-codex --title-id` sets that up). Exact, and
+#            keeps working if the session moves to another pane.
+#   args   — the TUI was started as `codex resume <thread-id>`
+#   screen — the pane shows an `agent-chat register <name>` line. Codex prints
+#            a command only AFTER it finishes ("• Ran …"), so the first
+#            registration can't see itself — a second one can.
+#   start  — the TUI process started just before the thread was created
+#            (thread ids are UUIDv7: the creation time is in the id)
+# `live` = called by the thread itself, mid-turn (register): its pane must be
+# showing a busy spinner, which rules out idle panes — notably an older session
+# that registered under the same name and still has that line on screen.
+codex_locate() {
+  local tid="$1" name="${2:-}" live="${3:-}" cands b a title cmd st
+  [ "${#tid}" -ge 32 ] || return 1   # not a thread id (a manual/legacy entry)
+  cands=$(codex_cands); [ -n "$cands" ] || return 1
+
+  while IFS="$US" read -r b a title st cmd; do
+    [ -n "$b" ] || continue
+    case "$title" in *"${tid:0:23}"*) echo "$b $a title"; return 0;; esac
+  done <<< "$cands"
+  while IFS="$US" read -r b a title st cmd; do
+    [ -n "$b" ] || continue
+    case " $cmd " in *" $tid "*) echo "$b $a args"; return 0;; esac
+  done <<< "$cands"
+
+  if [ -n "$live" ]; then
+    local busy=""
+    while IFS="$US" read -r b a title st cmd; do
+      [ -n "$b" ] && [ "$(glyph_state "$title")" = busy ] \
+        && busy="${busy}${b}${US}${a}${US}${title}${US}${st}${US}${cmd}"$'\n'
+    done <<< "$cands"
+    [ -n "$busy" ] && cands="$busy"   # (no spinner anywhere: the title was customised — keep them all)
+  fi
+
+  if [ -n "$name" ]; then
+    local hit="" n=0 scr
+    while IFS="$US" read -r b a title st cmd; do
+      [ -n "$b" ] || continue
+      scr=$(term_screen "$b" "$a" 2>/dev/null | tr -s '[:space:]' ' ')
+      if printf '%s' "$scr" | grep -Eq "agent-chat( --as [a-z0-9_-]+)? register ${name}([^a-z0-9_-]|\$)"; then
+        hit="$b $a"; n=$((n + 1))
+      fi
+    done <<< "$cands"
+    [ "$n" = 1 ] && { echo "$hit screen"; return 0; }
+  fi
+
+  # Lazily (no spinner to cross-check) only a near-exact start match counts;
+  # mid-turn, the busy filter above makes a wider window safe.
+  local te d win=5 best="" bestd="" second=""
+  [ -n "$live" ] && win=30
+  te=$(uuid7_epoch "$tid") || return 1
+  while IFS="$US" read -r b a title st cmd; do
+    [ -n "$b" ] && [ -n "$st" ] || continue
+    d=$(( te - st ))
+    { [ "$d" -ge -2 ] && [ "$d" -le "$win" ]; } || continue
+    [ "$d" -lt 0 ] && d=$(( -d ))
+    if [ "$b $a" = "$best" ]; then
+      [ "$d" -lt "$bestd" ] && bestd="$d"
+    elif [ -z "$bestd" ] || [ "$d" -lt "$bestd" ]; then second="$bestd"; bestd="$d"; best="$b $a"
+    elif [ -z "$second" ] || [ "$d" -lt "$second" ]; then second="$d"; fi
+  done <<< "$cands"
+  [ -n "$best" ] || return 1
+  # two TUIs started together and the id can't tell them apart: don't guess
+  [ -n "$second" ] && [ $(( second - bestd )) -lt 3 ] && return 1
+  echo "$best start"
+}
+
+# detect_term <cli> <session-id> <name> -> "backend addr src" for THIS session
+# ("none - <why>" when there is no usable terminal). src records how it was
+# found; for Codex only evidence-based sources are trusted later (resolve_term).
+detect_term() {
+  local cli="$1" sid="$2" name="$3" tt="" _ t loc hb="" ha="" ht=0 hint="$BASE/spawn/$3"
+  # `spawn` leaves a note of the terminal it created for this name
+  if [ -f "$hint" ]; then read -r hb ha ht < "$hint"; rm -f "$hint"; fi
+  while IFS=$'\t' read -r _ t _; do
+    real_tty "$t" && { tt="$t"; break; }
+  done <<< "$(ancestry)"
+  if [ -n "$tt" ] && loc=$(term_by_tty "/dev/$tt"); then echo "$loc ancestry"; return; fi
+  if [ "$cli" = codex ] && [ -z "$tt" ]; then
+    if [ -n "$hb" ] && [ $(( $(date +%s) - ${ht:-0} )) -lt 900 ] \
+       && tty_has_cli "$(agent_tty "$hb" "$ha")" codex; then
+      echo "$hb $ha spawn"; return
+    fi
+    codex_locate "$sid" "$name" live || echo "none - unlocated"
+    return
+  fi
+  if [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ]; then echo "tmux ${TMUX_PANE} env"
+  elif [ -n "${ITERM_SESSION_ID:-}" ]; then echo "iterm ${ITERM_SESSION_ID#*:} env"
+  else echo "none - none"; fi
+}
+
+# ---------- OpenCode server API ----------
+#
+# OpenCode (v2) runs sessions in a background service with an HTTP API, reached
+# through `opencode api`. That gives agent-chat a first-class channel that the
+# hook-based CLIs lack: a message can be put straight into a session's inbox —
+# picked up at the next step if the session is working, at its next prompt if
+# it is idle, or (resume) waking it right now. No hooks, no typing.
+
+oc_api() { # <operation> [args...] — prints the response; rc 127 without an opencode binary
+  local oc
+  oc=$(command -v opencode 2>/dev/null) || oc="$HOME/.opencode/bin/opencode"
+  [ -x "$oc" ] || return 127
+  "$oc" api "$@" 2>/dev/null </dev/null
+}
+
+oc_knows_session() { # session-id — does the running service have this session?
+  oc_api session.get --param "sessionID=$1" | $JQ -e '.data.id' >/dev/null 2>&1
+}
+
+oc_state() { # session-id -> busy | waiting | idle ; rc 1 if the server can't say
+  local sid="$1" active
+  active=$(oc_api session.active) || return 1
+  printf '%s' "$active" | $JQ -e '.data' >/dev/null 2>&1 || return 1
+  if oc_api session.permission.list --param "sessionID=$sid" | $JQ -e '.data | length > 0' >/dev/null 2>&1 \
+     || oc_api session.form.list --param "sessionID=$sid" | $JQ -e '.data | length > 0' >/dev/null 2>&1; then
+    echo waiting
+  elif printf '%s' "$active" | $JQ -e --arg s "$sid" '.data | has($s)' >/dev/null 2>&1; then
+    echo busy
+  else
+    echo idle
+  fi
+}
+
+# oc_push <name> <wake:0|1> — hand <name> everything it hasn't read, through
+# the OpenCode API. wake=1 also starts the session if it is idle (the API
+# equivalent of a nudge); wake=0 only queues it for the session's next step or
+# prompt (what a hook delivery is for the other CLIs).
+# rc 0 delivered · 1 nothing unread · 2 the server refused (cursors untouched)
+oc_push() {
+  local name="$1" wake="$2" sid text pend body resume=false lock="$CUR/.push-$1.lock" i=0
+  sid=$(reg_get "$name" session_id)
+  # one push per recipient at a time, or two senders would both deliver the same backlog
+  while ! mkdir "$lock" 2>/dev/null; do
+    i=$((i + 1)); [ "$i" -gt 50 ] && { rmdir "$lock" 2>/dev/null; i=0; }
+    sleep 0.1
+  done
+  pend=$(mktemp "${TMPDIR:-/tmp}/agent-chat.XXXXXX")
+  text=$(DELIVER_PENDING="$pend" deliver "$name")
+  if [ -z "$text" ]; then
+    commit_delivery "$pend"; rmdir "$lock" 2>/dev/null; return 1
+  fi
+  [ "$wake" = 1 ] && resume=true
+  body=$($JQ -cn --arg t "$(mail_payload "$name" "$text")" --argjson r "$resume" \
+    '{text:$t, description:"agent-chat", delivery:"steer", resume:$r}')
+  if oc_api session.synthetic --param "sessionID=$sid" -d "$body" | $JQ -e '.data.id' >/dev/null 2>&1; then
+    commit_delivery "$pend"; rmdir "$lock" 2>/dev/null; return 0
+  fi
+  rm -f "$pend"; rmdir "$lock" 2>/dev/null; return 2
+}
+
+reg_get() { $JQ -r --arg k "$2" '.[$k] // empty' "$REG/$1.json" 2>/dev/null; } # name field
+
+set_term() { # name backend addr src — re-point an agent at a terminal
+  $JQ --arg tb "$2" --arg ta "$3" --arg src "$4" \
+    '.term_backend = $tb | .term_addr = $ta | .term_src = $src' "$REG/$1.json" > "$REG/$1.json.tmp.$$" \
+    && mv "$REG/$1.json.tmp.$$" "$REG/$1.json"
+}
+
+# resolve_term <name> -> "backend addr". rc 1: no terminal on record;
+# rc 2: a Codex agent whose terminal can't be located (see codex_locate);
+# rc 3: a Codex agent that is gone (every Codex TUI is accounted for).
+#
+# A Codex agent's record is only believed when it was found by evidence
+# (term_src title/args/screen/start/…) AND a codex still runs there. Entries
+# written from the daemon's inherited environment, and bindings whose TUI has
+# gone, are re-resolved here and the registry repaired — that is what lets a
+# stale or moved Codex agent become reachable again without re-registering.
+resolve_term() {
+  local f="$REG/$1.json" tb ta src cli sid reg tty loc
+  [ -e "$f" ] || return 1
+  IFS="$US" read -r tb ta src cli sid reg <<< "$($JQ -r \
+    '[.term_backend // "", .term_addr // "", .term_src // "", .cli // "claude", .session_id // "", .registered_at // ""] | join("\u001f")' "$f")"
+  if [ -z "$tb" ]; then   # legacy entries
     ta=$($JQ -r '.iterm_session_id // empty' "$f"); ta="${ta#*:}"
     [ -n "$ta" ] && tb="iterm"
   fi
-  { [ -n "$tb" ] && [ "$tb" != "none" ]; } || die "'$1' has no terminal recorded (registered outside iTerm/tmux?)"
+  if [ "$cli" = codex ]; then
+    local trusted=0
+    case "$src" in title|args|screen|start|ancestry|spawn) [ -n "$tb" ] && [ "$tb" != none ] && trusted=1;; esac
+    if [ "$trusted" = 1 ]; then
+      tty=$(agent_tty "$tb" "$ta")
+      [ -n "$tty" ] && tty_has_cli "$tty" codex && { printf '%s %s' "$tb" "$ta"; return 0; }
+    fi
+    if [ -z "${_CODEX_CANDS+x}" ]; then local _CODEX_CANDS; _CODEX_CANDS=$(_codex_cands_raw); fi
+    # (its register line can only still be on screen if it joined recently)
+    local nm=""
+    [ $(( $(date +%s) - $(iso_epoch "$reg") )) -lt 1800 ] && nm="$1"
+    if loc=$(codex_locate "$sid" "$nm"); then
+      read -r tb ta src <<< "$loc"
+      set_term "$1" "$tb" "$ta" "$src"
+      printf '%s %s' "$tb" "$ta"; return 0
+    fi
+    if [ "$trusted" != 1 ]; then codex_unclaimed "$1" && return 2; return 3; fi
+  fi
+  { [ -n "$tb" ] && [ "$tb" != "none" ]; } || return 1
   printf '%s %s' "$tb" "$ta"
+}
+
+agent_term() { # name -> "backend addr" from the registry; dies when there is no usable terminal
+  [ -e "$REG/$1.json" ] || die "no agent named '$1' is registered"
+  local out rc
+  out=$(resolve_term "$1"); rc=$?
+  case "$rc" in
+    0) printf '%s' "$out";;
+    2) die "can't tell which terminal '$1' (codex) is in — have it run: agent-chat register $1";;
+    3) die "'$1' (codex) is gone — no Codex session left that it could be";;
+    *) die "'$1' has no terminal recorded (registered outside iTerm/tmux?)";;
+  esac
 }
 
 iterm_write() { # uuid raw-bytes — write into the iTerm session verbatim, no auto-newline
@@ -427,7 +846,11 @@ term_type() { # backend addr text — type WITHOUT submitting
 term_enter() { # backend addr — a real Enter keypress (separate from the text: bracketed paste)
   case "$1" in
     iterm) iterm_write "$2" $'\r';;
-    tmux)  tmux send-keys -t "$2" Enter && echo ok;;
+    # the pause matters: tmux delivers the text and the Enter microseconds
+    # apart, and Codex reads that as one pasted burst — the Enter then lands in
+    # the input box as a newline instead of submitting (iTerm's two osascript
+    # calls are naturally far enough apart)
+    tmux)  sleep 0.4; tmux send-keys -t "$2" Enter && echo ok;;
     *) die "unsupported terminal backend '$1'";;
   esac
 }
@@ -497,17 +920,31 @@ APPLESCRIPT
 #
 # Layered status, most-authoritative first:
 #   1. terminal reachable? (iterm session / tmux pane exists)  — else OFFLINE
-#   2. a claude process alive on its tty?                      — else DEAD
-#   3. title glyph (Claude's own render loop; ALWAYS fresh, can't go stale):
+#   2. the agent's CLI (claude / codex / opencode) alive on its tty? — else DEAD
+#   3. OpenCode only: its server says busy / waiting / idle outright
+#   4. title glyph (the CLI's own render loop; ALWAYS fresh, can't go stale):
 #        ⠂/⠐ animating = busy · ✳ static = idle-or-waiting
-#   4. hook status file: adds the "waiting" sub-state the glyph can't express,
+#   5. hook status file: adds the "waiting" sub-state the glyph can't express,
 #      and is the fallback when the title is unreadable. TTL-guarded so a
 #      crashed/escaped session's stale "busy" never wins over the live glyph.
 
 STATUS="$BASE/status"
 STATUS_TTL=180   # seconds; a hook stamp older than this is not trusted on its own
 
+term_field() { # backend addr tty|title — answered from the terminal snapshot; rc 1 if none was taken
+  [ -n "${_TERM_LIST+x}" ] || return 1
+  local b a t title
+  while IFS="$US" read -r b a t title; do
+    if [ "$b" = "$1" ] && [ "$a" = "$2" ]; then
+      if [ "$3" = tty ]; then printf '%s' "$t"; else printf '%s' "$title"; fi
+      return 0
+    fi
+  done <<< "$_TERM_LIST"
+  return 0   # snapshot taken and the terminal isn't in it: gone
+}
+
 term_title() { # backend addr -> current terminal title (carries the state glyph)
+  term_field "$1" "$2" title && return
   case "$1" in
     tmux) tmux display -p -t "$2" '#{pane_title}' 2>/dev/null;;
     iterm)
@@ -532,7 +969,9 @@ APPLESCRIPT
 
 glyph_state() { # title -> busy | idle | unknown  (from the leading status glyph)
   case "$1" in
-    "⠂"*|"⠐"*) echo busy;;      # Claude Code TITLE_ANIMATION_FRAMES
+    "⠂"*|"⠐"*) echo busy;;      # Claude Code TITLE_ANIMATION_FRAMES (<= 2.1.2xx)
+    "◐"*|"◑"*|"◒"*|"◓"*)
+               echo busy;;      # Claude Code's busy frames since ~2.1.29x
     "⠋"*|"⠙"*|"⠹"*|"⠸"*|"⠼"*|"⠴"*|"⠦"*|"⠧"*|"⠇"*|"⠏"*)
                echo busy;;      # Codex braille spinner (dots) while working
     "✳"*)      echo idle;;      # Claude Code static prefix: idle OR waiting
@@ -542,6 +981,7 @@ glyph_state() { # title -> busy | idle | unknown  (from the leading status glyph
 }
 
 agent_tty() { # backend addr -> tty path, empty if terminal is gone
+  term_field "$1" "$2" tty && return
   case "$1" in
     tmux)  tmux display -p -t "$2" '#{pane_tty}' 2>/dev/null;;
     iterm)
@@ -569,18 +1009,49 @@ stamp_status() { # name state — record a hook-observed state with a timestamp
   printf '%s %s\n' "$2" "$(date +%s)" > "$STATUS/$1"
 }
 
-# agent_state <name> -> prints "STATE\tSOURCE"; STATE in busy|idle|waiting|dead|offline|unknown
+tty_has_cli() { # tty-path cli — is that agent CLI (any of them, if cli is unknown) running on the tty?
+  local re
+  [ -n "$1" ] || return 1
+  case "$2" in
+    codex)    re='(^|[/ ])codex(\.js)?( |$)';;
+    opencode) re='(^|[/ ])opencode(\.js)?( |$)';;
+    claude)   re='^ *([^ ]*/)?(claude|node)( |$)|claude';;
+    *)        re='claude|(^|[/ ])(codex|opencode|node)(\.js)?( |$)';;
+  esac
+  ps -t "${1#/dev/}" -o command= 2>/dev/null | grep -qE "$re"
+}
+
+# agent_state <name> -> prints "STATE\tSOURCE"
+# STATE: busy | idle | waiting | dead | offline | unknown | unlocated
+# (unlocated = alive or not, there is no terminal we could check or type into)
 agent_state() {
-  local name="$1" tb ta tty g title hstate hepoch age
-  read -r tb ta <<< "$(agent_term "$name" 2>/dev/null)" || { printf 'unknown\tno-terminal\n'; return; }
-  tty=$(agent_tty "$tb" "$ta")
-  [ -n "$tty" ] || { printf 'offline\twindow/pane closed\n'; return; }
-  # Claude Code shows up as `claude` (or `node .../claude`); Codex as `codex`. Since Codex 0.161
-  # the TUI's helpers live in a detached app-server daemon, so `codex` may be the ONLY process
-  # on the tty — it must match on its own.
-  if ! ps -t "${tty#/dev/}" -o command= 2>/dev/null | grep -qE '^ *(\S*/)?(claude|codex|node)( |$)|claude|codex'; then
-    printf 'dead\tno claude/codex process on tty (crashed/exited)\n'; return
+  local name="$1" cli api=0 term rc tb="" ta="" tty g title hstate hepoch age st
+  # one look at the terminals answers every question below (tty, title, Codex location)
+  if [ -z "${_TERM_LIST+x}" ]; then local _TERM_LIST; _TERM_LIST=$(_term_list_raw); fi
+  cli=$(reg_get "$name" cli); [ -n "$cli" ] || cli=claude
+  [ "$(reg_get "$name" delivery)" = api ] && api=1
+  term=$(resolve_term "$name"); rc=$?
+  if [ "$rc" = 0 ]; then
+    read -r tb ta <<< "$term"
+    tty=$(agent_tty "$tb" "$ta")
+    [ -n "$tty" ] || { printf 'offline\twindow/pane closed\n'; return; }
+    if ! tty_has_cli "$tty" "$cli"; then
+      case "$cli" in claude|codex|opencode) st="$cli";; *) st="agent CLI";; esac
+      printf 'dead\tno %s process on tty (crashed/exited)\n' "$st"; return
+    fi
+  elif [ "$rc" = 2 ]; then
+    printf 'unlocated\tcan%st tell which terminal its Codex TUI is in\n' "'"; return
+  elif [ "$rc" = 3 ]; then
+    printf 'offline\tno Codex session left that it could be\n'; return
+  elif [ "$api" = 0 ]; then
+    printf 'unlocated\tno terminal on record (registered outside iTerm/tmux)\n'; return
   fi
+  # OpenCode's server knows the session's state first-hand
+  if [ "$api" = 1 ] && st=$(oc_state "$(reg_get "$name" session_id)"); then
+    stamp_status "$name" "$st"   # no hooks stamp it: keep the web viewer's dot current
+    printf '%s\topencode api\n' "$st"; return
+  fi
+  [ -n "$tb" ] || { printf 'unlocated\tno terminal on record and the OpenCode server is unreachable\n'; return; }
   title=$(term_title "$tb" "$ta"); g=$(glyph_state "$title")
   hstate=""; if [ -f "$STATUS/$name" ]; then read -r hstate hepoch < "$STATUS/$name"; fi
   age=999999; [ -n "${hepoch:-}" ] && age=$(( $(date +%s) - hepoch ))
@@ -629,11 +1100,28 @@ cmd_status() { # [name] — resolve one agent's live state (default: all)
     return
   fi
   local f n
+  warm_terms
   for f in "$REG"/*.json; do
     [ -e "$f" ] || { echo "  (nobody registered)"; break; }
     n=$($JQ -r .name "$f")
     printf '%-16s %s\n' "$n" "$(agent_state "$n" | sed 's/\t/  (/;s/$/)/')"
   done
+}
+
+cmd_whereami() { # [--porcelain] — what THIS session resolves to (also used by the respawn skill)
+  local sid cli tb="" ta="" tsrc="" name term
+  if sid=$(self_identity); then cli="${sid%% *}"; sid="${sid#* }"; else cli="unknown"; sid="-"; fi
+  name=$(resolve_name 2>/dev/null) || name=""
+  # For a registered Codex session the verified record beats a fresh look: it
+  # may rest on evidence that is gone by now (the register line on screen).
+  if [ "$cli" = codex ] && [ -n "$name" ] && [ -z "$AS_NAME" ] && term=$(resolve_term "$name"); then
+    read -r tb ta <<< "$term"; tsrc=$(reg_get "$name" term_src)
+  else
+    read -r tb ta tsrc <<< "$(detect_term "$cli" "$sid" "")"
+  fi
+  if [ "${1:-}" = "--porcelain" ]; then printf '%s %s %s %s %s\n' "$cli" "$sid" "$tb" "$ta" "$tsrc"; return; fi
+  printf 'cli:      %s\nsession:  %s\nname:     %s\nterminal: %s %s (found via %s)\n' \
+    "$cli" "$sid" "${name:-(not registered)}" "$tb" "$ta" "$tsrc"
 }
 
 do_nudge() { # name [text] — type text, then Enter as a SEPARATE keystroke (submits as a prompt).
@@ -700,32 +1188,18 @@ cmd_spawn() { # <name> [--dir d] [--cmd "claude ..."] [--prompt "task"] [--tab|-
   # default launch command: reuse this session's own CLI flags (minus session
   # selectors), so e.g. --dangerously-skip-permissions carries over
   if [ -z "$cmd" ]; then
-    local tb ta ttypath
-    read -r tb ta <<< "$(detect_term)"
-    ttypath=""
-    case "$tb" in
-      tmux)  ttypath=$(tmux display -p -t "$ta" '#{pane_tty}' 2>/dev/null);;
-      iterm) ttypath=$(osascript - "$ta" <<'APPLESCRIPT'
-on run argv
-  set targetId to item 1 of argv
-  tell application "iTerm2"
-    repeat with w in windows
-      repeat with t in tabs of w
-        repeat with s in sessions of t
-          if (id of s as text) is equal to targetId then return (tty of s)
-        end repeat
-      end repeat
-    end repeat
-  end tell
-  return ""
-end run
-APPLESCRIPT
-);;
-    esac
-    if [ -n "$ttypath" ]; then
-      cmd=$(ps -t "${ttypath#/dev/}" -o command= 2>/dev/null | grep -E '^(\S*/)?claude( |$)' | head -n1 \
+    # the nearest CLI above this command is the one spawning: launch the same
+    local _ acmd
+    while IFS=$'\t' read -r _ _ acmd; do
+      case "$(cli_of_cmd "$acmd")" in
+        claude)
+          cmd=$(printf '%s' "$acmd" \
             | sed -E 's/ (--resume|-r|--session-id|--from-pr) [^ ]+//g; s/ (--resume|-r|--continue|-c|--fork-session|--from-pr)( |$)/ /g')
-    fi
+          break;;
+        codex)    cmd="codex"; break;;      # (its flags live in config/profile, not on the daemon's command line)
+        opencode) cmd="opencode"; break;;
+      esac
+    done <<< "$(ancestry)"
     [ -n "$cmd" ] || cmd="claude"
   fi
 
@@ -833,6 +1307,10 @@ APPLESCRIPT
     term_enter "$sb" "$sa" >/dev/null
   fi
 
+  # note which terminal this name was given: a CLI that runs its commands in a
+  # background daemon (Codex) can't see its own terminal when it registers
+  mkdir -p "$BASE/spawn" && printf '%s %s %s\n' "$sb" "$sa" "$(date +%s)" > "$BASE/spawn/$name"
+
   term_type "$sb" "$sa" "$cmd" >/dev/null
   term_enter "$sb" "$sa" >/dev/null
 
@@ -845,7 +1323,7 @@ APPLESCRIPT
   esac
   deadline=$((SECONDS + 45))
   while [ "$SECONDS" -lt "$deadline" ]; do
-    if [ -n "$ttypath" ] && ps -t "${ttypath#/dev/}" -o command= 2>/dev/null | grep -qE '^(\S*/)?claude( |$)'; then break; fi
+    if [ -n "$ttypath" ] && tty_has_cli "$ttypath" any; then break; fi
     [ -z "$ttypath" ] && [ "$SECONDS" -ge $((deadline - 37)) ] && break   # iterm: fixed ~8s boot wait
     sleep 2
   done
@@ -892,7 +1370,8 @@ cmd_web() { # [port] — serve the read-only chat viewer UI on localhost
 cmd_setup_codex() {
   # Wire agent-chat delivery + status hooks into OpenAI Codex CLI (>= 0.145),
   # which uses a Claude-Code-compatible hooks system at ~/.codex/hooks.json.
-  local HK="$HOME/.codex/hooks.json" AC="$HOME/.claude/agent-chat/agent-chat"
+  local HK="$HOME/.codex/hooks.json" AC="$HOME/.claude/agent-chat/agent-chat" title_id=0
+  [ "${1:-}" = "--title-id" ] && title_id=1
   command -v codex >/dev/null || die "codex CLI not found on PATH"
   [ -x "$AC" ] || die "agent-chat runtime not found at $AC"
   [ -f "$HK" ] || echo '{"hooks":{}}' > "$HK"
@@ -925,6 +1404,52 @@ cmd_setup_codex() {
     echo "Nothing to do — all four hooks were already installed."
   fi
   echo "Codex agents register with: agent-chat register <name>  (identity via \$CODEX_THREAD_ID)"
+  echo
+  if [ "$title_id" = 1 ]; then
+    codex_title_id
+  elif ! grep -Eq '^ *terminal_title *=.*thread-id' "$HOME/.codex/config.toml" 2>/dev/null; then
+    echo "Optional: 'agent-chat setup-codex --title-id' adds the thread id to Codex's terminal title."
+    echo "Codex runs commands in a shared background daemon, so a Codex agent can't see which pane"
+    echo "it is in; agent-chat works that out from evidence (what the pane shows, when it started)."
+    echo "With the id in the title it is exact, and survives moving the session to another pane."
+  fi
+}
+
+# Put "thread-id" into [tui] terminal_title in ~/.codex/config.toml (backup kept).
+# New Codex sessions then carry their thread id in the terminal title, which
+# codex_locate reads back — the one exact link from a thread to its pane.
+codex_title_id() {
+  local CFG="$HOME/.codex/config.toml"
+  [ -f "$CFG" ] || die "no $CFG"
+  command -v python3 >/dev/null || die "python3 needed to edit $CFG — add \"thread-id\" to [tui] terminal_title by hand"
+  python3 - "$CFG" <<'PY'
+import re, shutil, sys
+path = sys.argv[1]
+src = open(path).read()
+lines = src.split("\n")
+start = next((i for i, l in enumerate(lines) if l.strip() == "[tui]"), None)
+DEFAULT = 'terminal_title = ["activity", "thread-name", "project", "thread-id"]'
+if start is None:
+    lines += ["", "[tui]", DEFAULT]
+    what = "added a [tui] table with " + DEFAULT
+else:
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].lstrip().startswith("[")), len(lines))
+    idx = next((i for i in range(start + 1, end) if re.match(r"\s*terminal_title\s*=", lines[i])), None)
+    if idx is None:
+        lines.insert(start + 1, DEFAULT)
+        what = "added " + DEFAULT
+    elif "thread-id" in lines[idx]:
+        print("  terminal_title: thread-id already present — nothing to do"); sys.exit(0)
+    elif re.search(r"\[[^\]]*\]\s*(#.*)?$", lines[idx]):
+        lines[idx] = re.sub(r"\s*\]", ', "thread-id"]', lines[idx], count=1)
+        what = "appended \"thread-id\" to your terminal_title"
+    else:
+        sys.exit("  terminal_title spans several lines — add \"thread-id\" to it by hand in " + path)
+shutil.copy2(path, path + ".bak-agentchat-title")
+open(path, "w").write("\n".join(lines))
+print("  " + what + " (backup: " + path + ".bak-agentchat-title)")
+print("  Takes effect in Codex sessions started from now on.")
+PY
 }
 
 # ---------- hook mode ----------
@@ -948,10 +1473,7 @@ cmd_hook() {
   esac
   text=$(deliver "$name")
   [ -n "$text" ] || exit 0
-  payload="📨 agent-chat — new message(s) for you ('$name'):
-$text
-
-If a reply or coordination is needed, respond with: agent-chat send \"...\" (add --to <sender> for a DM, --room <room> to answer in that room). If purely informational, take note and continue."
+  payload=$(mail_payload "$name" "$text")
   case "$event" in
     Stop)
       $JQ -n --arg r "$payload
@@ -996,9 +1518,10 @@ case "$cmd" in
   screen)     cmd_screen "$@";;
   spawn)      cmd_spawn "$@";;
   setup-codex) cmd_setup_codex "$@";;
+  whereami)   cmd_whereami "$@";;
   web)        cmd_web "$@";;
   hook)       cmd_hook "$@";;
   help|--help|-h)
-    sed -n '2,52p' "$0" | sed 's/^# \{0,1\}//';;
+    awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0";;
   *) die "unknown command '$cmd' (try: agent-chat help)";;
 esac
