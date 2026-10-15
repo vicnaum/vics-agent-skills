@@ -45,6 +45,18 @@
 #                                           launch a NEW agent: new iTerm window, --tab = tab in your window,
 #                                           --pane = split next to you (or tmux with --tmux / headless),
 #                                           reusing this session CLI flags; it registers itself as <name>
+#   agent-chat respawn <name> [--prompt "task"] [--report-to <name>] [--dry-run] [--no-wait]
+#                       [--force-busy] [--ignore-cooldown] [--cmd "codex ..."]
+#                                           replace a tripped/dead codex|claude agent IN PLACE: kill its CLI
+#                                           by signal (never types into the tripped chat), start a FRESH
+#                                           session in the SAME pane that re-registers as <name>; refuses
+#                                           unless the pane provably still holds that agent (no override),
+#                                           and refuses a busy agent unless --force-busy
+#   agent-chat watch <name...> [--interval 60] [--idle-alert MIN] [--respawn] [--report-to <name>]
+#                                           blocking watchdog for an orchestrator's BACKGROUND shell: exits
+#                                           with a report when an agent is dead, filter-tripped, errored,
+#                                           usage-limited, has stuck input or idles too long (--respawn
+#                                           replaces dead/filter-tripped ones itself); then re-arm it
 #   agent-chat unregister [<name>]          leave the chat (default: self)
 #   agent-chat web [port]                   local web viewer (default :8787): channels, live
 #                                           messages, people with status + unread counts
@@ -781,6 +793,9 @@ resolve_term() {
   if [ "$cli" = codex ]; then
     local trusted=0
     case "$src" in title|args|screen|start|ancestry|spawn) [ -n "$tb" ] && [ "$tb" != none ] && trusted=1;; esac
+    # a pane whose title shows ANOTHER thread id holds a different session now
+    # (the agent was replaced there): the record is no evidence any more
+    [ "$trusted" = 1 ] && title_shows_other_thread "$(term_title "$tb" "$ta")" "$sid" && trusted=0
     if [ "$trusted" = 1 ]; then
       tty=$(agent_tty "$tb" "$ta")
       [ -n "$tty" ] && tty_has_cli "$tty" codex && { printf '%s %s' "$tb" "$ta"; return 0; }
@@ -798,6 +813,16 @@ resolve_term() {
   fi
   { [ -n "$tb" ] && [ "$tb" != "none" ]; } || return 1
   printf '%s %s' "$tb" "$ta"
+}
+
+# title_shows_other_thread <title> <thread-id> — rc 0 when the title carries a
+# Codex thread id (UUIDv7, possibly truncated) that is NOT this one
+title_shows_other_thread() {
+  local shown
+  shown=$(printf '%s' "$1" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{1,12}' | head -n1)
+  [ -n "$shown" ] || return 1
+  case "$2" in "$shown"*) return 1;; esac
+  return 0
 }
 
 agent_term() { # name -> "backend addr" from the registry; dies when there is no usable terminal
@@ -1204,7 +1229,13 @@ cmd_spawn() { # <name> [--dir d] [--cmd "claude ..."] [--prompt "task"] [--tab|-
   fi
 
   local kickoff="You are a fresh agent. First, register on the local agent chat: agent-chat register $name — then check in with: agent-chat read."
-  [ -n "$task" ] && kickoff="$kickoff Your task: $task"
+  [ -n "$task" ] && kickoff="$kickoff Your task: $(printf '%s' "$task" | tr '\r\n' '  ')"
+  # codex and claude take their first prompt as an argument: hand the kickoff
+  # over on the command line, so nothing is typed into a booting TUI (startup
+  # popups such as Codex's security notice swallow typed text, and the retries
+  # below would pile keystrokes into the new window)
+  local argkick=0
+  case "$(cli_of_cmd "$cmd")" in codex|claude) argkick=1;; esac
 
   local sb sa   # spawned backend + addr
   if [ "$force_tmux" = 1 ] || ! osascript -e 'tell application "iTerm2" to count windows' >/dev/null 2>&1; then
@@ -1311,7 +1342,8 @@ APPLESCRIPT
   # background daemon (Codex) can't see its own terminal when it registers
   mkdir -p "$BASE/spawn" && printf '%s %s %s\n' "$sb" "$sa" "$(date +%s)" > "$BASE/spawn/$name"
 
-  term_type "$sb" "$sa" "$cmd" >/dev/null
+  if [ "$argkick" = 1 ]; then term_type "$sb" "$sa" "$cmd $(sq "$kickoff")" >/dev/null
+  else term_type "$sb" "$sa" "$cmd" >/dev/null; fi
   term_enter "$sb" "$sa" >/dev/null
 
   # wait for the CLI process, then deliver the kickoff with verify-and-retry:
@@ -1339,6 +1371,10 @@ APPLESCRIPT
       sleep 3
       continue   # re-inspect next iteration before sending the kickoff
     fi
+    if [ "$argkick" = 1 ]; then   # given on the command line: only check it arrived, never retype
+      printf '%s' "$scr" | grep -qE "fresh +agent" && { landed=1; break; }
+      continue
+    fi
     term_type "$sb" "$sa" "$kickoff" >/dev/null
     term_enter "$sb" "$sa" >/dev/null
     sleep 4
@@ -1353,6 +1389,335 @@ APPLESCRIPT
   else
     echo "WARNING: kickoff prompt may not have landed — check: agent-chat screen $name"
   fi
+}
+
+# ---------- respawn (fresh session, same terminal, same name) ----------
+#
+# Replaces a tripped/dead agent IN PLACE: the old CLI process is killed by
+# signal (nothing is ever typed into the tripped chat), and a FRESH session is
+# started in the same pane with a kickoff that re-registers it under the same
+# name — rebinding keeps its rooms and cursors, so peers see the same agent.
+# It never opens a window (that is `spawn`), and it refuses unless it can
+# prove the pane still belongs to the agent. There is no override for that
+# proof: a pane it can't prove is never killed in or typed into.
+
+RESPAWN_DIR="$BASE/respawn"
+RESPAWN_LOG="$BASE/respawn.log"
+RESPAWN_COOLDOWN=300   # seconds between two respawns of one agent (--ignore-cooldown overrides)
+
+rlog() { mkdir -p "$RESPAWN_DIR"; echo "[$(date '+%F %T')] $*" >> "$RESPAWN_LOG"; }
+
+# sq <string> — single-quote for a POSIX shell (zsh/bash), byte-exact.
+# (Not printf %q: bash 3.2 escapes multi-byte UTF-8 into a mix of raw and
+# octal bytes, which iTerm's AppleScript rejects as invalid text.)
+sq() { local s="$1" q="'"; s=${s//$q/$q\\$q$q}; printf '%s%s%s' "$q" "$s" "$q"; }
+
+agent_pids() { # tty-path cli -> pids of the TOP-LEVEL processes of that agent CLI on the tty
+  local rows pid ppid cmd mine="" e
+  rows=$(ps -t "${1#/dev/}" -o pid=,ppid=,command= 2>/dev/null)
+  while read -r pid ppid cmd; do
+    [ -n "$pid" ] || continue
+    [ "$(cli_of_cmd "$cmd")" = "$2" ] && mine="$mine $pid:$ppid"
+  done <<< "$rows"
+  for e in $mine; do
+    case " $mine " in *" ${e#*:}:"*) continue;; esac   # child of another match (npm wrapper, tool)
+    echo "${e%%:*}"
+  done
+}
+
+tty_fg_shell() { # tty-path — rc 0 when the tty's foreground process group is an interactive shell
+  local fg c
+  fg=$(ps -t "${1#/dev/}" -o stat=,comm= 2>/dev/null | awk '$1 ~ /\+/ {print $2}')
+  [ -n "$fg" ] || return 1
+  while read -r c; do
+    case "${c##*/}" in zsh|-zsh|bash|-bash|fish|-fish|sh|-sh) ;; *) return 1;; esac
+  done <<< "$fg"
+  return 0
+}
+
+pane_taken_by_other() { # name backend addr -> prints the other agent registered LATER on this pane
+  $JQ -r --arg me "$1" --arg tb "$2" --arg ta "$3" --arg reg "$(reg_get "$1" registered_at)" \
+    'select(.name != $me and .term_backend == $tb and .term_addr == $ta and (.registered_at // "") > $reg) | .name' \
+    "$REG"/*.json 2>/dev/null | head -n1
+}
+
+cmd_respawn() { # <name> [--prompt "task"] [--cmd "codex ..."] [--report-to <name>] [--force-busy] [--ignore-cooldown] [--no-wait] [--dry-run]
+  local name="" task="" cmd="" report="" force_busy=0 nocool=0 wait=1 dry=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --prompt) task="$2"; shift 2;;
+      --cmd) cmd="$2"; shift 2;;
+      --report-to) report="$2"; shift 2;;
+      --force-busy) force_busy=1; shift;;
+      --ignore-cooldown) nocool=1; shift;;
+      --no-wait) wait=0; shift;;
+      --dry-run) dry=1; shift;;
+      -*) die "respawn: unknown arg '$1'";;
+      *) [ -n "$name" ] && die "respawn: one name only"; name="$1"; shift;;
+    esac
+  done
+  [ -n "$name" ] || die 'usage: agent-chat respawn <name> [--prompt "task"] [--cmd "codex ..."] [--report-to <name>] [--force-busy] [--ignore-cooldown] [--no-wait] [--dry-run]'
+  [ -e "$REG/$name.json" ] || die "no agent named '$name' is registered"
+  local cli sid cwd tb ta term rc tty title pids p pp last other
+  cli=$(reg_get "$name" cli); sid=$(reg_get "$name" session_id); cwd=$(reg_get "$name" cwd)
+  case "$cli" in codex|claude) ;; *) die "respawn: '$name' is a '$cli' agent — only codex and claude agents can be respawned";; esac
+  [ -d "$cwd" ] || cwd="$HOME"
+  [ -n "$cmd" ] || cmd="$cli"
+  if [ -z "$report" ]; then report=$(resolve_name 2>/dev/null) || report=""; [ "$report" = "$name" ] && report=""; fi
+
+  last=$(cat "$RESPAWN_DIR/$name.last" 2>/dev/null || echo 0)
+  if [ "$nocool" = 0 ] && [ $(( $(date +%s) - last )) -lt "$RESPAWN_COOLDOWN" ]; then
+    die "respawn: '$name' was respawned $(( $(date +%s) - last ))s ago (cooldown ${RESPAWN_COOLDOWN}s) — look at it first: agent-chat screen $name"
+  fi
+
+  # 1. the pane, proven to still be this agent's
+  warm_terms
+  term=$(resolve_term "$name"); rc=$?
+  [ "$rc" = 0 ] || die "respawn: can't prove which pane is '$name''s (its pane is closed, or it now runs a different session) — nothing was touched. 'agent-chat spawn $name' starts it in a new window instead"
+  read -r tb ta <<< "$term"
+  other=$(pane_taken_by_other "$name" "$tb" "$ta")
+  [ -z "$other" ] || die "respawn: '$name''s pane was taken over by '$other' (registered there later) — refusing"
+  tty=$(agent_tty "$tb" "$ta")
+  [ -n "$tty" ] || die "respawn: '$name''s terminal ($tb $ta) is closed — 'agent-chat spawn $name' starts it in a new window"
+  title=$(term_title "$tb" "$ta")
+  title_shows_other_thread "$title" "$sid" && die "respawn: '$name''s pane shows another Codex thread — refusing"
+
+  # 2. what runs there: this agent's CLI (proven by its session id), or a bare
+  #    shell prompt (it died). Anything else: refuse — never type into it.
+  pids=$(agent_pids "$tty" "$cli")
+  if [ -z "$pids" ]; then
+    tty_fg_shell "$tty" || die "respawn: '$name' isn't running and its pane ($tty) is busy with something that isn't a shell prompt — refusing to type into it"
+  else
+    case "$cli" in
+      codex)
+        if ! { case "$title" in *"${sid:0:23}"*) true;; *) false;; esac; } \
+           && ! ps -o command= -p $pids 2>/dev/null | grep -qF -- "$sid"; then
+          die "respawn: the Codex in $tty doesn't show '$name''s thread ($sid) in its title or arguments — refusing"
+        fi;;
+      claude)
+        for p in $pids; do
+          [ "$($JQ -r '.sessionId // empty' "$HOME/.claude/sessions/$p.json" 2>/dev/null)" = "$sid" ] \
+            || die "respawn: the Claude Code in $tty (pid $p) isn't session $sid — refusing"
+        done;;
+    esac
+    for p in $pids; do   # it must sit on a shell, or killing it would close the pane
+      pp=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+      case "$(ps -o comm= -p "$pp" 2>/dev/null)" in
+        *zsh|*bash|*fish|*/sh|sh|-*) ;;
+        *) die "respawn: $cli (pid $p) isn't running under a shell in $tty — killing it would close the pane; refusing";;
+      esac
+    done
+    # a working agent is not tripped: never kill one mid-turn by accident
+    if [ "$force_busy" = 0 ]; then
+      local scr
+      scr=$(term_screen "$tb" "$ta" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 25)
+      if [ "$(glyph_state "$title")" = busy ] || printf '%s' "$scr" | grep -q 'esc to interrupt'; then
+        die "respawn: '$name' looks BUSY (spinner / 'esc to interrupt' on screen) — refusing to kill a working agent (--force-busy if it is truly stuck)"
+      fi
+    fi
+  fi
+
+  # 3. build + validate the launch line BEFORE anything is killed
+  local kickoff launch
+  task=$(printf '%s' "$task" | tr '\r\n' '  ')
+  kickoff="You are a FRESH session replacing agent '$name' (its previous session tripped or died and was restarted in this same terminal). First run: agent-chat register $name - then run: agent-chat read."
+  if [ -n "$task" ]; then
+    kickoff="$kickoff Your task: $task"
+  elif [ -n "$report" ]; then
+    kickoff="$kickoff Then tell $report you are back: agent-chat send --to $report \"$name: respawned as a fresh session, ready for a task\" - and wait for instructions."
+  else
+    kickoff="$kickoff Then wait for instructions in the chat."
+  fi
+  launch="reset; cd $(sq "$cwd") && $cmd $(sq "$kickoff")"
+  printf '%s' "$launch" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 || die "respawn: launch line is not valid UTF-8 — nothing was touched"
+
+  if [ "$dry" = 1 ]; then
+    echo "DRY RUN — would respawn '$name': pane $tb $ta ($tty), kill $cli pid(s) ${pids:-none (already dead)}, then type: $launch"
+    return 0
+  fi
+  mkdir -p "$RESPAWN_DIR"
+  rlog "$name: respawn (cli=$cli tty=$tty pane=$tb $ta old=$sid report=${report:-none} pids=${pids:-none})"
+  date +%s > "$RESPAWN_DIR/$name.last"
+
+  # 4. stop the old session by signal — no keystrokes into the tripped chat
+  if [ -n "$pids" ]; then
+    kill -TERM $pids 2>/dev/null
+    local i=0
+    while [ "$i" -lt 10 ] && [ -n "$(agent_pids "$tty" "$cli")" ]; do sleep 1; i=$((i + 1)); done
+    pids=$(agent_pids "$tty" "$cli")
+    if [ -n "$pids" ]; then
+      rlog "$name: still alive after SIGTERM — SIGKILL $pids"
+      kill -KILL $pids 2>/dev/null; sleep 2
+      [ -z "$(agent_pids "$tty" "$cli")" ] || die "respawn: could not kill $cli in $tty"
+    fi
+    sleep 1
+  fi
+  tty_fg_shell "$tty" || { rlog "$name: ABORT pane not at a shell prompt after kill"; die "respawn: '$name''s old session is stopped, but its pane isn't back at a shell prompt — not typing anything. Look: agent-chat screen $name"; }
+
+  # 5. fresh session in the same pane; the kickoff rides on the command line
+  #    (nothing is typed into a booting TUI, where popups would swallow it)
+  mkdir -p "$BASE/spawn" && printf '%s %s %s\n' "$tb" "$ta" "$(date +%s)" > "$BASE/spawn/$name"
+  term_type "$tb" "$ta" "$launch" >/dev/null 2>&1 || { rlog "$name: ABORT typing the launch line failed"; die "respawn: old session stopped, but typing the launch line failed — the pane is at a bare shell"; }
+  term_enter "$tb" "$ta" >/dev/null 2>&1
+  local deadline=$((SECONDS + 30)) npid=""
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    sleep 2; npid=$(agent_pids "$tty" "$cli"); [ -n "$npid" ] && break
+  done
+  if [ -z "$npid" ]; then
+    rlog "$name: FAILED no new $cli process after 30s"
+    echo "FAILED: old session stopped, but no new $cli started in $tty within 30s — look: agent-chat screen $name"
+    return 2
+  fi
+  rlog "$name: fresh $cmd running (pid $npid) in $tb $ta"
+  echo "Respawned '$name' in its own pane ($tb $ta, $tty): old session $sid stopped, fresh $cmd running (pid $npid) in $cwd."
+  [ "$wait" = 1 ] || { echo "Not waiting for it to re-register (--no-wait)."; return 0; }
+
+  # 6. confirm: the name must be rebound to a NEW session
+  local nsid=""
+  deadline=$((SECONDS + 180))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    sleep 5
+    nsid=$(reg_get "$name" session_id)
+    [ -n "$nsid" ] && [ "$nsid" != "$sid" ] && break
+    nsid=""
+  done
+  if [ -n "$nsid" ]; then
+    rlog "$name: re-registered as session $nsid"
+    echo "Re-registered: '$name' -> session $nsid (pane $(reg_get "$name" term_addr), found via $(reg_get "$name" term_src))."
+  else
+    rlog "$name: WARNING not re-registered after 180s"
+    echo "WARNING: '$name' has not re-registered after 180s — look: agent-chat screen $name"
+    return 1
+  fi
+}
+
+# ---------- watch (blocking fleet watchdog) ----------
+#
+# Built to run as a BACKGROUND shell of the orchestrating agent (OpenCode
+# `shell` with background:true, Claude Code run_in_background): it polls the
+# named agents and EXITS as soon as something needs attention, printing a
+# report — the harness then wakes the orchestrator with that output. The
+# orchestrator handles it and re-arms the watch (the report ends with the
+# exact command). Each condition is reported once per session (signatures in
+# $BASE/watch/), so re-arming never re-fires on the same screen.
+#
+# Trips (with --respawn: replaced in place by `respawn`, then reported):
+#   dead    — the pane is at a shell prompt: its agent CLI exited/crashed
+#   filter  — Codex content gate: the unindented "ⓘ This content can't be
+#             shown" block with its "Apply for Daybreak" line, on an idle
+#             screen (tool output is always indented, so an agent merely
+#             printing the phrase doesn't match)
+# Reported only (the orchestrator decides):
+#   error   — stream disconnected / retry limit / bad status
+#   limit   — usage limit hit (a respawn would not help)
+#   paste   — a pasted prompt stuck unsent in the input box
+#   idle    — idle longer than --idle-alert minutes (it may have just stopped)
+#   offline — its pane was closed / it is gone
+
+WATCH_DIR="$BASE/watch"
+
+# watch_classify <screen-tail> -> "kind<TAB>matched line" ("" when clean).
+# A working screen ('esc to interrupt') is never classified.
+watch_classify() {
+  local s="$1" m
+  printf '%s' "$s" | grep -q 'esc to interrupt' && return 0
+  m=$(printf '%s' "$s" | grep -E "^[[:space:]]?ⓘ +This content can[^ ]{1,3}t be shown" | tail -n1)
+  if [ -n "$m" ] && printf '%s' "$s" | grep -q "Apply for Daybreak"; then printf 'filter\t%s\n' "$m"; return 0; fi
+  m=$(printf '%s' "$s" | grep -iE "You.ve hit your usage limit|Goal hit usage limits" | tail -n1)
+  [ -n "$m" ] && { printf 'limit\t%s\n' "$m"; return 0; }
+  m=$(printf '%s' "$s" | grep -E "^[[:space:]]?[■⚠✗].*(stream disconnected before completion|exceeded retry limit|unexpected status [45][0-9][0-9])" | tail -n1)
+  [ -n "$m" ] && { printf 'error\t%s\n' "$m"; return 0; }
+  m=$(printf '%s' "$s" | grep -E "^› .*\[Pasted Content [0-9]+ chars\]" | tail -n1)
+  [ -n "$m" ] && { printf 'paste\t%s\n' "$m"; return 0; }
+  return 0
+}
+
+cmd_watch() { # <name...> [--interval S] [--idle-alert MIN] [--respawn] [--report-to <name>]
+  local names="" interval=60 idle_min=0 respawn=0 report="" argv="$*"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --interval) interval="$2"; shift 2;;
+      --idle-alert) idle_min="$2"; shift 2;;
+      --respawn) respawn=1; shift;;
+      --report-to) report="$2"; shift 2;;
+      -*) die "watch: unknown arg '$1'";;
+      *) [ -e "$REG/$1.json" ] || die "watch: no agent named '$1' is registered"; names="$names $1"; shift;;
+    esac
+  done
+  [ -n "$names" ] || die 'usage: agent-chat watch <name...> [--interval 60] [--idle-alert MIN] [--respawn] [--report-to <name>]'
+  if [ -z "$report" ]; then report=$(resolve_name 2>/dev/null) || report=""; fi
+  mkdir -p "$WATCH_DIR"
+  echo "[$(date '+%T')] watching:$names (every ${interval}s$([ "$respawn" = 1 ] && echo ', auto-respawn on dead/filter')$([ "$idle_min" -gt 0 ] && echo ", idle alert ${idle_min}m"))"
+
+  local n st state why sid scr cls kind line sig prev pend events="" hstate hepoch=0 out tb ta rout rrc
+  while :; do
+    warm_terms
+    date +%s > "$WATCH_DIR/heartbeat"
+    for n in $names; do
+      [ -e "$REG/$n.json" ] || continue
+      st=$(agent_state "$n"); state="${st%%$'\t'*}"; why="${st#*$'\t'}"
+      sid=$(reg_get "$n" session_id)
+      kind=""; line=""
+      case "$state" in
+        dead)    kind=dead;;
+        offline) kind=offline;;
+        busy|unlocated) ;;
+        *)
+          tb=""; ta=""
+          read -r tb ta <<< "$(resolve_term "$n" 2>/dev/null)"
+          if [ -n "$ta" ]; then
+            scr=$(term_screen "$tb" "$ta" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 16)
+            cls=$(watch_classify "$scr")
+            if [ -n "$cls" ]; then kind="${cls%%$'\t'*}"; line="${cls#*$'\t'}"; fi
+          fi
+          if [ -z "$kind" ] && [ "$idle_min" -gt 0 ] && [ "$state" = idle ] && [ -f "$STATUS/$n" ]; then
+            read -r hstate hepoch < "$STATUS/$n"
+            if [ "$hstate" = idle ] && [ $(( $(date +%s) - hepoch )) -ge $(( idle_min * 60 )) ]; then
+              kind=idle; line="$hepoch"
+            fi
+          fi;;
+      esac
+      [ -n "$kind" ] || { rm -f "${WATCH_DIR:?}/${n:?}.pending"; continue; }
+      sig="$kind|$sid|$line"
+      prev=$(cat "$WATCH_DIR/$n.reported" 2>/dev/null)
+      [ "$sig" = "$prev" ] && continue
+      # screen-based conditions must hold on two polls in a row (not a frame mid-redraw)
+      case "$kind" in
+        filter|error|limit|paste)
+          pend=$(cat "$WATCH_DIR/$n.pending" 2>/dev/null)
+          [ "$pend" = "$sig" ] || { printf '%s' "$sig" > "$WATCH_DIR/$n.pending"; continue; };;
+      esac
+      rm -f "${WATCH_DIR:?}/${n:?}.pending"
+      printf '%s' "$sig" > "$WATCH_DIR/$n.reported"
+      case "$kind" in
+        dead)    out="DEAD — its $(reg_get "$n" cli) exited/crashed ($why)";;
+        offline) out="OFFLINE — $why";;
+        filter)  out="CONTENT-FILTER TRIP — the chat is gated (do NOT type into it)";;
+        error)   out="ERROR — $(printf '%s' "$line" | sed 's/^[[:space:]]*//' | cut -c1-160)";;
+        limit)   out="USAGE LIMIT — a respawn won't help until it resets";;
+        paste)   out="STUCK INPUT — a pasted prompt sits unsent in its input box";;
+        idle)    out="IDLE for $(( ($(date +%s) - hepoch) / 60 ))m — it may have stopped without reporting";;
+      esac
+      if [ "$respawn" = 1 ] && { [ "$kind" = dead ] || [ "$kind" = filter ]; }; then
+        rout=$( (cmd_respawn "$n" --no-wait ${report:+--report-to "$report"}) 2>&1 ); rrc=$?
+        out="$out
+    -> respawn: $(printf '%s' "$rout" | tr '\n' ' ')"
+        [ "$rrc" = 0 ] && rm -f "${WATCH_DIR:?}/${n:?}.reported"   # a fresh session starts with a clean slate
+        warm_terms
+      fi
+      events="$events
+- $n: $out"
+    done
+    if [ -n "$events" ]; then
+      echo "[$(date '+%T')] agent-chat watch — needs attention:$events"
+      echo
+      echo "Look closer: agent-chat screen <name> · replace one by hand: agent-chat respawn <name> [--prompt \"task\"]"
+      echo "A respawned agent is a FRESH session: give it its task (agent-chat send --to <name> \"...\")."
+      echo "Re-arm (as a background shell again): agent-chat watch $argv"
+      return 0
+    fi
+    sleep "$interval"
+  done
 }
 
 # ---------- web viewer ----------
@@ -1515,6 +1880,8 @@ case "$cmd" in
   key)        cmd_key "$@";;
   screen)     cmd_screen "$@";;
   spawn)      cmd_spawn "$@";;
+  respawn)    cmd_respawn "$@";;
+  watch)      cmd_watch "$@";;
   setup-codex) cmd_setup_codex "$@";;
   whereami)   cmd_whereami "$@";;
   web)        cmd_web "$@";;
