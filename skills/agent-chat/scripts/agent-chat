@@ -509,7 +509,8 @@ cmd_who() {
 #   3. otherwise the environment         (OpenCode's TUI forwards its own env
 #      to the server for the session it shows, so there it IS the TUI's)
 
-_term_list_raw() {
+_term_list_raw() { # rc 1 when iTerm runs but its sessions couldn't be listed
+  local rc=0
   if command -v tmux >/dev/null 2>&1; then
     tmux list-panes -a -F "tmux${US}#{pane_id}${US}#{pane_tty}${US}#{pane_title}" 2>/dev/null
   fi
@@ -531,7 +532,9 @@ tell application "iTerm2"
 end tell
 return out
 APPLESCRIPT
+    [ $? = 0 ] || rc=1
   fi
+  return $rc
 }
 
 # every reachable terminal, one per line: backend<US>addr<US>tty<US>title
@@ -540,7 +543,21 @@ APPLESCRIPT
 term_list() {
   if [ -n "${_TERM_LIST+x}" ]; then printf '%s\n' "$_TERM_LIST"; else _term_list_raw; fi
 }
-warm_terms() { _TERM_LIST=$(_term_list_raw); _CODEX_CANDS=$(_codex_cands_raw); }
+# A failed AppleScript call (iTerm busy, an AppleEvent timeout) must not become
+# an EMPTY snapshot: that reads as "every pane is closed" and marks all agents
+# offline at once. Retry; if it still fails, drop the snapshot (lookups go
+# live) and return 1 so callers that act on it can stand down.
+warm_terms() {
+  local i out
+  for i in 1 2 3; do
+    if out=$(_term_list_raw); then
+      _TERM_LIST="$out"; _CODEX_CANDS=$(_codex_cands_raw); return 0
+    fi
+    sleep 1
+  done
+  unset _TERM_LIST _CODEX_CANDS
+  return 1
+}
 
 term_by_tty() { # /dev/ttyX -> "backend addr"
   local b a t _
@@ -1471,7 +1488,7 @@ cmd_respawn() { # <name> [--prompt "task"] [--cmd "codex ..."] [--report-to <nam
   fi
 
   # 1. the pane, proven to still be this agent's
-  warm_terms
+  warm_terms || die "respawn: can't list the terminals right now (iTerm AppleScript failing) — nothing was touched; try again shortly"
   term=$(resolve_term "$name"); rc=$?
   [ "$rc" = 0 ] || die "respawn: can't prove which pane is '$name''s (its pane is closed, or it now runs a different session) — nothing was touched. 'agent-chat spawn $name' starts it in a new window instead"
   read -r tb ta <<< "$term"
@@ -1649,10 +1666,23 @@ cmd_watch() { # <name...> [--interval S] [--idle-alert MIN] [--respawn] [--repor
   mkdir -p "$WATCH_DIR"
   echo "[$(date '+%T')] watching:$names (every ${interval}s$([ "$respawn" = 1 ] && echo ', auto-respawn on dead/filter')$([ "$idle_min" -gt 0 ] && echo ", idle alert ${idle_min}m"))"
 
-  local n st state why sid scr cls kind line sig prev pend events="" hstate hepoch=0 out tb ta rout rrc
+  local n st state why sid scr cls kind line sig prev pend events="" hstate hepoch=0 out tb ta rout rrc blind=0
   while :; do
-    warm_terms
     date +%s > "$WATCH_DIR/heartbeat"
+    # no trustworthy view of the terminals: judge nothing this poll (a failed
+    # snapshot would make every agent look offline); say so if it persists
+    if ! warm_terms; then
+      blind=$((blind + 1))
+      if [ "$blind" = 10 ]; then
+        echo "[$(date '+%T')] agent-chat watch — needs attention:
+- (watch itself): can't read the terminals for 10 polls in a row (iTerm AppleScript failing) — agents are NOT being watched.
+
+Re-arm (as a background shell again): agent-chat watch $argv"
+        return 0
+      fi
+      sleep "$interval"; continue
+    fi
+    blind=0
     for n in $names; do
       [ -e "$REG/$n.json" ] || continue
       st=$(agent_state "$n"); state="${st%%$'\t'*}"; why="${st#*$'\t'}"
@@ -1677,13 +1707,15 @@ cmd_watch() { # <name...> [--interval S] [--idle-alert MIN] [--respawn] [--repor
             fi
           fi;;
       esac
-      [ -n "$kind" ] || { rm -f "${WATCH_DIR:?}/${n:?}.pending"; continue; }
+      # clean poll: the condition is over — a later recurrence is a new event
+      [ -n "$kind" ] || { rm -f "${WATCH_DIR:?}/${n:?}.pending" "${WATCH_DIR:?}/${n:?}.reported"; continue; }
       sig="$kind|$sid|$line"
       prev=$(cat "$WATCH_DIR/$n.reported" 2>/dev/null)
       [ "$sig" = "$prev" ] && continue
-      # screen-based conditions must hold on two polls in a row (not a frame mid-redraw)
+      # every condition must hold on two polls in a row: not a frame mid-redraw,
+      # not one bad terminal snapshot (idle is already a long-lived condition)
       case "$kind" in
-        filter|error|limit|paste)
+        dead|offline|filter|error|limit|paste)
           pend=$(cat "$WATCH_DIR/$n.pending" 2>/dev/null)
           [ "$pend" = "$sig" ] || { printf '%s' "$sig" > "$WATCH_DIR/$n.pending"; continue; };;
       esac
@@ -1703,7 +1735,7 @@ cmd_watch() { # <name...> [--interval S] [--idle-alert MIN] [--respawn] [--repor
         out="$out
     -> respawn: $(printf '%s' "$rout" | tr '\n' ' ')"
         [ "$rrc" = 0 ] && rm -f "${WATCH_DIR:?}/${n:?}.reported"   # a fresh session starts with a clean slate
-        warm_terms
+        warm_terms || true
       fi
       events="$events
 - $n: $out"
@@ -1889,4 +1921,5 @@ case "$cmd" in
   help|--help|-h)
     awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0";;
   *) die "unknown command '$cmd' (try: agent-chat help)";;
-esac
+esac; exit $?   # same line as esac: bash reads a script lazily, so a long-running
+                # command (watch) must never read on into a file edited under it
