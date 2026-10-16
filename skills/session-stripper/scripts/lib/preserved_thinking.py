@@ -42,12 +42,18 @@ _THINKING_TYPES = ("thinking", "redacted_thinking")
 
 def session_model(chain):
     """Model of the newest assistant record on the chain: the model the
-    session will continue on, which is the one that runs the check."""
+    session will continue on, which is the one that runs the check.
+
+    Claude Code writes local assistant records (API errors, "Prompt is too
+    long", interrupts) with the placeholder model "<synthetic>". They are not
+    a real model, so they are skipped: a session ending on one would otherwise
+    read as unbound and the check would stay silent."""
     for obj in reversed(chain):
         if obj.get("type") == "assistant":
             msg = obj.get("message")
-            if isinstance(msg, dict) and msg.get("model"):
-                return msg["model"]
+            model = msg.get("model") if isinstance(msg, dict) else None
+            if model and not model.startswith("<"):
+                return model
     return None
 
 

@@ -110,6 +110,21 @@ class TestFindInvalidated(unittest.TestCase):
         self.assertEqual(r["first_pos"], 3)
         self.assertGreater(r["chars"], 4000)
 
+    def test_trailing_synthetic_record_does_not_hide_the_model(self):
+        objects = load_session(self.path)
+        last = objects[-1]
+        objects.append({**last, "uuid": "synthetic-leaf", "parentUuid": last["uuid"],
+                        "message": {"role": "assistant", "model": "<synthetic>",
+                                    "content": [{"type": "text", "text": "API Error"}]}})
+        save_session(self.path, objects, create_backup=False)
+
+        def clear_result(chain):
+            chain[2]["message"]["content"][0]["content"] = "[cleared]"
+        r = self._report(_edit(self.path, clear_result))
+        self.assertTrue(r["bound"])
+        self.assertEqual(r["model"], "claude-fable-5-1")
+        self.assertEqual([p for p, _ in r["invalid"]], [3, 5])
+
     def test_front_thinking_removal_is_safe(self):
         def drop_first(chain):
             chain[1]["message"]["content"].pop(0)
