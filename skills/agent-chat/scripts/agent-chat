@@ -214,10 +214,10 @@ commit_delivery() { # <pending-file> — apply the cursor moves a deferred deliv
 }
 
 mail_payload() { # name text — the block an agent is shown when mail reaches it
-  printf '%s' "📨 agent-chat — new message(s) for you ('$1'):
-$2
-
-If a reply or coordination is needed, respond with: agent-chat send \"...\" (add --to <sender> for a DM, --room <room> to answer in that room). If purely informational, take note and continue."
+  # (kept short: registered agents know the skill, and Claude Code wraps inbox
+  #  deliveries in its own paragraph about peer messages anyway)
+  printf '%s' "📨 agent-chat ($1):
+$2"
 }
 
 set_cursor_eof() { # name room
