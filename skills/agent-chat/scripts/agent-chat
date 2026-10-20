@@ -34,7 +34,8 @@
 #   agent-chat who                          list registered agents and their rooms
 #   agent-chat status [<name>]              live state of an agent: busy|idle|waiting|dead|offline
 #                                           (glyph-primary + hook fallback + process liveness)
-#   agent-chat nudge <name> [text]          type a wake-up line + Enter into that agent's iTerm window
+#   agent-chat nudge <name> [text] [--force] type a wake-up line + Enter into that agent's terminal
+#                                           (refuses while someone types in that pane; --force overrides)
 #   agent-chat type <name> "text"           type into that agent's input box WITHOUT submitting
 #   agent-chat screen <name> [N]            snapshot of that agent's visible terminal (what it is
 #                                           doing right now: spinner, running tool, stuck prompt)
@@ -245,11 +246,12 @@ cmd_register() {
     oldname=$($JQ -r --arg sid "$sid" 'select(.session_id == $sid) | .name' "$f")
     if [ -n "$oldname" ] && [ "$oldname" != "$name" ]; then rm -f "$f" "$CUR/$oldname"@*; fi
   done
-  local tb ta tsrc delivery=""
+  local tb ta tsrc delivery="" inbox=""
+  [ "$cli" = claude ] && inbox="${CLAUDE_CODE_MESSAGING_SOCKET:-}"
   read -r tb ta tsrc <<< "$(detect_term "$cli" "$sid" "$name")"
   # OpenCode running under its background service: mail is pushed into the
   # session through the server API (no hooks to pull it, no typing needed)
-  if [ "$cli" = opencode ] && ! has_tty_ancestor && oc_knows_session "$sid"; then delivery="api"; fi
+  if [ "$cli" = opencode ] && oc_service_run && oc_knows_session "$sid"; then delivery="api"; fi
   # OpenCode's TUI hands its own environment to the session it shows; a session
   # nobody opened in a TUI still has the service's, which names an unrelated
   # terminal — only keep it if an opencode really runs there
@@ -260,9 +262,9 @@ cmd_register() {
     # existing identity: silent rebind (new session/window/cwd), keep rooms + cursors
     rooms_json=$($JQ -c --arg hr "$proom" '(.rooms + [$hr]) | unique' "$REG/$name.json")
     $JQ -n --arg name "$name" --arg sid "$sid" --arg tb "$tb" --arg ta "$ta" --arg tsrc "$tsrc" --arg cli "$cli" \
-          --arg dl "$delivery" --arg cwd "$PWD" --arg ts "$(now)" --arg hr "$proom" --argjson rooms "$rooms_json" \
+          --arg dl "$delivery" --arg ib "$inbox" --arg cwd "$PWD" --arg ts "$(now)" --arg hr "$proom" --argjson rooms "$rooms_json" \
           '{name:$name, session_id:$sid, cli:$cli, term_backend:$tb, term_addr:$ta, term_src:$tsrc, cwd:$cwd, home_room:$hr, rooms:$rooms, registered_at:$ts}
-           + (if $dl != "" then {delivery:$dl} else {} end)' \
+           + (if $dl != "" then {delivery:$dl} else {} end) + (if $ib != "" then {inbox:$ib} else {} end)' \
           > "$REG/$name.json.tmp.$$" && mv "$REG/$name.json.tmp.$$" "$REG/$name.json"
     local r
     while IFS= read -r r; do
@@ -271,9 +273,9 @@ cmd_register() {
     echo "Rebound '$name' to this session (silent — no join announcement, cursors kept)."
   else
     $JQ -n --arg name "$name" --arg sid "$sid" --arg tb "$tb" --arg ta "$ta" --arg tsrc "$tsrc" --arg cli "$cli" \
-          --arg dl "$delivery" --arg cwd "$PWD" --arg ts "$(now)" --arg hr "$proom" \
+          --arg dl "$delivery" --arg ib "$inbox" --arg cwd "$PWD" --arg ts "$(now)" --arg hr "$proom" \
           '{name:$name, session_id:$sid, cli:$cli, term_backend:$tb, term_addr:$ta, term_src:$tsrc, cwd:$cwd, home_room:$hr, rooms:([$hr,"general"] | unique), registered_at:$ts}
-           + (if $dl != "" then {delivery:$dl} else {} end)' \
+           + (if $dl != "" then {delivery:$dl} else {} end) + (if $ib != "" then {inbox:$ib} else {} end)' \
           > "$REG/$name.json"
     append_msg "$proom" "system" "*" "$name joined (cwd: $PWD)"
     set_cursor_eof "$name" "$proom"
@@ -299,7 +301,7 @@ cmd_register() {
 
 cmd_unregister() {
   local name="${1:-}"
-  [ -n "$name" ] || name=$(require_name)
+  [ -n "$name" ] || { name=$(require_name) || exit 1; }
   local hr; hr=$(home_room "$name")
   rm -f "$REG/$name.json" "$CUR/$name"@*
   [ -n "$hr" ] && append_msg "$hr" "system" "*" "$name left the chat"
@@ -319,7 +321,7 @@ cmd_send() {
   done
   [ -n "$msg" ] || die 'usage: agent-chat send "<message>" [--room <room>] [--to <name>] [--nudge|--quiet]'
   local from
-  from=$(require_name)
+  from=$(require_name) || exit 1
   if [ -z "$room" ]; then
     if [ "$to" != "*" ]; then
       # DM routing: prefer a room BOTH agents are in, so working conversations
@@ -403,16 +405,15 @@ cmd_send() {
       waiting)
         echo "  → $name is blocked on a prompt/dialog — NOT typing (would hit a button). It'll see the message when it resumes. Inspect: agent-chat screen $name";;
       idle)
-        do_nudge "$name" "[agent-chat] new message from $from in #$room — run: agent-chat read" && \
-          echo "  → $name was idle — nudged" || true;;
+        nudge_request "$name" "$from";;
       dead|offline)
         echo "  → $name is $state ($src) — message stored; it'll be delivered when that session restarts and re-registers";;
       unlocated)
         echo "  → $name: $src — NOT typing (no terminal to type into). Message stored; it sees it at its next turn boundary. To make it reachable, have it run: agent-chat register $name";;
       *)
         # unknown: nudge anyway (best-effort), typing is harmless at an idle prompt
-        do_nudge "$name" "[agent-chat] new message from $from in #$room — run: agent-chat read" && \
-          echo "  → $name state unknown ($src) — nudged best-effort" || true;;
+        echo "  → $name state unknown ($src) — nudging best-effort"
+        nudge_request "$name" "$from";;
     esac
   done 3<<< "$($JQ -r --arg r "$room" \
     '[.name, (.delivery // ""), (((.rooms // []) | index($r)) != null)] | map(tostring) | join("\u001f")' \
@@ -421,7 +422,7 @@ cmd_send() {
 
 cmd_read() {
   local name out
-  name=$(require_name)
+  name=$(require_name) || exit 1
   out=$(deliver "$name")
   if [ -n "$out" ]; then printf '%s\n' "$out"; else echo "No new messages."; fi
 }
@@ -467,7 +468,7 @@ cmd_join() {
   local room="${1:-}" name
   [ -n "$room" ] || die "usage: agent-chat join <room>"
   valid_room "$room" || die "invalid room name '$room'"
-  name=$(require_name)
+  name=$(require_name) || exit 1
   my_rooms "$name" | grep -qxF -- "$room" && { echo "already in #$room"; return; }
   $JQ --arg r "$room" '.rooms = ((.rooms + [$r]) | unique)' "$REG/$name.json" > "$REG/$name.json.tmp" \
     && mv "$REG/$name.json.tmp" "$REG/$name.json"
@@ -478,7 +479,7 @@ cmd_join() {
 cmd_leave() {
   local room="${1:-}" name
   [ -n "$room" ] || die "usage: agent-chat leave <room>"
-  name=$(require_name)
+  name=$(require_name) || exit 1
   [ "$room" = "general" ] && die "#general membership is fixed (DM delivery depends on it)"
   [ "$room" = "$(home_room "$name")" ] && die "cannot leave your project room"
   $JQ --arg r "$room" '.rooms = (.rooms - [$r])' "$REG/$name.json" > "$REG/$name.json.tmp" \
@@ -567,9 +568,15 @@ term_by_tty() { # /dev/ttyX -> "backend addr"
   return 1
 }
 
-has_tty_ancestor() { # is this command a descendant of something attached to a terminal?
-  local _ t
-  while IFS=$'\t' read -r _ t _; do real_tty "$t" && return 0; done <<< "$(ancestry)"
+oc_service_run() { # is this command run by OpenCode's background service (not a standalone TUI)?
+  # the nearest of the two decides: the service process, or something on a tty.
+  # (the service itself may sit under a TUI's tty — a TUI that found no service
+  #  running starts one as its own child — so "any tty ancestor" isn't the test)
+  local _ t cmd
+  while IFS=$'\t' read -r _ t cmd; do
+    case "$cmd" in *opencode*" serve"*) return 0;; esac
+    real_tty "$t" && return 1
+  done <<< "$(ancestry)"
   return 1
 }
 
@@ -889,10 +896,11 @@ term_enter() { # backend addr — a real Enter keypress (separate from the text:
   case "$1" in
     iterm) iterm_write "$2" $'\r';;
     # the pause matters: tmux delivers the text and the Enter microseconds
-    # apart, and Codex reads that as one pasted burst — the Enter then lands in
-    # the input box as a newline instead of submitting (iTerm's two osascript
-    # calls are naturally far enough apart)
-    tmux)  sleep 0.4; tmux send-keys -t "$2" Enter && echo ok;;
+    # apart, and Codex/Claude read that as one pasted burst — the Enter then
+    # lands in the input box as a newline instead of submitting (0.4s still
+    # missed sometimes with Claude Code 2.1.3xx; iTerm's two osascript calls
+    # are naturally far enough apart)
+    tmux)  sleep 1; tmux send-keys -t "$2" Enter && echo ok;;
     *) die "unsupported terminal backend '$1'";;
   esac
 }
@@ -1166,17 +1174,255 @@ cmd_whereami() { # [--porcelain] — what THIS session resolves to (also used by
     "$cli" "$sid" "${name:-(not registered)}" "$tb" "$ta" "$tsrc"
 }
 
-do_nudge() { # name [text] — type text, then Enter as a SEPARATE keystroke (submits as a prompt).
+# ---------- Claude Code inbox socket ----------
+#
+# Claude Code (>= 2.1.224) gives every session an inbox: a Unix socket, exported
+# to its hooks and Bash as $CLAUDE_CODE_MESSAGING_SOCKET (<dir>/<pid>.sock). A
+# JSON line posted there is read between tool calls of a running turn, or
+# STARTS a turn when the session is idle — no typing, so whatever a human has
+# half-typed in the input box stays where it is. The catch: a session that
+# bypasses permission prompts HOLDS such a message (an approval dialog per
+# message) unless "crossSessionInbound": "accept" applies to it — so the inbox
+# is only used where it is known to deliver, and typing stays the fallback.
+
+cc_inbox() { # name -> the agent's live inbox socket; rc 1 if it has none we can use
+  local reg dir term tb ta tty pid
+  reg=$(reg_get "$1" inbox)
+  term=$(resolve_term "$1") || return 1
+  read -r tb ta <<< "$term"
+  tty=$(agent_tty "$tb" "$ta"); [ -n "$tty" ] || return 1
+  dir=$(dirname "${reg:-/tmp/cc-socks/x}")
+  # the socket is named after its session's pid: only trust one whose claude
+  # still runs on this agent's tty (a restart in the pane gets a new socket)
+  for pid in $(ps -t "${tty#/dev/}" -o pid=,command= 2>/dev/null \
+               | awk '{ n = $2; sub(/.*\//, "", n); if (n == "claude") print $1 }'); do
+    [ -S "$dir/$pid.sock" ] && { echo "$dir/$pid.sock"; return 0; }
+  done
+  return 1
+}
+
+cc_inbound_accepts() { # name — will its session deliver an outside message without a dialog?
+  local mode cwd f
+  mode=$(cat "$STATUS/$1.mode" 2>/dev/null)
+  # prompting sessions deliver anything that doesn't claim to bypass; a bypassing
+  # one (plan mode may count as bypassing) only with an explicit accept
+  case "$mode" in default|acceptEdits|auto|dontAsk) return 0;; esac
+  cwd=$(reg_get "$1" cwd)
+  for f in "$cwd/.claude/settings.local.json" "$cwd/.claude/settings.json" "$HOME/.claude/settings.json"; do
+    [ -f "$f" ] || continue
+    case "$($JQ -r '.crossSessionInbound // empty' "$f" 2>/dev/null)" in
+      accept) return 0;;
+      hold|refuse) return 1;;
+    esac
+  done
+  return 1
+}
+
+# cc_push <name> — hand <name> everything it hasn't read through its inbox socket.
+# rc 0 delivered · 1 nothing unread · 2 no usable inbox / refused (cursors untouched)
+cc_push() {
+  local name="$1" sock text pend lock="$CUR/.push-$1.lock" i=0
+  cc_inbound_accepts "$name" && sock=$(cc_inbox "$name") || return 2
+  while ! mkdir "$lock" 2>/dev/null; do
+    i=$((i + 1)); [ "$i" -gt 50 ] && { rmdir "$lock" 2>/dev/null; i=0; }
+    sleep 0.1
+  done
+  pend=$(mktemp "${TMPDIR:-/tmp}/agent-chat.XXXXXX")
+  text=$(DELIVER_PENDING="$pend" deliver "$name")
+  if [ -z "$text" ]; then
+    commit_delivery "$pend"; rmdir "$lock" 2>/dev/null; return 1
+  fi
+  if $JQ -cn --arg t "$(mail_payload "$name" "$text")" '{type:"user", message:{role:"user", content:$t}}' \
+     | nc -U -w 2 "$sock" >/dev/null 2>&1; then
+    commit_delivery "$pend"; rmdir "$lock" 2>/dev/null; return 0
+  fi
+  rm -f "$pend"; rmdir "$lock" 2>/dev/null; return 2
+}
+
+# ---------- nudge (wake an idle agent by typing into its prompt) ----------
+#
+# Typing into a pane someone is typing in garbles both: the human's half-written
+# prompt gets the wake-up line glued on and submitted. So a nudge only types when
+#   1. nobody is at THAT pane's keyboard: it isn't the focused pane of the
+#      frontmost terminal, or no key was pressed for NUDGE_HANDS_OFF seconds
+#      (work in other windows/apps doesn't count), and
+#   2. its screen is still: two snapshots NUDGE_SETTLE seconds apart are equal.
+# Text sitting unchanged in the input box does NOT block (a forgotten word, an
+# autocomplete suggestion) — the nudge is typed after it.
+# Otherwise the nudge is deferred to a background worker that retries until it
+# lands, the agent reads its mail some other way (e.g. the human submits: the
+# prompt hook delivers it), or NUDGE_GIVEUP passes. Nudges to one agent are
+# combined: at most one per NUDGE_GAP seconds, naming every sender since.
+
+NUDGE_DIR="$BASE/nudge"
+NUDGE_GAP=30
+NUDGE_HANDS_OFF=20
+NUDGE_SETTLE=1.5
+NUDGE_RETRY=5
+NUDGE_GIVEUP=1800
+
+has_unread() { [ -n "$(DELIVER_PENDING=/dev/null deliver "$1")" ]; } # name — without consuming
+
+key_idle() { # seconds since the last keyboard/mouse input anywhere on this Mac
+  ioreg -c IOHIDSystem 2>/dev/null | awk '/HIDIdleTime/ { print int($NF / 1000000000); exit }'
+}
+
+# pane_key_idle <backend> <addr> -> seconds since a key was pressed IN that pane;
+# prints nothing when the pane doesn't have the keyboard (so nobody types there)
+pane_key_idle() {
+  case "$1" in
+    iterm)
+      local focused
+      focused=$(osascript - "$2" <<'APPLESCRIPT' 2>/dev/null
+on run argv
+  tell application "iTerm2"
+    if not frontmost then return "no"
+    try
+      if (id of current session of current tab of current window as text) is equal to (item 1 of argv) then return "yes"
+    end try
+  end tell
+  return "no"
+end run
+APPLESCRIPT
+)
+      [ "$focused" = yes ] && key_idle;;
+    tmux)
+      local act cs
+      act=$(tmux display -p -t "$2" '#{pane_active}#{window_active}#{session_attached}' 2>/dev/null)
+      case "$act" in 11[1-9]*) ;; *) return 0;; esac
+      cs=$(tmux display -p -t "$2" '#{session_name}')
+      tmux list-clients -t "$cs" -F '#{client_activity}' 2>/dev/null \
+        | sort -n | tail -n1 | awk -v now="$(date +%s)" 'NF { print now - $1 }';;
+  esac
+}
+
+screen_tail() { term_screen "$1" "$2" 2>/dev/null | sed -e :a -e '/^[[:space:]]*$/{$d;N;ba' -e '}' | tail -n 12; }
+
+# nudge_blocker <backend> <addr> -> why typing now would collide ("" = clear)
+nudge_blocker() {
+  local idle a b
+  idle=$(pane_key_idle "$1" "$2")
+  if [ -n "$idle" ] && [ "$idle" -lt "$NUDGE_HANDS_OFF" ]; then
+    echo "someone is typing in its pane (focused, last key ${idle}s ago)"; return
+  fi
+  a=$(screen_tail "$1" "$2")
+  printf '%s' "$a" | grep -q 'esc to interrupt' && { echo "it is working (spinner on screen)"; return; }
+  sleep "$NUDGE_SETTLE"; b=$(screen_tail "$1" "$2")
+  [ "$a" = "$b" ] || echo "its screen is changing (someone typing?)"
+}
+
+nudge_type() { # backend addr text — type text, then Enter as a SEPARATE keystroke (submits as a prompt).
   # The separation is deliberate: TUIs run with bracketed paste on, so a \r inside
   # the same payload is pasted as a literal newline into the input box instead of
   # submitting. A lone Enter in its own call acts as a real keypress.
-  local name="$1"
-  local text="${2:-[agent-chat] you have new messages — run: agent-chat read}"
-  text=$(printf '%s' "$text" | tr -d '"\\')
-  local tb ta
+  local text
+  text=$(printf '%s' "$3" | tr -d '"\\')
+  term_type "$1" "$2" "$text" >/dev/null && term_enter "$1" "$2" >/dev/null || return 1
+  # an Enter swallowed as part of the paste leaves the line sitting in the box:
+  # one more Enter (the prompt line ending in our text means it wasn't sent)
+  sleep 1.5
+  screen_tail "$1" "$2" | grep -E '^[❯›>] ' | tail -n1 | grep -qF -- "${text: -40}" && term_enter "$1" "$2" >/dev/null
+  return 0
+}
+
+nudge_text() { # name — the wake-up line for everyone waiting on this agent
+  local who
+  who=$(sort -u "$NUDGE_DIR/$1.from" 2>/dev/null | paste -sd, - | sed 's/,/, /g')
+  echo "[agent-chat] new message(s)${who:+ from $who} — run: agent-chat read"
+}
+
+nudge_last() { cat "$NUDGE_DIR/$1.last" 2>/dev/null || echo 0; }
+
+nudge_worker_alive() { # name
+  local pid; pid=$(cat "$NUDGE_DIR/$1.worker" 2>/dev/null) || return 1
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+nudge_now() { # name — one guarded attempt. rc 0 typed · 1 blocked (reason on stdout) · 2 no terminal
+  local term tb ta why
+  term=$(resolve_term "$1") || return 2
+  read -r tb ta <<< "$term"
+  why=$(nudge_blocker "$tb" "$ta")
+  [ -n "$why" ] && { echo "$why"; return 1; }
+  nudge_type "$tb" "$ta" "$(nudge_text "$1")" || return 2
+  date +%s > "$NUDGE_DIR/$1.last"; rm -f "$NUDGE_DIR/$1.from"
+}
+
+# nudge_request <name> <from> — wake <name> about mail from <from>: right away
+# when safe, else hand it to the background worker. Prints the outcome.
+nudge_request() {
+  local name="$1" wait why
+  # a Claude Code agent whose inbox delivers needs no typing at all
+  if [ "$(reg_get "$name" cli)" = claude ]; then
+    cc_push "$name"
+    case $? in
+      0) echo "  → $name was idle — delivered to its inbox (woken without typing)"; return;;
+      1) echo "  → $name has nothing unread from this"; return;;
+    esac
+  fi
+  mkdir -p "$NUDGE_DIR"
+  printf '%s\n' "$2" >> "$NUDGE_DIR/$name.from"
+  if nudge_worker_alive "$name"; then
+    echo "  → $name was idle — a nudge is already pending; this message joins it"; return
+  fi
+  wait=$(( NUDGE_GAP - ($(date +%s) - $(nudge_last "$name")) ))
+  if [ "$wait" -le 0 ]; then
+    why=$(nudge_now "$name") && { echo "  → $name was idle — nudged"; return; }
+    [ -z "$why" ] && { echo "  → $name: couldn't type into its terminal"; return; }
+    echo "  → $name was idle, but $why — nudge deferred (retried in the background; dropped if it reads the mail first)"
+  else
+    echo "  → $name was idle — nudged $(( NUDGE_GAP - wait ))s ago already; the next nudge (in ≤${wait}s) covers this one"
+  fi
+  ( nohup "$0" _nudge-worker "$name" >/dev/null 2>&1 </dev/null & )
+}
+
+cmd_nudge_worker() { # name — background: land one combined nudge, then exit
+  local name="$1" start st state lock="$NUDGE_DIR/$1.lock"
+  mkdir -p "$NUDGE_DIR"
+  if ! mkdir "$lock" 2>/dev/null; then
+    nudge_worker_alive "$name" && exit 0  # another worker has it
+    rm -f "$NUDGE_DIR/$name.worker"       # a dead one's leftovers: take over
+  fi
+  # (expanded now: the locals are gone by the time EXIT fires)
+  trap "rm -f '$NUDGE_DIR/$name.worker'; rmdir '$lock' 2>/dev/null" EXIT
+  echo $$ > "$NUDGE_DIR/$name.worker"
+  start=$(date +%s)
+  while [ $(( $(date +%s) - start )) -lt "$NUDGE_GIVEUP" ]; do
+    sleep "$NUDGE_RETRY"
+    [ -e "$REG/$name.json" ] && has_unread "$name" || break     # read some other way: done
+    [ $(( $(date +%s) - $(nudge_last "$name") )) -ge "$NUDGE_GAP" ] || continue
+    st=$(agent_state "$name"); state="${st%%$'\t'*}"
+    case "$state" in
+      idle|unknown) nudge_now "$name" >/dev/null; [ $? = 1 ] || break;;
+      busy|waiting) ;;      # its hooks deliver at the next turn boundary, or it resumes
+      *) break;;            # dead / offline / unlocated: nothing to type into
+    esac
+  done
+  rm -f "$NUDGE_DIR/$name.from"
+}
+
+cmd_nudge() { # name [text] [--force] — type a wake-up line + Enter (same guard as send)
+  local name="" text="" force=0 tb ta why
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force) force=1; shift;;
+      *) if [ -z "$name" ]; then name="$1"; else text="$1"; fi; shift;;
+    esac
+  done
+  [ -n "$name" ] || die 'usage: agent-chat nudge <name> [text] [--force]'
+  local sock
+  if [ "$(reg_get "$name" cli)" = claude ] && cc_inbound_accepts "$name" && sock=$(cc_inbox "$name"); then
+    [ -n "$text" ] || text="[agent-chat] you have new messages — run: agent-chat read"
+    $JQ -cn --arg t "$text" '{type:"user", message:{role:"user", content:$t}}' | nc -U -w 2 "$sock" >/dev/null 2>&1 \
+      && { echo "ok (inbox)"; return; }
+  fi
   read -r tb ta <<< "$(agent_term "$name")"
-  term_type "$tb" "$ta" "$text"
-  term_enter "$tb" "$ta"
+  if [ "$force" = 0 ] && why=$(nudge_blocker "$tb" "$ta") && [ -n "$why" ]; then
+    die "not nudging $name: $why — try again shortly, or --force"
+  fi
+  mkdir -p "$NUDGE_DIR"
+  [ -n "$text" ] || text=$(nudge_text "$name")
+  nudge_type "$tb" "$ta" "$text" && date +%s > "$NUDGE_DIR/$name.last" && echo ok
 }
 
 cmd_type() { # name text — type into the input box WITHOUT submitting
@@ -1857,6 +2103,8 @@ cmd_hook() {
   sid=$(printf '%s' "$input" | $JQ -r '.session_id // empty' 2>/dev/null)
   [ -n "$sid" ] || exit 0
   name=$(resolve_name "$sid") || exit 0
+  local pmode; pmode=$(printf '%s' "$input" | $JQ -r '.permission_mode // empty' 2>/dev/null)
+  [ -n "$pmode" ] && { mkdir -p "$STATUS"; printf '%s\n' "$pmode" > "$STATUS/$name.mode"; }
   # stamp coarse state from the event (fallback signal; the live title glyph is
   # primary). Runs BEFORE the no-mail early-exit so it always records.
   case "$event" in
@@ -1907,7 +2155,8 @@ case "$cmd" in
   peek)       cmd_peek "$@";;
   who)        cmd_who "$@";;
   status)     cmd_status "$@";;
-  nudge)      do_nudge "$@";;
+  nudge)      cmd_nudge "$@";;
+  _nudge-worker) cmd_nudge_worker "$@";;
   type)       cmd_type "$@";;
   key)        cmd_key "$@";;
   screen)     cmd_screen "$@";;
