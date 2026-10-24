@@ -59,7 +59,7 @@ pattern in the same sentence. Noisy on capitalised names, so it is a prompt to t
 | Every prompt you send | UserPromptSubmit | One reminder line with the rules, built from your config thresholds, so the rules stay in recent context. |
 | Final reply to the user | Stop | One advisory line under replies of 60 words or more. Never blocks, so the user never sees two versions of one message. |
 | Any .md, .html, .txt file the agent writes | PostToolUse on Write and Edit | The named list lands in the agent's context, so it fixes the file before finishing. Artifacts included. Code files ignored. |
-| Text sent to other people | PreToolUse on Slack, GitHub, Linear and Notion tools | Denied with the list until the list is empty. Every string field counts, titles included. Dashes are checked at any length, code spans excluded. The agent fixes the draft and calls the tool again. |
+| Text sent to other people | PreToolUse on Slack, GitHub, Linear and Notion tools | Denied until the blocking items are fixed. The denial lists those first, then the full report. Every string field counts, titles included. Dashes are checked at any length, code spans excluded. Notion markup such as callouts, spans, mentions and toggles is stripped before any layer reads the text. The agent fixes the draft and calls the tool again. |
 | Publishing an artifact | PreToolUse on the Artifact tool | Denied when the page prose has an em-dash or an en-dash. Quoted samples inside figures and tables are not counted. Other breaks are reported and allowed. |
 
 Subagent hand-backs are not checked. They are working material for the main agent, not
@@ -142,6 +142,12 @@ items they have no instruction for, so the instruction has to exist in all three
 - `structure_timeout`: seconds before a hook gives up on the layer and goes on without it. Default 15.
 
 Kill switch: `SLOPCHECK_OFF=1` in the environment, or an empty file at `~/.config/slopcheck/off`.
+
+**Override, one blocked call at a time.** `slopcheck allow` lets the next blocked send or publish through, then the gate closes again. It is meant for a false alarm, or for a text the user wants sent as it is.
+- `slopcheck allow 3 --minutes 30 --reason "user approved the wording"` lets three calls through within 30 minutes. The defaults are one call within 10 minutes.
+- `slopcheck allow --status` shows a pending override, and `slopcheck allow --clear` drops it.
+- Each use is logged to `~/.config/slopcheck/overrides.jsonl` with the reason and what it would have blocked. The session also sees a line that names the override.
+- An agent runs it only when the user asks. The user can run it from the Claude Code prompt as `! slopcheck allow`.
 
 ## Model layer
 

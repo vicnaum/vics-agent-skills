@@ -11,6 +11,8 @@ Usage:
   slopcheck.py rules                            # print the CLAUDE.md rules block, ready to paste
   slopcheck.py uninstall                        # remove them
   slopcheck.py labels                           # summary of ~/.config/slopcheck/labels.jsonl
+  slopcheck.py allow [N] [--minutes M] [--reason TEXT]   # let the next N blocked sends or publishes through (default 1, 10 minutes)
+  slopcheck.py allow --status | allow --clear   # show or drop a pending override
 
 Exit codes for the CLI: 0 clean, 1 style flags only, 2 rule breaks.
 Config: ~/.config/slopcheck/config.json (created with defaults on first run).
@@ -212,7 +214,9 @@ def is_off():
 # ---------------- word lists ----------------
 def achievement_re(cfg):
     words = cfg.get("achievement_words") or DEFAULTS["achievement_words"]
-    return re.compile(r"\b(" + "|".join(re.escape(w) for w in sorted(words, key=len, reverse=True)) + r")\b", re.I)
+    # "intel" is slang only in lowercase prose: not the company "Intel", not inside a URL or slug
+    alt = lambda w: r"(?-i:(?<![\w/.-])intel(?![\w/-]))" if w.lower() == "intel" else re.escape(w)
+    return re.compile(r"\b(" + "|".join(alt(w) for w in sorted(words, key=len, reverse=True)) + r")\b", re.I)
 SELF_RATING = re.compile(r"\b(genuinely|honestly|straightforward|elegant(ly)?|seamless(ly)?|robust|crucial(ly)?|pivotal|delve|tapestry|leverag(e|ing)|notably|demonstrably|effectively)\b", re.I)
 AGREEMENT_OPENER = re.compile(r"^\s*(\*\*)?(you'?re (absolutely |completely )?right|good catch|great catch|great question|correct\b|fair (hit|point|enough)|exactly\b|absolutely\b)", re.I)
 STATUS_OPENER = re.compile(r"^\s*(\*\*)?(done|fixed|success|perfect|great|yes, it worked)\b\s*[.!]", re.I)
@@ -524,6 +528,7 @@ def model_hard(m):
 
 def check(raw, surface="terminal", is_html=False, cfg=None):
     cfg = cfg or config()
+    if not is_html: raw = notion_to_md(raw)
     breaks = rule_breaks(raw, is_html, cfg)
     flags = style_flags(raw, surface, cfg)
     plain = strip(raw, is_html)
@@ -726,6 +731,88 @@ def lines_as_paragraphs(text):
     parts = re.split(r"(```.*?```)", text, flags=re.S)
     return "".join(x if x.startswith("```") else re.sub(r"\n(?!\n)", "\n\n", x) for x in parts)
 
+# Notion enhanced markdown: XML-like block tags and {attr="..."} groups. Only text that carries one of these is converted.
+NOTION_MARKUP = re.compile(r"<(?:callout|columns?|details|summary|span|mention-[\w-]+|page|database|data-source|empty-block|table_of_contents|synced_block[\w-]*|meeting-notes|audio|video|image|file|pdf|embed|bookmark|equation|toggle)\b|\{\s*[\w-]+=\"[^\"]*\"", re.I)
+NOTION_ATTRS = re.compile(r"\s*\{\s*[\w-]+=\"[^\"]*\"(?:\s+[\w-]+=\"[^\"]*\")*\s*\}")
+NOTION_TAG = re.compile(r"</?[a-z][\w-]*(?:\s+[\w-]+(?:=\"[^\"]*\"|='[^']*'|=[^\s>]+)?)*\s*/?>", re.I)
+def notion_to_md(text):
+    """Notion pages arrive as enhanced markdown: callouts, columns, spans, mentions and child-page blocks are XML-like tags,
+    and {toggle="true"} style groups ride on headings. That is markup, not prose. Drop it and keep the words inside,
+    so no layer reads a tag line as a sentence. Text without Notion markup is returned unchanged."""
+    if not text or not NOTION_MARKUP.search(text): return text
+    t = re.sub(r"<table\b.*?</table>", " ", text, flags=re.S | re.I)                               # tables are data
+    t = re.sub(r"<(page|database|data-source)\b[^>]*>.*?</\1>", " ", t, flags=re.S | re.I)          # child-page blocks: titles, not prose
+    t = re.sub(r"<(?:page|database|data-source)\b[^>]*/>", " ", t, flags=re.I)
+    t = re.sub(r"<mention-[\w-]+\b[^>]*/>", " x ", t, flags=re.I)                                 # a bare mention reads as a noun, like a code span
+    t = re.sub(r"<br\s*/?>", "\n", t, flags=re.I)
+    t = NOTION_ATTRS.sub("", t)
+    t = NOTION_TAG.sub("", t)                                                                     # every other tag goes, its text stays
+    t = re.sub(r"^[ \t]+", "", t, flags=re.M)                                                     # child-block indentation
+    return t
+
+def blocking_items(r, bans):
+    """What alone makes a send blocked. The report lists more than this, and the rest does not block."""
+    out = [f"{kind} in field \"{k}\": \"{snip[:60]}\"" for kind, k, snip in bans]
+    out += [f"{k}: \"{s[:60]}\"" for k, s in r["breaks"] if "semicolons" not in k]
+    out += [f"{k}: \"{(s or '')[:60]}\"" for k, s, hard in r["flags"] if hard]
+    st = r.get("structure") or {}
+    if "skipped" not in st:
+        out += [f"structure {b['rule']}: \"{b['sentence'][:60]}\"" for b in st.get("breaks", []) if b.get("deny")]
+    if model_hard(r.get("model") or {}): out.append("model check: inflated or dramatic wording")
+    return out
+
+# ---------------- override ----------------
+# A pending override lets the next N blocked calls through. Set from the shell: `slopcheck allow`. Every use is logged.
+ALLOW_PATH = os.path.join(CFG_DIR, "allow.json")
+OVERRIDE_LOG = os.path.join(CFG_DIR, "overrides.jsonl")
+OVERRIDE_HINT = ("Override: only if the user explicitly asks to send this text as it is, run `slopcheck allow --reason \"<why>\"` "
+                 "and repeat the call. One override covers one blocked call within 10 minutes, and every use is logged.")
+
+def _read_allowance():
+    try:
+        a = json.load(open(ALLOW_PATH))
+    except Exception:
+        return None
+    if a.get("remaining", 0) < 1 or a.get("expires", 0) < time.time():
+        try: os.remove(ALLOW_PATH)
+        except Exception: pass
+        return None
+    return a
+
+def take_allowance(what, blocking):
+    """Consume one pending override, if any. Returns the allowance after use, or None when the call must stay blocked."""
+    a = _read_allowance()
+    if a is None: return None
+    a["remaining"] -= 1
+    try:
+        if a["remaining"] < 1: os.remove(ALLOW_PATH)
+        else: json.dump(a, open(ALLOW_PATH, "w"))
+        with open(OVERRIDE_LOG, "a") as f:
+            f.write(json.dumps({"time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "what": what, "reason": a.get("reason", ""), "blocking": blocking[:10]}) + "\n")
+    except Exception:
+        pass
+    return a
+
+def allow_cmd(argv):
+    if "--clear" in argv:
+        try: os.remove(ALLOW_PATH); print("pending override dropped")
+        except FileNotFoundError: print("no pending override")
+        return 0
+    if "--status" in argv:
+        a = _read_allowance()
+        if a is None: print("no pending override")
+        else: print(f"{a['remaining']} override(s) pending, {int(a['expires'] - time.time()) // 60} min left, reason: {a.get('reason') or 'none'}")
+        return 0
+    minutes = float(argv[argv.index("--minutes") + 1]) if "--minutes" in argv else 10.0
+    reason = argv[argv.index("--reason") + 1] if "--reason" in argv else ""
+    skip = {argv.index(f) + 1 for f in ("--minutes", "--reason") if f in argv}
+    nums = [a for i, a in enumerate(argv[2:], start=2) if i not in skip and a.isdigit()]
+    n = int(nums[0]) if nums else 1
+    os.makedirs(CFG_DIR, exist_ok=True)
+    json.dump({"remaining": n, "expires": time.time() + minutes * 60, "reason": reason, "created": time.strftime("%Y-%m-%dT%H:%M:%S%z")}, open(ALLOW_PATH, "w"))
+    print(f"next {n} blocked send(s) or publish(es) allowed for {minutes:g} min" + (f", reason: {reason}" if reason else "") + f". Uses are logged to {OVERRIDE_LOG}.")
+    return 0
+
 def hook_pre_send():
     cfg = config(); inp = _read_stdin_json()
     if os.environ.get("SLOPCHECK_INNER"): return
@@ -736,7 +823,7 @@ def hook_pre_send():
     bans = char_bans(fields, cfg)
     long_texts = [v for k, v in fields if len(v.split()) >= cfg["external_min_words"]]
     if is_notion_tool(inp.get("tool_name")):
-        long_texts = [lines_as_paragraphs(v) for v in long_texts]
+        long_texts = [lines_as_paragraphs(notion_to_md(v)) for v in long_texts]
     r = check("\n\n".join(long_texts), "external", cfg=cfg) if long_texts else {"words": 0, "breaks": [], "flags": [], "terms": [], "model": {"skipped": "short"}, "hard": False}
     rep = report(r)
     if bans:
@@ -744,8 +831,15 @@ def hook_pre_send():
     _save_last(rep)
     tool = inp.get("tool_name", "the tool")
     if cfg.get("block_external", True) and (bans or r["hard"]):
+        blocking = blocking_items(r, bans)
+        a = take_allowance(tool, blocking)
+        if a is not None:
+            print(json.dumps({"systemMessage": f"Style check overridden for this {tool} call ({a.get('reason') or 'no reason given'}). It would have blocked on: " + "; ".join(blocking[:4]) + f". Overrides left: {a['remaining']}."})); return
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-                          "permissionDecisionReason": f"Style check denied this {tool} call. This text goes to other people, so the writing rules apply in full, in every field including titles. Fix the items below in the draft and call the tool again.\n\n{rep}"}}))
+                          "permissionDecisionReason": f"Style check denied this {tool} call. This text goes to other people, so the writing rules apply in full, in every field including titles. Fix the items below in the draft and call the tool again.\n\n"
+                                                      + "Blocking, these alone stop the send:\n" + "\n".join(f"  - {b}" for b in blocking)
+                                                      + "\nThe rest of the report is listed for fixing and does not block on its own.\n\n"
+                                                      + f"{rep}\n\n{OVERRIDE_HINT}"}}))
     elif r["breaks"] or r["flags"] or r["terms"] or structure_breaks(r) or (r.get("model") and "skipped" not in r["model"]):
         print(json.dumps({"systemMessage": one_line(r) + " Allowed."}))
 
@@ -763,8 +857,11 @@ def hook_pre_publish():
     dashes = [(k, snip) for k, snip in r["breaks"] if k == "em-dash or en-dash"]
     rep = report(r); _save_last(rep)
     if dashes:
+        a = take_allowance("Artifact " + os.path.basename(fp), [f"{len(dashes)} dash breaks"])
+        if a is not None:
+            print(json.dumps({"systemMessage": f"Style check overridden for publishing {os.path.basename(fp)} ({a.get('reason') or 'no reason given'}): {len(dashes)} dash breaks went through. Overrides left: {a['remaining']}."})); return
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-                          "permissionDecisionReason": f"Style check denied publishing {os.path.basename(fp)}: {len(dashes)} dash breaks in the page text (quoted samples inside <figure> and <table> are not counted). Fix them and publish again.\n\n{rep}"}}))
+                          "permissionDecisionReason": f"Style check denied publishing {os.path.basename(fp)}: {len(dashes)} dash breaks in the page text (quoted samples inside <figure> and <table> are not counted). Fix them and publish again.\n\n{rep}\n\n{OVERRIDE_HINT}"}}))
     elif r["breaks"] or r["flags"] or structure_breaks(r):
         print(json.dumps({"systemMessage": f"Style check on {os.path.basename(fp)} before publish: {len(r['breaks'])} rule breaks, {len(r['flags'])} style flags, {len(structure_breaks(r))} structure items. Allowed."}))
 
@@ -933,6 +1030,8 @@ def uninstall():
 def main(argv):
     if len(argv) > 1 and argv[1] in ("hook-stop", "hook-post-write", "hook-pre-send", "hook-pre-publish", "labels", "uninstall", "rules"):
         {"hook-stop": hook_stop, "hook-post-write": hook_post_write, "hook-pre-send": hook_pre_send, "hook-pre-publish": hook_pre_publish, "labels": labels_summary, "uninstall": uninstall, "rules": rules_block}[argv[1]](); return 0
+    if len(argv) > 1 and argv[1] == "allow":
+        return allow_cmd(argv)
     if len(argv) > 1 and argv[1] == "install":
         install(dry_run="--dry-run" in argv, reminder="--no-reminder" not in argv, rules="--no-rules" not in argv); return 0
     if len(argv) > 1 and argv[1] == "install-structure":
