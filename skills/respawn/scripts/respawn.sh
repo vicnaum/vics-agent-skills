@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# respawn.sh — schedule a restart of THIS Claude Code CLI in its own terminal
+# respawn.sh — schedule a restart of THIS Claude Code or Codex CLI in its terminal
 # (iTerm window or tmux pane), resuming a session (typically right after a
 # session-stripper strip). The agent calls this as its LAST action, then ends
 # its turn; a detached watcher does the rest.
@@ -7,7 +7,7 @@
 # Usage:
 #   respawn.sh [<session-id>] [--swap <pending>] [--prompt "kickoff"] [--grace N] [--force] [--cmd "claude ..."] [--dry-run]
 #
-# <session-id>  session to resume. Default: $CLAUDE_CODE_SESSION_ID (this
+# <session-id>  session to resume. Default: the verified calling session (this
 #               session) — correct for in-place strips. Pass the NEW id after
 #               a forked strip.
 # --swap        path to a stripped `<session>.jsonl.pending` copy (made by
@@ -18,15 +18,15 @@
 #               fails, the session is relaunched UNSTRIPPED (fail-open) and
 #               the kickoff prompt says so. The pending's original must be the
 #               session being resumed.
-# --prompt      first prompt typed into the resumed CLI
-# --grace       seconds the watcher waits before typing /exit (default 15)
+# --prompt      initial prompt passed on the resumed CLI's command line
+# --grace       seconds before rechecking ownership and stopping the CLI (default 15)
 # --force       escalate to SIGTERM after 20s instead of waiting out a long turn
 # --cmd         full relaunch command override, e.g. --cmd "claude --model opus".
-#               Skips ps-based reconstruction; --resume <sid> is appended.
-# --dry-run     watcher logs what it would do, types/kills/swaps nothing
+#               Skips ps reconstruction; the CLI's resume selector is appended.
+# --dry-run     synchronously verifies and prints the plan; starts no watcher
 #
-# Terminal backends: tmux pane ($TMUX_PANE) or iTerm2 window ($ITERM_SESSION_ID);
-# tmux wins when both are set. Works headless (e.g. Linux server) under tmux.
+# Terminal backend and caller identity come from the companion agent-chat CLI.
+# Codex requires a current, unique thread-id title, never inherited terminal env.
 #
 # The relaunch command is rebuilt from the running CLI's ps entry: all flags
 # are kept (e.g. --dangerously-skip-permissions, --model) EXCEPT session
@@ -59,47 +59,26 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# which CLI is this? Claude Code exports CLAUDE_CODE_SESSION_ID, Codex exports
-# CODEX_THREAD_ID (same UUID `codex resume` takes). Determines the exit method
-# (/exit vs double ctrl-c) and the relaunch form (--resume vs resume).
-if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then CLI="claude"
-elif [ -n "${CODEX_THREAD_ID:-}" ]; then CLI="codex"
-else CLI="claude"; fi
-
-# terminal backend of this very session
-TB="" TA=""
-if [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ]; then
-  TB="tmux"; TA="$TMUX_PANE"
-elif [ -n "${ITERM_SESSION_ID:-}" ]; then
-  TB="iterm"; TA="${ITERM_SESSION_ID#*:}"
-fi
-
-# Codex (>= 0.16x) runs tool commands in a shared background daemon, so the
-# environment above is the DAEMON's: it names whichever terminal first started
-# it, not this session's. Sending the quit keys there would kill a different
-# agent's CLI. It is only this session's terminal if an ancestor of this
-# process is attached to a tty (Codex running tools in-process); otherwise ask
-# agent-chat, which locates the real pane by evidence.
-if [ "$CLI" = "codex" ]; then
-  own_tty=""; p=$PPID; hops=0
-  while [ -n "$p" ] && [ "$p" -gt 1 ] 2>/dev/null && [ "$hops" -lt 30 ]; do
-    pp=""; read -r pp tt <<< "$(ps -o ppid=,tty= -p "$p" 2>/dev/null)"
-    [ -n "$pp" ] || break
-    case "$tt" in ''|'?'|'??'|'-') ;; *) own_tty="$tt"; break;; esac
-    p="$pp"; hops=$((hops + 1))
-  done
-  if [ -z "$own_tty" ]; then
-    TB="" TA=""
-    AC="$(command -v agent-chat 2>/dev/null || echo "$HOME/.claude/agent-chat/agent-chat")"
-    [ -x "$AC" ] && read -r _ _ TB TA _ <<< "$("$AC" whereami --porcelain 2>/dev/null)"
-    { [ -n "$TB" ] && [ "$TB" != "none" ]; } || die "can't tell which terminal this Codex session is in (Codex runs commands in a shared background daemon, so \$ITERM_SESSION_ID/\$TMUX_PANE describe the daemon, not you). Register on agent-chat first ('agent-chat register <name>', twice if it asks), or make it exact for new sessions with 'agent-chat setup-codex --title-id'."
-  fi
-fi
-[ -n "$TB" ] || die "no supported terminal (need iTerm2 or tmux)"
-
-[ -n "$SID" ] || SID="${CLAUDE_CODE_SESSION_ID:-${CODEX_THREAD_ID:-}}"
+# Use the same identity and ownership implementation as peer control. Resolve
+# the sibling checkout first so an older PATH install cannot bypass this guard.
+AC="$SCRIPT_DIR/../../agent-chat/scripts/agent-chat"
+[ -x "$AC" ] || AC="$(command -v agent-chat 2>/dev/null || true)"
+[ -x "$AC" ] || die "agent-chat is required for verified session/terminal identity; install the companion skill"
+IDENTITY=$("$AC" whereami --porcelain) || die "couldn't resolve caller identity"
+read -r CLI ORIGIN_SID TB TA TERM_SOURCE <<< "$IDENTITY"
+case "$CLI" in claude|codex) ;; *) die "caller identity is missing, ambiguous, or unsupported ($CLI)";; esac
+[ -n "$TB" ] && [ "$TB" != none ] || die "can't prove this session's pane; for Codex enable 'agent-chat setup-codex --title-id', restart the TUI, and register again"
+[ -n "$SID" ] || SID="$ORIGIN_SID"
 [[ "$SID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
   || die "'$SID' does not look like a session id (pass one explicitly)"
+[[ "$GRACE" =~ ^[0-9]+$ ]] || die "--grace must be a nonnegative number of seconds"
+PROOF=$("$AC" _session-proof "$CLI" "$ORIGIN_SID" "$TB" "$TA") \
+  || die "the pane's current foreground CLI isn't provably this session — nothing scheduled"
+read -r TTY_PATH CLI_PID CLI_BIRTH SHELL_PID SHELL_BIRTH <<< "$PROOF"
+case "$(ps -o comm= -p "$SHELL_PID" 2>/dev/null)" in
+  *zsh|*bash|*fish|*/sh|sh|-*) ;;
+  *) die "the CLI isn't running under a shell; quitting it could close the pane";;
+esac
 
 # --swap: validate up front so a typo dies HERE, not in the detached watcher.
 STRIPPER=""
@@ -117,33 +96,11 @@ if [ -n "$SWAP" ]; then
   ORIG_SID="$(basename "$ORIG" .jsonl)"
   [ "$ORIG_SID" = "$SID" ] \
     || die "--swap pending belongs to session $ORIG_SID but resuming $SID — swapping one session's file while resuming another is almost certainly a mistake"
+  [ "$ORIG_SID" = "$ORIGIN_SID" ] || die "--swap must belong to the session being stopped"
   STRIPPER="$SCRIPT_DIR/../../session-stripper/scripts/stripper.py"
   STRIPPER="$(cd "$(dirname "$STRIPPER")" && pwd)/$(basename "$STRIPPER")" 2>/dev/null
   [ -f "$STRIPPER" ] || die "session-stripper not found next to respawn (needed for --swap): $STRIPPER"
 fi
-
-get_tty() {
-  case "$TB" in
-    tmux) tmux display -p -t "$TA" '#{pane_tty}' 2>/dev/null;;
-    iterm)
-      osascript - "$TA" <<'AS'
-on run argv
-  set targetId to item 1 of argv
-  tell application "iTerm2"
-    repeat with w in windows
-      repeat with t in tabs of w
-        repeat with s in sessions of t
-          if (id of s as text) is equal to targetId then return (tty of s)
-        end repeat
-      end repeat
-    end repeat
-  end tell
-  return ""
-end run
-AS
-      ;;
-  esac
-}
 
 # Rebuild the relaunch command from the live process: keep every flag except
 # session selectors (and worktree/tmux creation), then resume $SID.
@@ -174,8 +131,6 @@ if [ "$CLI" = "codex" ]; then
 elif [ -n "$CMD" ]; then
   RELAUNCH="$CMD --resume $SID"
 else
-  TTY_PATH=$(get_tty)
-  [ -n "$TTY_PATH" ] || die "terminal for this session not found ($TB $TA)"
   SHORT="${TTY_PATH#/dev/}"
   ORIG=$(ps -t "$SHORT" -o command= 2>/dev/null | grep -E '^(\S*/)?claude( |$)' | head -n1)
   [ -n "$ORIG" ] || ORIG="claude"
@@ -186,14 +141,21 @@ if [ -z "$KICKOFF" ]; then
   if [ -n "$SWAP" ]; then
     KICKOFF="[respawn] Your CLI was restarted after a session strip: the stripped pending copy was swapped in while the CLI was dead. The tail of your final pre-restart turn (the stripping commands themselves) was discarded by design — do NOT re-run the strip. Re-read your recent context and continue where you left off."
   else
-    KICKOFF="[respawn] Your CLI was restarted, resuming your session (after a strip). Re-read your recent context and continue exactly where you left off."
+    KICKOFF="[respawn] Your CLI was restarted, resuming your session. Re-read your recent context and continue exactly where you left off."
   fi
 fi
 
 WAIT_EXIT=900
 [ -n "$FORCE" ] && WAIT_EXIT=20
 
-nohup "$SCRIPT_DIR/respawn-watcher.sh" "$TB" "$TA" "$SID" "$RELAUNCH" "$KICKOFF" "$GRACE" "$WAIT_EXIT" "$DRY" "$CLI" "$SWAP" "$STRIPPER" \
+if [ -n "$DRY" ]; then
+  echo "DRY RUN: verified $CLI session $ORIGIN_SID on $TB $TA ($TTY_PATH), pid $CLI_PID born $CLI_BIRTH, shell $SHELL_PID born $SHELL_BIRTH."
+  echo "Would resume: $RELAUNCH (kickoff passed as a command-line argument)."
+  [ -z "$SWAP" ] || echo "Would apply after exit: $SWAP"
+  exit 0
+fi
+
+nohup "$SCRIPT_DIR/respawn-watcher.sh" "$TB" "$TA" "$SID" "$RELAUNCH" "$KICKOFF" "$GRACE" "$WAIT_EXIT" "$DRY" "$CLI" "$SWAP" "$STRIPPER" "$ORIGIN_SID" "$TTY_PATH" "$CLI_PID" "$CLI_BIRTH" "$SHELL_PID" "$SHELL_BIRTH" "$AC" \
   >> "$BASE/respawn.log" 2>&1 &
 disown
 
@@ -201,4 +163,4 @@ echo "Respawn scheduled${DRY:+ (DRY RUN)} on $TB ($TA), cli=$CLI."
 [ -n "$SWAP" ] && echo "Swap after exit: $SWAP → ${SWAP%.pending}"
 echo "Relaunch command: $RELAUNCH"
 echo "Log: $BASE/respawn.log"
-echo "IMPORTANT: this must be your LAST action — end your turn NOW (the watcher types /exit in ${GRACE}s; if your turn is still running it queues and fires at turn end)."
+echo "IMPORTANT: end your turn NOW. After ${GRACE}s the watcher re-verifies this exact session, then quits it ($CLI)."

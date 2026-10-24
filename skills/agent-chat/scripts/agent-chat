@@ -134,12 +134,14 @@ self_identity() {
   [ -n "$c" ] && n=$((n + 1)); [ -n "$x" ] && n=$((n + 1)); [ -n "$o" ] && n=$((n + 1))
   if [ "$n" -gt 1 ]; then
     cli=$(ancestry | while IFS=$'\t' read -r _ _ cmd; do cli_of_cmd "$cmd" && break; done)
+    [ -n "$cli" ] || return 1   # conflicting inherited identities: never choose by variable order
   fi
   case "$cli" in
     claude)   [ -n "$c" ] && { echo "claude $c"; return 0; };;
     codex)    [ -n "$x" ] && { echo "codex $x"; return 0; };;
     opencode) [ -n "$o" ] && { echo "opencode $o"; return 0; };;
   esac
+  [ "$n" -le 1 ] || return 1
   if   [ -n "$c" ]; then echo "claude $c"
   elif [ -n "$x" ]; then echo "codex $x"
   elif [ -n "$o" ]; then echo "opencode $o"
@@ -282,10 +284,13 @@ cmd_register() {
     set_cursor_eof "$name" "general"
     echo "Registered as '$name' (project room: #$proom, also in #general)."
   fi
+  case "$cli" in
+    codex|claude) [ "$tb" = none ] || set_term "$name" "$tb" "$ta" "$tsrc" "$sid" || return 1;;
+  esac
   case "$tb" in
     none)
       if [ "$cli" = codex ]; then
-        echo "ACTION NEEDED: run this exact command once more — 'agent-chat register $name'. Registration worked, but agent-chat couldn't yet tell which terminal this Codex session is in (Codex runs commands in a shared background daemon, and only prints a command on screen after it finishes). The second run recognises this pane by the line the first one just left on screen. Until then chat reaches you through hooks, but peers can't wake or watch you. (If a second run still says this, 'agent-chat setup-codex --title-id' makes it exact for new Codex sessions.)" >&2
+        echo "Registered for mail, but no unique current Codex thread title identifies this pane. Run 'agent-chat setup-codex --title-id', then restart this TUI and register again. Repeating registration alone cannot prove the current thread; terminal control is disabled until it can be identified." >&2
       elif [ "$delivery" = api ]; then
         echo "Mail delivery: OpenCode server API (no iTerm/tmux terminal found, so peers can't watch or drive this session — messages and wake-ups still arrive)."
       else
@@ -504,9 +509,8 @@ cmd_who() {
 # process that exported them, and newer CLIs run tool commands in a shared
 # background server (Codex's app-server daemon, OpenCode's service) whose
 # environment belongs to whichever terminal happened to start it first. So:
-#   1. nearest ancestor that owns a tty  -> that tty's pane   (Claude Code, and
-#      any CLI that runs tools in-process)
-#   2. Codex under its daemon            -> codex_locate (evidence-based)
+#   1. Codex (regardless of ancestry)    -> unique current thread-id title
+#   2. nearest tty ancestor              -> Claude Code's pane
 #   3. otherwise the environment         (OpenCode's TUI forwards its own env
 #      to the server for the session it shows, so there it IS the TUI's)
 
@@ -580,17 +584,6 @@ oc_service_run() { # is this command run by OpenCode's background service (not a
   return 1
 }
 
-uuid7_epoch() { # UUIDv7 -> the creation time embedded in it (unix seconds); rc 1 if not v7
-  local h="${1//-/}"
-  [ "${#h}" = 32 ] && [ "${h:12:1}" = 7 ] || return 1
-  case "${h:0:12}" in *[!0-9a-fA-F]*) return 1;; esac
-  echo $(( 16#${h:0:12} / 1000 ))
-}
-
-iso_epoch() { # our own timestamps (2026-10-12T21:06:10+0200) -> unix seconds; 0 if unparsable
-  date -j -f '%Y-%m-%dT%H:%M:%S%z' "$1" +%s 2>/dev/null || date -d "$1" +%s 2>/dev/null || echo 0
-}
-
 lstart_epoch() { # ps lstart in the C locale ("Mon Oct 12 21:05:52 2026") -> unix seconds
   LC_ALL=C date -j -f '%a %b %d %T %Y' "$1" +%s 2>/dev/null || LC_ALL=C date -d "$1" +%s 2>/dev/null
 }
@@ -610,119 +603,64 @@ _codex_cands_raw() {
     while read -r tt d1 d2 d3 d4 d5 cmd; do
       [ "/dev/$tt" = "$t" ] || continue
       [ "$(cli_of_cmd "$cmd")" = codex ] || continue
-      case " $cmd " in *" app-server "*|*" exec "*|*" mcp-server "*) continue;; esac
+      codex_tui_cmd "$cmd" || continue
       printf '%s\n' "${b}${US}${a}${US}${title}${US}$(lstart_epoch "$d1 $d2 $d3 $d4 $d5")${US}${cmd}"
     done <<< "$procs"
   done <<< "$list"
 }
 
-# codex_unclaimed <name> — is there a Codex TUI that no OTHER registered agent
-# is verifiably bound to? If not, an agent we can't locate has nowhere left to
-# be: it is gone, not merely hidden.
-codex_unclaimed() {
-  local cands claimed b a _
-  cands=$(codex_cands); [ -n "$cands" ] || return 1
-  claimed=$($JQ -r --arg me "$1" \
-    'select(.cli == "codex" and .name != $me and ((.term_src // "") | IN("title","args","screen","start","ancestry","spawn")))
-     | "\(.term_backend) \(.term_addr)"' "$REG"/*.json 2>/dev/null)
-  while IFS="$US" read -r b a _; do
-    [ -n "$b" ] || continue
-    printf '%s\n' "$claimed" | grep -qxF -- "$b $a" || return 0
-  done <<< "$cands"
+# A title is current evidence. Launch argv, old screen text, spawn hints and
+# process start times cannot distinguish a TUI that has since switched threads.
+thread_ids_in_title() {
+  printf '%s' "$1" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[0-9a-f]{4}(-[0-9a-f]{1,12})?' | sort -u
+}
+
+title_matches_thread() { # title sid — exactly one unambiguous UUIDv7 prefix
+  local shown
+  shown=$(thread_ids_in_title "$1")
+  [ -n "$shown" ] && [ "$(printf '%s\n' "$shown" | wc -l | tr -d ' ')" = 1 ] || return 1
+  case "$2" in "$shown"*) return 0;; esac
   return 1
 }
 
-# codex_locate <thread-id> [<name>] [live] -> "backend addr src"; rc 1 if not found.
-#
-# Finds the terminal whose Codex TUI is showing this thread, strongest evidence
-# first — and returns nothing rather than a guess:
-#   title  — the thread id is in the terminal title ([tui] terminal_title has
-#            "thread-id"; `setup-codex --title-id` sets that up). Exact, and
-#            keeps working if the session moves to another pane.
-#   args   — the TUI was started as `codex resume <thread-id>`
-#   screen — the pane shows an `agent-chat register <name>` line. Codex prints
-#            a command only AFTER it finishes ("• Ran …"), so the first
-#            registration can't see itself — a second one can.
-#   start  — the TUI process started just before the thread was created
-#            (thread ids are UUIDv7: the creation time is in the id)
-# `live` = called by the thread itself, mid-turn (register): its pane must be
-# showing a busy spinner, which rules out idle panes — notably an older session
-# that registered under the same name and still has that line on screen.
+codex_tui_cmd() {
+  [ "$(cli_of_cmd "$1")" = codex ] || return 1
+  case " $1 " in
+    *" app-server "*|*" exec-server "*|*" exec "*|*" mcp-server "*|*" remote-control "*) return 1;;
+  esac
+}
+
+# codex_locate sid [unused-name] [unused-live] -> backend addr title.
+# Duplicate wrappers on one tty count once; two panes showing the thread are
+# ambiguous. Even a cached title binding must pass this check on every use.
 codex_locate() {
-  local tid="$1" name="${2:-}" live="${3:-}" cands b a title cmd st
-  [ "${#tid}" -ge 32 ] || return 1   # not a thread id (a manual/legacy entry)
-  cands=$(codex_cands); [ -n "$cands" ] || return 1
-
+  local tid="$1" b a title st cmd hits="" count
+  [ "${#tid}" = 36 ] || return 1
   while IFS="$US" read -r b a title st cmd; do
     [ -n "$b" ] || continue
-    case "$title" in *"${tid:0:23}"*) echo "$b $a title"; return 0;; esac
-  done <<< "$cands"
-  while IFS="$US" read -r b a title st cmd; do
-    [ -n "$b" ] || continue
-    case " $cmd " in *" $tid "*) echo "$b $a args"; return 0;; esac
-  done <<< "$cands"
-
-  if [ -n "$live" ]; then
-    local busy=""
-    while IFS="$US" read -r b a title st cmd; do
-      [ -n "$b" ] && [ "$(glyph_state "$title")" = busy ] \
-        && busy="${busy}${b}${US}${a}${US}${title}${US}${st}${US}${cmd}"$'\n'
-    done <<< "$cands"
-    [ -n "$busy" ] && cands="$busy"   # (no spinner anywhere: the title was customised — keep them all)
-  fi
-
-  if [ -n "$name" ]; then
-    local hit="" n=0 scr
-    while IFS="$US" read -r b a title st cmd; do
-      [ -n "$b" ] || continue
-      scr=$(term_screen "$b" "$a" 2>/dev/null | tr -s '[:space:]' ' ')
-      if printf '%s' "$scr" | grep -Eq "agent-chat( --as [a-z0-9_-]+)? register ${name}([^a-z0-9_-]|\$)"; then
-        hit="$b $a"; n=$((n + 1))
-      fi
-    done <<< "$cands"
-    [ "$n" = 1 ] && { echo "$hit screen"; return 0; }
-  fi
-
-  # Lazily (no spinner to cross-check) only a near-exact start match counts;
-  # mid-turn, the busy filter above makes a wider window safe.
-  local te d win=5 best="" bestd="" second=""
-  [ -n "$live" ] && win=30
-  te=$(uuid7_epoch "$tid") || return 1
-  while IFS="$US" read -r b a title st cmd; do
-    [ -n "$b" ] && [ -n "$st" ] || continue
-    d=$(( te - st ))
-    { [ "$d" -ge -2 ] && [ "$d" -le "$win" ]; } || continue
-    [ "$d" -lt 0 ] && d=$(( -d ))
-    if [ "$b $a" = "$best" ]; then
-      [ "$d" -lt "$bestd" ] && bestd="$d"
-    elif [ -z "$bestd" ] || [ "$d" -lt "$bestd" ]; then second="$bestd"; bestd="$d"; best="$b $a"
-    elif [ -z "$second" ] || [ "$d" -lt "$second" ]; then second="$d"; fi
-  done <<< "$cands"
-  [ -n "$best" ] || return 1
-  # two TUIs started together and the id can't tell them apart: don't guess
-  [ -n "$second" ] && [ $(( second - bestd )) -lt 3 ] && return 1
-  echo "$best start"
+    title_matches_thread "$title" "$tid" || continue
+    hits="${hits}${b} ${a}"$'\n'
+  done <<< "$(codex_cands)"
+  hits=$(printf '%s' "$hits" | sed '/^$/d' | sort -u)
+  [ -n "$hits" ] || return 1
+  count=$(printf '%s\n' "$hits" | wc -l | tr -d ' ')
+  [ "$count" = 1 ] || return 1
+  printf '%s title\n' "$hits"
 }
 
 # detect_term <cli> <session-id> <name> -> "backend addr src" for THIS session
 # ("none - <why>" when there is no usable terminal). src records how it was
-# found; for Codex only evidence-based sources are trusted later (resolve_term).
+# found; Codex always needs a unique current thread-id title.
 detect_term() {
-  local cli="$1" sid="$2" name="$3" tt="" _ t loc hb="" ha="" ht=0 hint="$BASE/spawn/$3"
-  # `spawn` leaves a note of the terminal it created for this name
-  if [ -f "$hint" ]; then read -r hb ha ht < "$hint"; rm -f "$hint"; fi
+  local cli="$1" sid="$2" name="$3" tt="" _ t loc
+  if [ "$cli" = codex ]; then
+    codex_locate "$sid" || echo "none - unlocated"
+    return
+  fi
   while IFS=$'\t' read -r _ t _; do
     real_tty "$t" && { tt="$t"; break; }
   done <<< "$(ancestry)"
   if [ -n "$tt" ] && loc=$(term_by_tty "/dev/$tt"); then echo "$loc ancestry"; return; fi
-  if [ "$cli" = codex ] && [ -z "$tt" ]; then
-    if [ -n "$hb" ] && [ $(( $(date +%s) - ${ht:-0} )) -lt 900 ] \
-       && tty_has_cli "$(agent_tty "$hb" "$ha")" codex; then
-      echo "$hb $ha spawn"; return
-    fi
-    codex_locate "$sid" "$name" live || echo "none - unlocated"
-    return
-  fi
   if [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ]; then echo "tmux ${TMUX_PANE} env"
   elif [ -n "${ITERM_SESSION_ID:-}" ]; then echo "iterm ${ITERM_SESSION_ID#*:} env"
   else echo "none - none"; fi
@@ -790,63 +728,150 @@ oc_push() {
 
 reg_get() { $JQ -r --arg k "$2" '.[$k] // empty' "$REG/$1.json" 2>/dev/null; } # name field
 
-set_term() { # name backend addr src — re-point an agent at a terminal
-  $JQ --arg tb "$2" --arg ta "$3" --arg src "$4" \
-    '.term_backend = $tb | .term_addr = $ta | .term_src = $src' "$REG/$1.json" > "$REG/$1.json.tmp.$$" \
-    && mv "$REG/$1.json.tmp.$$" "$REG/$1.json"
+process_token() { # pid -> process birth timestamp; PID alone can be reused
+  local started
+  started=$(LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null) || return 1
+  [ -n "$started" ] || return 1
+  lstart_epoch "$(printf '%s' "$started" | sed 's/^ *//;s/ *$//')"
 }
 
-# resolve_term <name> -> "backend addr". rc 1: no terminal on record;
-# rc 2: a Codex agent whose terminal can't be located (see codex_locate);
-# rc 3: a Codex agent that is gone (every Codex TUI is accounted for).
-#
-# A Codex agent's record is only believed when it was found by evidence
-# (term_src title/args/screen/start/…) AND a codex still runs there. Entries
-# written from the daemon's inherited environment, and bindings whose TUI has
-# gone, are re-resolved here and the registry repaired — that is what lets a
-# stale or moved Codex agent become reachable again without re-registering.
+same_process() { [ -n "$2" ] && [ "$(process_token "$1")" = "$2" ]; }
+
+is_shell_pid() {
+  local cmd
+  cmd=$(ps -o comm= -p "$1" 2>/dev/null); cmd="${cmd##*/}"
+  case "$cmd" in zsh|-zsh|bash|-bash|fish|-fish|sh|-sh) return 0;; esac
+  return 1
+}
+
+# session_proof cli sid backend addr -> tty pid birth parent-pid parent-birth.
+# Used by both respawn implementations. These checks always bypass snapshots:
+# a fleet snapshot is useful for observation, never permission to send input.
+session_proof() {
+  local cli="$1" sid="$2" tb="$3" ta="$4" tty pids pid born parent pb stat
+  local _TERM_LIST _CODEX_CANDS; unset _TERM_LIST _CODEX_CANDS
+  warm_terms || return 1
+  tty=$(agent_tty "$tb" "$ta"); [ -n "$tty" ] || return 1
+  pids=$(agent_pids "$tty" "$cli")
+  [ -n "$pids" ] && [ "$(printf '%s\n' "$pids" | wc -l | tr -d ' ')" = 1 ] || return 1
+  pid="$pids"
+  stat=$(ps -o stat= -p "$pid" 2>/dev/null)
+  case "$stat" in *+*) ;; *) return 1;; esac  # background CLI is not the keyboard owner
+  case "$cli" in
+    codex)
+      title_matches_thread "$(term_title "$tb" "$ta")" "$sid" || return 1
+      local found
+      found=$(codex_locate "$sid") || return 1
+      [ "$found" = "$tb $ta title" ] || return 1;;
+    claude)
+      [ "$($JQ -r '.sessionId // empty' "$HOME/.claude/sessions/$pid.json" 2>/dev/null)" = "$sid" ] || return 1;;
+    *) return 1;;
+  esac
+  born=$(process_token "$pid") || return 1
+  parent=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+  pb=$(process_token "$parent") || return 1
+  printf '%s %s %s %s %s\n' "$tty" "$pid" "$born" "$parent" "$pb"
+}
+
+shell_proof() { # backend addr tty shell-pid shell-birth
+  local _TERM_LIST _CODEX_CANDS; unset _TERM_LIST _CODEX_CANDS
+  [ -n "$3" ] && [ "$(agent_tty "$1" "$2")" = "$3" ] || return 1
+  same_process "$4" "$5" && is_shell_pid "$4" || return 1
+  [ "$(ps -o tty= -p "$4" 2>/dev/null | tr -d ' ')" = "${3#/dev/}" ] || return 1
+  tty_fg_shell "$3"
+}
+
+set_term() { # name backend addr src [expected-sid]
+  local name="$1" proof="" tty="" pid="" born="" parent="" pb="" cli sid
+  cli=$(reg_get "$name" cli); sid=$(reg_get "$name" session_id)
+  [ -z "${5:-}" ] || [ "$sid" = "$5" ] || return 1
+  if proof=$(session_proof "$cli" "$sid" "$2" "$3"); then
+    read -r tty pid born parent pb <<< "$proof"
+  elif [ "$cli" = codex ]; then
+    return 1
+  fi
+  $JQ --arg tb "$2" --arg ta "$3" --arg src "$4" --arg sid "$sid" \
+      --arg tty "$tty" --arg pid "$pid" --arg born "$born" --arg parent "$parent" --arg pb "$pb" --arg verified "${proof:+$sid}" \
+    'select(.session_id == $sid) | .term_backend = $tb | .term_addr = $ta | .term_src = $src
+     | .term_tty = $tty | .term_cli_pid = $pid | .term_cli_birth = $born
+     | .term_shell_pid = $parent | .term_shell_birth = $pb | .term_verified_session = $verified' "$REG/$name.json" > "$REG/$name.json.tmp.$$" \
+    && [ -s "$REG/$name.json.tmp.$$" ] && mv "$REG/$name.json.tmp.$$" "$REG/$name.json"
+}
+
+# A dead CLI can be recovered only in its previously verified, unchanged
+# shell. Legacy records without a shell fingerprint cannot authorize recovery.
+saved_shell_proof() {
+  local name="$1" tb="$2" ta="$3" oldpid oldbirth
+  [ "$(reg_get "$name" term_verified_session)" = "$(reg_get "$name" session_id)" ] || return 1
+  oldpid=$(reg_get "$name" term_cli_pid); oldbirth=$(reg_get "$name" term_cli_birth)
+  [ -n "$oldpid" ] && ! same_process "$oldpid" "$oldbirth" || return 1
+  shell_proof "$tb" "$ta" "$(reg_get "$name" term_tty)" \
+    "$(reg_get "$name" term_shell_pid)" "$(reg_get "$name" term_shell_birth)"
+}
+
+# resolve_term name -> backend addr. 2 means unlocated, 3 means pane closed.
+# Codex always needs a unique CURRENT title. Historical hints are never proof.
 resolve_term() {
-  local f="$REG/$1.json" tb ta src cli sid reg tty loc
+  local f="$REG/$1.json" tb ta cli sid loc src
   [ -e "$f" ] || return 1
-  IFS="$US" read -r tb ta src cli sid reg <<< "$($JQ -r \
-    '[.term_backend // "", .term_addr // "", .term_src // "", .cli // "claude", .session_id // "", .registered_at // ""] | join("\u001f")' "$f")"
-  if [ -z "$tb" ]; then   # legacy entries
-    ta=$($JQ -r '.iterm_session_id // empty' "$f"); ta="${ta#*:}"
-    [ -n "$ta" ] && tb="iterm"
+  tb=$(reg_get "$1" term_backend); ta=$(reg_get "$1" term_addr)
+  cli=$(reg_get "$1" cli); sid=$(reg_get "$1" session_id)
+  if [ -z "$tb" ]; then
+    ta=$(reg_get "$1" iterm_session_id); ta="${ta#*:}"
+    [ -n "$ta" ] && tb=iterm
   fi
   if [ "$cli" = codex ]; then
-    local trusted=0
-    case "$src" in title|args|screen|start|ancestry|spawn) [ -n "$tb" ] && [ "$tb" != none ] && trusted=1;; esac
-    # a pane whose title shows ANOTHER thread id holds a different session now
-    # (the agent was replaced there): the record is no evidence any more
-    [ "$trusted" = 1 ] && title_shows_other_thread "$(term_title "$tb" "$ta")" "$sid" && trusted=0
-    if [ "$trusted" = 1 ]; then
-      tty=$(agent_tty "$tb" "$ta")
-      [ -n "$tty" ] && tty_has_cli "$tty" codex && { printf '%s %s' "$tb" "$ta"; return 0; }
-    fi
-    if [ -z "${_CODEX_CANDS+x}" ]; then local _CODEX_CANDS; _CODEX_CANDS=$(_codex_cands_raw); fi
-    # (its register line can only still be on screen if it joined recently)
-    local nm=""
-    [ $(( $(date +%s) - $(iso_epoch "$reg") )) -lt 1800 ] && nm="$1"
-    if loc=$(codex_locate "$sid" "$nm"); then
+    if loc=$(codex_locate "$sid"); then
       read -r tb ta src <<< "$loc"
-      set_term "$1" "$tb" "$ta" "$src"
+      set_term "$1" "$tb" "$ta" "$src" "$sid" || return 2
       printf '%s %s' "$tb" "$ta"; return 0
     fi
-    if [ "$trusted" != 1 ]; then codex_unclaimed "$1" && return 2; return 3; fi
+    if saved_shell_proof "$1" "$tb" "$ta"; then printf '%s %s' "$tb" "$ta"; return 0; fi
+    # Only a previously fingerprinted terminal that is now gone is OFFLINE.
+    # Missing evidence says nothing about whether the thread itself is alive.
+    if [ -n "$(reg_get "$1" term_tty)" ] && [ -z "$(agent_tty "$tb" "$ta")" ]; then return 3; fi
+    return 2
   fi
-  { [ -n "$tb" ] && [ "$tb" != "none" ]; } || return 1
+  { [ -n "$tb" ] && [ "$tb" != none ]; } || return 1
   printf '%s %s' "$tb" "$ta"
 }
 
-# title_shows_other_thread <title> <thread-id> — rc 0 when the title carries a
-# Codex thread id (UUIDv7, possibly truncated) that is NOT this one
 title_shows_other_thread() {
   local shown
-  shown=$(printf '%s' "$1" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{1,12}' | head -n1)
-  [ -n "$shown" ] || return 1
-  case "$2" in "$shown"*) return 1;; esac
-  return 0
+  while read -r shown; do
+    [ -n "$shown" ] || continue
+    case "$2" in "$shown"*) ;; *) return 0;; esac
+  done <<< "$(thread_ids_in_title "$1")"
+  return 1
+}
+
+# Pin the requested session across sleeps and multi-key sequences. Failure is
+# final for this operation, even if the same agent name was rebound elsewhere.
+control_proof() { # name backend addr expected-sid
+  local cli term other
+  local _TERM_LIST _CODEX_CANDS; unset _TERM_LIST _CODEX_CANDS
+  [ "$(reg_get "$1" session_id)" = "$4" ] || return 1
+  other=$(pane_taken_by_other "$1" "$2" "$3"); [ -z "$other" ] || return 1
+  cli=$(reg_get "$1" cli)
+  case "$cli" in
+    codex|claude) session_proof "$cli" "$4" "$2" "$3" >/dev/null;;
+    *) term=$(resolve_term "$1") && [ "$term" = "$2 $3" ] && tty_has_cli "$(agent_tty "$2" "$3")" "$cli";;
+  esac
+}
+
+control_type() { # name backend addr sid text
+  control_proof "$1" "$2" "$3" "$4" || { echo "agent-chat: terminal ownership changed or cannot be proved — no input sent" >&2; return 1; }
+  term_type "$2" "$3" "$5"
+}
+
+control_key() { # name backend addr sid key
+  control_proof "$1" "$2" "$3" "$4" || { echo "agent-chat: terminal ownership changed or cannot be proved — no key sent" >&2; return 1; }
+  term_key "$2" "$3" "$5"
+}
+
+control_enter() {
+  [ "$2" != tmux ] || sleep 1
+  control_key "$1" "$2" "$3" "$4" enter
 }
 
 agent_term() { # name -> "backend addr" from the registry; dies when there is no usable terminal
@@ -855,14 +880,15 @@ agent_term() { # name -> "backend addr" from the registry; dies when there is no
   out=$(resolve_term "$1"); rc=$?
   case "$rc" in
     0) printf '%s' "$out";;
-    2) die "can't tell which terminal '$1' (codex) is in — have it run: agent-chat register $1";;
-    3) die "'$1' (codex) is gone — no Codex session left that it could be";;
+    2) die "can't prove the current pane for '$1' (codex) — enable thread-id with 'agent-chat setup-codex --title-id', restart that TUI, and register again";;
+    3) die "'$1' (codex) has a closed verified terminal";;
     *) die "'$1' has no terminal recorded (registered outside iTerm/tmux?)";;
   esac
 }
 
 iterm_write() { # uuid raw-bytes — write into the iTerm session verbatim, no auto-newline
-  osascript - "$1" "$2" <<'APPLESCRIPT'
+  local result
+  result=$(osascript - "$1" "$2" <<'APPLESCRIPT'
 on run argv
   set targetId to item 1 of argv
   set payload to item 2 of argv
@@ -881,6 +907,9 @@ on run argv
   return "session not found (window closed?)"
 end run
 APPLESCRIPT
+) || return 1
+  [ "$result" = ok ] || { echo "agent-chat: $result" >&2; return 1; }
+  echo ok
 }
 
 # terminal I/O primitives — dispatch on backend ("iterm" uuid | "tmux" pane-id)
@@ -957,7 +986,7 @@ on run argv
       end repeat
     end repeat
   end tell
-  return "agent-chat: session not found (window closed?)"
+  error "agent-chat: session not found (window closed?)"
 end run
 APPLESCRIPT
       ;;
@@ -1059,16 +1088,15 @@ stamp_status() { # name state — record a hook-observed state with a timestamp
   printf '%s %s\n' "$2" "$(date +%s)" > "$STATUS/$1"
 }
 
-tty_has_cli() { # tty-path cli — is that agent CLI (any of them, if cli is unknown) running on the tty?
-  local re
+tty_has_cli() {
+  local cmd found
   [ -n "$1" ] || return 1
-  case "$2" in
-    codex)    re='(^|[/ ])codex(\.js)?( |$)';;
-    opencode) re='(^|[/ ])opencode(\.js)?( |$)';;
-    claude)   re='^ *([^ ]*/)?(claude|node)( |$)|claude';;
-    *)        re='claude|(^|[/ ])(codex|opencode|node)(\.js)?( |$)';;
-  esac
-  ps -t "${1#/dev/}" -o command= 2>/dev/null | grep -qE "$re"
+  while read -r cmd; do
+    found=$(cli_of_cmd "$cmd") || continue
+    [ "$found" != codex ] || codex_tui_cmd "$cmd" || continue
+    if [ "$2" = unknown ] || [ "$2" = any ] || [ "$found" = "$2" ]; then return 0; fi
+  done <<< "$(ps -t "${1#/dev/}" -o command= 2>/dev/null)"
+  return 1
 }
 
 # agent_state <name> -> prints "STATE\tSOURCE"
@@ -1077,7 +1105,10 @@ tty_has_cli() { # tty-path cli — is that agent CLI (any of them, if cli is unk
 agent_state() {
   local name="$1" cli api=0 term rc tb="" ta="" tty g title hstate hepoch age st
   # one look at the terminals answers every question below (tty, title, Codex location)
-  if [ -z "${_TERM_LIST+x}" ]; then local _TERM_LIST; _TERM_LIST=$(_term_list_raw); fi
+  if [ -z "${_TERM_LIST+x}" ]; then
+    local _TERM_LIST
+    _TERM_LIST=$(_term_list_raw) || { printf 'unlocated\tterminal inventory unavailable\n'; return; }
+  fi
   cli=$(reg_get "$name" cli); [ -n "$cli" ] || cli=claude
   [ "$(reg_get "$name" delivery)" = api ] && api=1
   term=$(resolve_term "$name"); rc=$?
@@ -1092,7 +1123,7 @@ agent_state() {
   elif [ "$rc" = 2 ]; then
     printf 'unlocated\tcan%st tell which terminal its Codex TUI is in\n' "'"; return
   elif [ "$rc" = 3 ]; then
-    printf 'offline\tno Codex session left that it could be\n'; return
+    printf 'offline\tverified terminal closed\n'; return
   elif [ "$api" = 0 ]; then
     printf 'unlocated\tno terminal on record (registered outside iTerm/tmux)\n'; return
   fi
@@ -1162,10 +1193,10 @@ cmd_whereami() { # [--porcelain] — what THIS session resolves to (also used by
   local sid cli tb="" ta="" tsrc="" name term
   if sid=$(self_identity); then cli="${sid%% *}"; sid="${sid#* }"; else cli="unknown"; sid="-"; fi
   name=$(resolve_name 2>/dev/null) || name=""
-  # For a registered Codex session the verified record beats a fresh look: it
-  # may rest on evidence that is gone by now (the register line on screen).
-  if [ "$cli" = codex ] && [ -n "$name" ] && [ -z "$AS_NAME" ] && term=$(resolve_term "$name"); then
-    read -r tb ta <<< "$term"; tsrc=$(reg_get "$name" term_src)
+  if [ "$cli" = codex ] && [ -n "$name" ] && [ -z "$AS_NAME" ]; then
+    if term=$(resolve_term "$name"); then
+      read -r tb ta <<< "$term"; tsrc=$(reg_get "$name" term_src)
+    else tb=none; ta=-; tsrc=unlocated; fi
   else
     read -r tb ta tsrc <<< "$(detect_term "$cli" "$sid" "")"
   fi
@@ -1186,18 +1217,16 @@ cmd_whereami() { # [--porcelain] — what THIS session resolves to (also used by
 # is only used where it is known to deliver, and typing stays the fallback.
 
 cc_inbox() { # name -> the agent's live inbox socket; rc 1 if it has none we can use
-  local reg dir term tb ta tty pid
+  local reg dir term tb ta tty pid born parent pb proof
   reg=$(reg_get "$1" inbox)
   term=$(resolve_term "$1") || return 1
   read -r tb ta <<< "$term"
-  tty=$(agent_tty "$tb" "$ta"); [ -n "$tty" ] || return 1
+  proof=$(session_proof claude "$(reg_get "$1" session_id)" "$tb" "$ta") || return 1
+  read -r tty pid born parent pb <<< "$proof"
   dir=$(dirname "${reg:-/tmp/cc-socks/x}")
   # the socket is named after its session's pid: only trust one whose claude
   # still runs on this agent's tty (a restart in the pane gets a new socket)
-  for pid in $(ps -t "${tty#/dev/}" -o pid=,command= 2>/dev/null \
-               | awk '{ n = $2; sub(/.*\//, "", n); if (n == "claude") print $1 }'); do
-    [ -S "$dir/$pid.sock" ] && { echo "$dir/$pid.sock"; return 0; }
-  done
+  [ -S "$dir/$pid.sock" ] && { echo "$dir/$pid.sock"; return 0; }
   return 1
 }
 
@@ -1311,18 +1340,15 @@ nudge_blocker() {
   [ "$a" = "$b" ] || echo "its screen is changing (someone typing?)"
 }
 
-nudge_type() { # backend addr text — type text, then Enter as a SEPARATE keystroke (submits as a prompt).
-  # The separation is deliberate: TUIs run with bracketed paste on, so a \r inside
-  # the same payload is pasted as a literal newline into the input box instead of
-  # submitting. A lone Enter in its own call acts as a real keypress.
+nudge_type() { # name backend addr text expected-sid
   local text
-  text=$(printf '%s' "$3" | tr -d '"\\')
-  term_type "$1" "$2" "$text" >/dev/null && term_enter "$1" "$2" >/dev/null || return 1
-  # an Enter swallowed as part of the paste leaves the line sitting in the box:
-  # one more Enter (the prompt line ending in our text means it wasn't sent)
+  text=$(printf '%s' "$4" | tr -d '"\\')
+  control_type "$1" "$2" "$3" "$5" "$text" >/dev/null || return 1
+  control_enter "$1" "$2" "$3" "$5" >/dev/null || return 1
   sleep 1.5
-  screen_tail "$1" "$2" | grep -E '^[❯›>] ' | tail -n1 | grep -qF -- "${text: -40}" && term_enter "$1" "$2" >/dev/null
-  return 0
+  if screen_tail "$2" "$3" | grep -E '^[❯›>] ' | tail -n1 | grep -qF -- "${text: -40}"; then
+    control_enter "$1" "$2" "$3" "$5" >/dev/null || return 1
+  fi
 }
 
 nudge_text() { # name — the wake-up line for everyone waiting on this agent
@@ -1339,12 +1365,13 @@ nudge_worker_alive() { # name
 }
 
 nudge_now() { # name — one guarded attempt. rc 0 typed · 1 blocked (reason on stdout) · 2 no terminal
-  local term tb ta why
+  local term tb ta why sid
+  sid=$(reg_get "$1" session_id)
   term=$(resolve_term "$1") || return 2
   read -r tb ta <<< "$term"
   why=$(nudge_blocker "$tb" "$ta")
   [ -n "$why" ] && { echo "$why"; return 1; }
-  nudge_type "$tb" "$ta" "$(nudge_text "$1")" || return 2
+  nudge_type "$1" "$tb" "$ta" "$(nudge_text "$1")" "$sid" || return 2
   date +%s > "$NUDGE_DIR/$1.last"; rm -f "$NUDGE_DIR/$1.from"
 }
 
@@ -1402,7 +1429,7 @@ cmd_nudge_worker() { # name — background: land one combined nudge, then exit
 }
 
 cmd_nudge() { # name [text] [--force] — type a wake-up line + Enter (same guard as send)
-  local name="" text="" force=0 tb ta why
+  local name="" text="" force=0 tb ta why term sid
   while [ $# -gt 0 ]; do
     case "$1" in
       --force) force=1; shift;;
@@ -1416,29 +1443,34 @@ cmd_nudge() { # name [text] [--force] — type a wake-up line + Enter (same guar
     $JQ -cn --arg t "$text" '{type:"user", message:{role:"user", content:$t}}' | nc -U -w 2 "$sock" >/dev/null 2>&1 \
       && { echo "ok (inbox)"; return; }
   fi
-  read -r tb ta <<< "$(agent_term "$name")"
+  sid=$(reg_get "$name" session_id)
+  term=$(agent_term "$name") || return 1
+  read -r tb ta <<< "$term"
   if [ "$force" = 0 ] && why=$(nudge_blocker "$tb" "$ta") && [ -n "$why" ]; then
     die "not nudging $name: $why — try again shortly, or --force"
   fi
   mkdir -p "$NUDGE_DIR"
   [ -n "$text" ] || text=$(nudge_text "$name")
-  nudge_type "$tb" "$ta" "$text" && date +%s > "$NUDGE_DIR/$name.last" && echo ok
+  nudge_type "$name" "$tb" "$ta" "$text" "$sid" && date +%s > "$NUDGE_DIR/$name.last" && echo ok
 }
 
 cmd_type() { # name text — type into the input box WITHOUT submitting
   local name="${1:-}" text="${2:-}"
   [ -n "$name" ] && [ -n "$text" ] || die 'usage: agent-chat type <name> "text"'
-  local tb ta
-  read -r tb ta <<< "$(agent_term "$name")"
-  term_type "$tb" "$ta" "$text"
+  local tb ta term sid
+  sid=$(reg_get "$name" session_id)
+  term=$(agent_term "$name") || return 1
+  read -r tb ta <<< "$term"
+  control_type "$name" "$tb" "$ta" "$sid" "$text"
 }
 
 cmd_screen() { # name [N] — snapshot of the agent's visible terminal (last N lines)
   local name="${1:-}" n="${2:-0}"
   [ -n "$name" ] || die "usage: agent-chat screen <name> [N]"
-  local tb ta out
-  read -r tb ta <<< "$(agent_term "$name")"
-  out=$(term_screen "$tb" "$ta")
+  local tb ta out term
+  term=$(agent_term "$name") || return 1
+  read -r tb ta <<< "$term"
+  out=$(term_screen "$tb" "$ta") || return 1
   # drop trailing blank lines; optionally keep only the last N
   out=$(printf '%s\n' "$out" | sed -e :a -e '/^[[:space:]]*$/{$d;N;ba' -e '}')
   if [ "$n" -gt 0 ] 2>/dev/null; then printf '%s\n' "$out" | tail -n "$n"; else printf '%s\n' "$out"; fi
@@ -1447,10 +1479,12 @@ cmd_screen() { # name [N] — snapshot of the agent's visible terminal (last N l
 cmd_key() { # name key... — send special keys / Claude Code shortcuts
   local name="${1:-}"; shift 2>/dev/null || true
   [ -n "$name" ] && [ $# -gt 0 ] || die "usage: agent-chat key <name> <key...>  (keys: escape enter ctrl-c ctrl-d ctrl-b ctrl-o ctrl-r ctrl-t ctrl-v tab shift-tab up down left right space backspace)"
-  local tb ta k
-  read -r tb ta <<< "$(agent_term "$name")"
+  local tb ta k term sid
+  sid=$(reg_get "$name" session_id)
+  term=$(agent_term "$name") || return 1
+  read -r tb ta <<< "$term"
   for k in "$@"; do
-    term_key "$tb" "$ta" "$k" >/dev/null
+    control_key "$name" "$tb" "$ta" "$sid" "$k" >/dev/null || return 1
   done
   echo ok
 }
@@ -1500,20 +1534,30 @@ cmd_spawn() { # <name> [--dir d] [--cmd "claude ..."] [--prompt "task"] [--tab|-
   local argkick=0
   case "$(cli_of_cmd "$cmd")" in codex|claude) argkick=1;; esac
 
-  local sb sa   # spawned backend + addr
-  if [ "$force_tmux" = 1 ] || ! osascript -e 'tell application "iTerm2" to count windows' >/dev/null 2>&1; then
+  local sb sa own_cli own_sid own_tb="" own_ta="" own_src own
+  # Relative placement needs the caller's verified pane, never the daemon's
+  # inherited terminal or whichever window happens to be frontmost.
+  if [ "$place" != window ]; then
+    own=$(self_identity) || die "spawn: relative placement requires an unambiguous caller session"
+    read -r own_cli own_sid <<< "$own"
+    read -r own_tb own_ta own_src <<< "$(detect_term "$own_cli" "$own_sid" "")"
+    [ -n "$own_tb" ] && [ "$own_tb" != none ] || die "spawn: can't prove the caller's pane for --$place; enable Codex thread-id titles or use a new window"
+    [ "$force_tmux" = 0 ] || [ "$own_tb" = tmux ] || die "spawn: --tmux --$place requires the caller to be in tmux"
+  fi
+  if [ "$force_tmux" = 1 ] || [ "$own_tb" = tmux ] || { [ -z "$own_tb" ] && ! osascript -e 'tell application "iTerm2" to count windows' >/dev/null 2>&1; }; then
     command -v tmux >/dev/null || die "tmux not available and iTerm unreachable"
     sb="tmux"
-    if [ -n "${TMUX:-}" ]; then
+    if [ "$own_tb" = tmux ]; then
       if [ "$place" = "pane" ]; then
-        sa=$(tmux split-window -P -F '#{pane_id}' -t "${TMUX_PANE:-}" -c "$dir")
+        sa=$(tmux split-window -P -F '#{pane_id}' -t "$own_ta" -c "$dir")
       else
-        sa=$(tmux new-window -P -F '#{pane_id}' -c "$dir")
+        sa=$(tmux new-window -P -F '#{pane_id}' -t "$own_ta" -c "$dir")
       fi
     else
       sa=$(tmux new-session -d -P -F '#{pane_id}' -s "agent-$name" -c "$dir" 2>/dev/null) \
         || sa=$(tmux new-session -d -P -F '#{pane_id}' -c "$dir")
     fi
+    [ -n "$sa" ] || die "spawn: failed to create a new tmux pane — no input sent"
   else
     sb="iterm"
     # SAFETY: snapshot existing session ids — the id we get back for the new
@@ -1532,8 +1576,8 @@ tell application "iTerm2"
 end tell
 return out
 APPLESCRIPT
-)
-    myid="${ITERM_SESSION_ID:-}"; myid="${myid#*:}"
+ ) || die "spawn: cannot snapshot iTerm sessions — nothing created"
+    myid="$own_ta"
     case "$place" in
       pane)
         # split the spawner's own pane (object-based: no positional window refs)
@@ -1558,7 +1602,7 @@ APPLESCRIPT
 )
         ;;
       tab)
-        # new tab in the spawner's own window (fallback: frontmost window);
+        # new tab in the spawner's verified window; no frontmost fallback;
         # uses the returned tab OBJECT — a positional window reference can
         # re-resolve to a different window after z-order changes
         sa=$(osascript - "$myid" <<'APPLESCRIPT'
@@ -1575,8 +1619,7 @@ on run argv
         end repeat
       end repeat
     end repeat
-    tell current window to set newTab to (create tab with default profile)
-    return id of current session of newTab
+    error "verified caller pane no longer exists"
   end tell
 end run
 APPLESCRIPT
@@ -1597,17 +1640,13 @@ APPLESCRIPT
     printf '%s\n' "$existing" | grep -qxF "$sa" \
       && die "SAFETY ABORT: '$sa' is a pre-existing session, not the new $place — refusing to type into it"
     sleep 1
-    term_type "$sb" "$sa" "cd '$dir'" >/dev/null
-    term_enter "$sb" "$sa" >/dev/null
+    term_type "$sb" "$sa" "cd $(sq "$dir")" >/dev/null || die "spawn: could not type directory command"
+    term_enter "$sb" "$sa" >/dev/null || die "spawn: directory command Enter failed"
   fi
 
-  # note which terminal this name was given: a CLI that runs its commands in a
-  # background daemon (Codex) can't see its own terminal when it registers
-  mkdir -p "$BASE/spawn" && printf '%s %s %s\n' "$sb" "$sa" "$(date +%s)" > "$BASE/spawn/$name"
-
-  if [ "$argkick" = 1 ]; then term_type "$sb" "$sa" "$cmd $(sq "$kickoff")" >/dev/null
-  else term_type "$sb" "$sa" "$cmd" >/dev/null; fi
-  term_enter "$sb" "$sa" >/dev/null
+  if [ "$argkick" = 1 ]; then term_type "$sb" "$sa" "$cmd $(sq "$kickoff")" >/dev/null || die "spawn: launch text failed"
+  else term_type "$sb" "$sa" "$cmd" >/dev/null || die "spawn: launch text failed"; fi
+  term_enter "$sb" "$sa" >/dev/null || die "spawn: launch Enter failed"
 
   # wait for the CLI process, then deliver the kickoff with verify-and-retry:
   # input typed during TUI startup (MCP servers still loading) gets swallowed
@@ -1680,7 +1719,9 @@ agent_pids() { # tty-path cli -> pids of the TOP-LEVEL processes of that agent C
   rows=$(ps -t "${1#/dev/}" -o pid=,ppid=,command= 2>/dev/null)
   while read -r pid ppid cmd; do
     [ -n "$pid" ] || continue
-    [ "$(cli_of_cmd "$cmd")" = "$2" ] && mine="$mine $pid:$ppid"
+    [ "$(cli_of_cmd "$cmd")" = "$2" ] || continue
+    [ "$2" != codex ] || codex_tui_cmd "$cmd" || continue
+    mine="$mine $pid:$ppid"
   done <<< "$rows"
   for e in $mine; do
     case " $mine " in *" ${e#*:}:"*) continue;; esac   # child of another match (npm wrapper, tool)
@@ -1704,7 +1745,7 @@ pane_taken_by_other() { # name backend addr -> prints the other agent registered
     "$REG"/*.json 2>/dev/null | head -n1
 }
 
-cmd_respawn() { # <name> [--prompt "task"] [--cmd "codex ..."] [--report-to <name>] [--force-busy] [--ignore-cooldown] [--no-wait] [--dry-run]
+cmd_respawn() ( # <name> [--prompt "task"] [--cmd "codex ..."] [--report-to <name>] [--force-busy] [--ignore-cooldown] [--no-wait] [--dry-run]
   local name="" task="" cmd="" report="" force_busy=0 nocool=0 wait=1 dry=0
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1733,49 +1774,37 @@ cmd_respawn() { # <name> [--prompt "task"] [--cmd "codex ..."] [--report-to <nam
     die "respawn: '$name' was respawned $(( $(date +%s) - last ))s ago (cooldown ${RESPAWN_COOLDOWN}s) — look at it first: agent-chat screen $name"
   fi
 
-  # 1. the pane, proven to still be this agent's
-  warm_terms || die "respawn: can't list the terminals right now (iTerm AppleScript failing) — nothing was touched; try again shortly"
+  # Serialize replacements of one identity. A dry run acquires no lock.
+  if [ "$dry" = 0 ]; then
+    mkdir -p "$RESPAWN_DIR"
+    local lock="$RESPAWN_DIR/$name.lock"
+    mkdir "$lock" 2>/dev/null || die "respawn: another replacement of '$name' is in progress"
+    trap 'rmdir "$lock" 2>/dev/null' EXIT
+    trap 'exit 1' HUP INT TERM
+  fi
+
+  warm_terms || die "respawn: can't list the terminals right now — nothing was touched"
   term=$(resolve_term "$name"); rc=$?
-  [ "$rc" = 0 ] || die "respawn: can't prove which pane is '$name''s (its pane is closed, or it now runs a different session) — nothing was touched. 'agent-chat spawn $name' starts it in a new window instead"
+  [ "$rc" = 0 ] || die "respawn: can't prove '$name''s current pane — nothing was touched; enable thread-id titles before using terminal recovery"
   read -r tb ta <<< "$term"
   other=$(pane_taken_by_other "$name" "$tb" "$ta")
-  [ -z "$other" ] || die "respawn: '$name''s pane was taken over by '$other' (registered there later) — refusing"
-  tty=$(agent_tty "$tb" "$ta")
-  [ -n "$tty" ] || die "respawn: '$name''s terminal ($tb $ta) is closed — 'agent-chat spawn $name' starts it in a new window"
+  [ -z "$other" ] || die "respawn: pane was taken over by '$other' — refusing"
+  tty=$(agent_tty "$tb" "$ta"); [ -n "$tty" ] || die "respawn: pane closed"
   title=$(term_title "$tb" "$ta")
-  title_shows_other_thread "$title" "$sid" && die "respawn: '$name''s pane shows another Codex thread — refusing"
-
-  # 2. what runs there: this agent's CLI (proven by its session id), or a bare
-  #    shell prompt (it died). Anything else: refuse — never type into it.
+  local proof="" born="" parent="" pb=""
   pids=$(agent_pids "$tty" "$cli")
   if [ -z "$pids" ]; then
-    tty_fg_shell "$tty" || die "respawn: '$name' isn't running and its pane ($tty) is busy with something that isn't a shell prompt — refusing to type into it"
+    saved_shell_proof "$name" "$tb" "$ta" || die "respawn: no running session and no verified unchanged shell — refusing"
+    parent=$(reg_get "$name" term_shell_pid); pb=$(reg_get "$name" term_shell_birth)
   else
-    case "$cli" in
-      codex)
-        if ! { case "$title" in *"${sid:0:23}"*) true;; *) false;; esac; } \
-           && ! ps -o command= -p $pids 2>/dev/null | grep -qF -- "$sid"; then
-          die "respawn: the Codex in $tty doesn't show '$name''s thread ($sid) in its title or arguments — refusing"
-        fi;;
-      claude)
-        for p in $pids; do
-          [ "$($JQ -r '.sessionId // empty' "$HOME/.claude/sessions/$p.json" 2>/dev/null)" = "$sid" ] \
-            || die "respawn: the Claude Code in $tty (pid $p) isn't session $sid — refusing"
-        done;;
-    esac
-    for p in $pids; do   # it must sit on a shell, or killing it would close the pane
-      pp=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
-      case "$(ps -o comm= -p "$pp" 2>/dev/null)" in
-        *zsh|*bash|*fish|*/sh|sh|-*) ;;
-        *) die "respawn: $cli (pid $p) isn't running under a shell in $tty — killing it would close the pane; refusing";;
-      esac
-    done
-    # a working agent is not tripped: never kill one mid-turn by accident
+    proof=$(session_proof "$cli" "$sid" "$tb" "$ta") || die "respawn: current foreground CLI isn't provably session $sid — refusing"
+    read -r tty p born parent pb <<< "$proof"
+    is_shell_pid "$parent" || die "respawn: CLI isn't running under a shell; killing it could close the pane"
     if [ "$force_busy" = 0 ]; then
       local scr
       scr=$(term_screen "$tb" "$ta" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 25)
       if [ "$(glyph_state "$title")" = busy ] || printf '%s' "$scr" | grep -q 'esc to interrupt'; then
-        die "respawn: '$name' looks BUSY (spinner / 'esc to interrupt' on screen) — refusing to kill a working agent (--force-busy if it is truly stuck)"
+        die "respawn: '$name' looks BUSY — refusing (--force-busy if truly stuck)"
       fi
     fi
   fi
@@ -1802,26 +1831,32 @@ cmd_respawn() { # <name> [--prompt "task"] [--cmd "codex ..."] [--report-to <nam
   rlog "$name: respawn (cli=$cli tty=$tty pane=$tb $ta old=$sid report=${report:-none} pids=${pids:-none})"
   date +%s > "$RESPAWN_DIR/$name.last"
 
-  # 4. stop the old session by signal — no keystrokes into the tripped chat
+  # Signal only the captured process, and re-prove ownership before escalation.
+  # Never rediscover and kill whichever replacement happens to occupy its tty.
   if [ -n "$pids" ]; then
-    kill -TERM $pids 2>/dev/null
+    [ "$(reg_get "$name" session_id)" = "$sid" ] && \
+      [ "$(session_proof "$cli" "$sid" "$tb" "$ta")" = "$proof" ] || die "respawn: ownership changed before stop — refusing"
+    kill -TERM "$p" 2>/dev/null || die "respawn: could not signal captured CLI"
     local i=0
-    while [ "$i" -lt 10 ] && [ -n "$(agent_pids "$tty" "$cli")" ]; do sleep 1; i=$((i + 1)); done
-    pids=$(agent_pids "$tty" "$cli")
-    if [ -n "$pids" ]; then
-      rlog "$name: still alive after SIGTERM — SIGKILL $pids"
-      kill -KILL $pids 2>/dev/null; sleep 2
-      [ -z "$(agent_pids "$tty" "$cli")" ] || die "respawn: could not kill $cli in $tty"
+    while [ "$i" -lt 10 ] && same_process "$p" "$born"; do sleep 1; i=$((i + 1)); done
+    if same_process "$p" "$born"; then
+      [ "$(reg_get "$name" session_id)" = "$sid" ] && \
+        [ "$(session_proof "$cli" "$sid" "$tb" "$ta")" = "$proof" ] || die "respawn: ownership changed before escalation — refusing"
+      rlog "$name: still alive after SIGTERM — SIGKILL captured pid $p"
+      kill -KILL "$p" 2>/dev/null || die "respawn: could not kill captured CLI"
+      sleep 2
+      same_process "$p" "$born" && die "respawn: captured CLI is still alive"
     fi
-    sleep 1
   fi
-  tty_fg_shell "$tty" || { rlog "$name: ABORT pane not at a shell prompt after kill"; die "respawn: '$name''s old session is stopped, but its pane isn't back at a shell prompt — not typing anything. Look: agent-chat screen $name"; }
+  [ "$(reg_get "$name" session_id)" = "$sid" ] || die "respawn: identity rebound while stopping — refusing to launch"
+  shell_proof "$tb" "$ta" "$tty" "$parent" "$pb" || die "respawn: old session stopped, but the original shell isn't ready — no input sent"
 
   # 5. fresh session in the same pane; the kickoff rides on the command line
   #    (nothing is typed into a booting TUI, where popups would swallow it)
-  mkdir -p "$BASE/spawn" && printf '%s %s %s\n' "$tb" "$ta" "$(date +%s)" > "$BASE/spawn/$name"
   term_type "$tb" "$ta" "$launch" >/dev/null 2>&1 || { rlog "$name: ABORT typing the launch line failed"; die "respawn: old session stopped, but typing the launch line failed — the pane is at a bare shell"; }
-  term_enter "$tb" "$ta" >/dev/null 2>&1
+  [ "$tb" != tmux ] || sleep 1
+  shell_proof "$tb" "$ta" "$tty" "$parent" "$pb" || die "respawn: original shell changed before Enter — launch was not submitted"
+  term_key "$tb" "$ta" enter >/dev/null 2>&1 || die "respawn: launch Enter failed"
   local deadline=$((SECONDS + 30)) npid=""
   while [ "$SECONDS" -lt "$deadline" ]; do
     sleep 2; npid=$(agent_pids "$tty" "$cli"); [ -n "$npid" ] && break
@@ -1841,7 +1876,7 @@ cmd_respawn() { # <name> [--prompt "task"] [--cmd "codex ..."] [--report-to <nam
   while [ "$SECONDS" -lt "$deadline" ]; do
     sleep 5
     nsid=$(reg_get "$name" session_id)
-    [ -n "$nsid" ] && [ "$nsid" != "$sid" ] && break
+    if [ -n "$nsid" ] && [ "$nsid" != "$sid" ]        && [ "$(reg_get "$name" term_backend) $(reg_get "$name" term_addr)" = "$tb $ta" ]        && session_proof "$cli" "$nsid" "$tb" "$ta" >/dev/null; then break; fi
     nsid=""
   done
   if [ -n "$nsid" ]; then
@@ -1852,7 +1887,7 @@ cmd_respawn() { # <name> [--prompt "task"] [--cmd "codex ..."] [--report-to <nam
     echo "WARNING: '$name' has not re-registered after 180s — look: agent-chat screen $name"
     return 1
   fi
-}
+)
 
 # ---------- watch (blocking fleet watchdog) ----------
 #
@@ -1937,7 +1972,8 @@ Re-arm (as a background shell again): agent-chat watch $argv"
       case "$state" in
         dead)    kind=dead;;
         offline) kind=offline;;
-        busy|unlocated) ;;
+        unlocated) kind=unlocated; line="$why";;
+        busy) ;;
         *)
           tb=""; ta=""
           read -r tb ta <<< "$(resolve_term "$n" 2>/dev/null)"
@@ -1961,7 +1997,7 @@ Re-arm (as a background shell again): agent-chat watch $argv"
       # every condition must hold on two polls in a row: not a frame mid-redraw,
       # not one bad terminal snapshot (idle is already a long-lived condition)
       case "$kind" in
-        dead|offline|filter|error|limit|paste)
+        dead|offline|unlocated|filter|error|limit|paste)
           pend=$(cat "$WATCH_DIR/$n.pending" 2>/dev/null)
           [ "$pend" = "$sig" ] || { printf '%s' "$sig" > "$WATCH_DIR/$n.pending"; continue; };;
       esac
@@ -1970,6 +2006,7 @@ Re-arm (as a background shell again): agent-chat watch $argv"
       case "$kind" in
         dead)    out="DEAD — its $(reg_get "$n" cli) exited/crashed ($why)";;
         offline) out="OFFLINE — $why";;
+        unlocated) out="UNLOCATED — cannot watch this worker ($why); terminal control and auto-respawn are disabled";;
         filter)  out="CONTENT-FILTER TRIP — the chat is gated (do NOT type into it)";;
         error)   out="ERROR — $(printf '%s' "$line" | sed 's/^[[:space:]]*//' | cut -c1-160)";;
         limit)   out="USAGE LIMIT — a respawn won't help until it resets";;
@@ -2049,9 +2086,9 @@ cmd_setup_codex() {
   if [ "$title_id" = 1 ]; then
     codex_title_id
   elif ! grep -Eq '^ *terminal_title *=.*thread-id' "$HOME/.codex/config.toml" 2>/dev/null; then
-    echo "Optional: 'agent-chat setup-codex --title-id' adds the thread id to Codex's terminal title."
+    echo "Required for Codex terminal control: 'agent-chat setup-codex --title-id'."
     echo "Codex runs commands in a shared background daemon, so a Codex agent can't see which pane"
-    echo "it is in; agent-chat works that out from evidence (what the pane shows, when it started)."
+    echo "it is in; agent-chat requires a unique current thread-id title to locate it."
     echo "With the id in the title it is exact, and survives moving the session to another pane."
   fi
 }
@@ -2165,6 +2202,9 @@ case "$cmd" in
   watch)      cmd_watch "$@";;
   setup-codex) cmd_setup_codex "$@";;
   whereami)   cmd_whereami "$@";;
+  _session-proof) session_proof "$@";;
+  _shell-proof) shell_proof "$@";;
+  _process-token) process_token "$@";;
   web)        cmd_web "$@";;
   hook)       cmd_hook "$@";;
   help|--help|-h)

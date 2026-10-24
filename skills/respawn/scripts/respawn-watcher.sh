@@ -1,27 +1,36 @@
 #!/usr/bin/env bash
-# Internal: detached watcher spawned by respawn.sh — do not run directly.
-# Exits the Claude Code CLI in one terminal (iTerm session or tmux pane),
-# relaunches it with the given command, and types a kickoff prompt.
-#
-# args: <backend: iterm|tmux> <addr> <session-id> <relaunch-cmd> <kickoff-prompt> <grace-secs> <exit-wait-secs> [dry] [cli: claude|codex] [swap-pending-path] [stripper-path]
-
+# Internal detached watcher. The scheduler supplies a verified original session,
+# process birth token and parent shell. Recheck them after every wait; never
+# discover and quit an arbitrary CLI in the saved pane.
+# args: backend addr resume-sid relaunch kickoff grace exit-wait dry cli swap stripper
+#       original-sid tty cli-pid cli-birth shell-pid shell-birth agent-chat-path
+set -u
 BASE="$HOME/.claude/respawn"
 LOG="$BASE/respawn.log"
-TB="$1"; TA="$2"; SID="$3"; RELAUNCH="$4"; KICKOFF="$5"; GRACE="${6:-15}"; WAIT_EXIT="${7:-900}"; DRY="${8:-}"; CLI="${9:-claude}"; SWAP="${10:-}"; STRIPPER="${11:-}"
-
+TB="$1"; TA="$2"; SID="$3"; RELAUNCH="$4"; KICKOFF="$5"; GRACE="$6"; WAIT_EXIT="$7"; DRY="$8"; CLI="$9"
+SWAP="${10}"; STRIPPER="${11}"; ORIGIN_SID="${12}"; TTY_PATH="${13}"; PID="${14}"; BIRTH="${15}"
+SHELL_PID="${16}"; SHELL_BIRTH="${17}"; AC="${18}"
+mkdir -p "$BASE"
 log() { echo "[$(date '+%F %T')] [$SID] $*" >> "$LOG"; }
+abort() { log "ABORT: $*"; exit 1; }
+sq() { local s="$1" q="'"; s=${s//$q/$q\\$q$q}; printf '%s%s%s' "$q" "$s" "$q"; }
+[ -x "$AC" ] || abort "verified agent-chat helper is unavailable"
+EXPECTED="$TTY_PATH $PID $BIRTH $SHELL_PID $SHELL_BIRTH"
 
-iterm_write() { # payload — verbatim, no auto-newline
-  osascript - "$TA" "$1" <<'AS'
+same_process() { [ "$("$AC" _process-token "$PID" 2>/dev/null)" = "$BIRTH" ]; }
+prove_session() { [ "$("$AC" _session-proof "$CLI" "$ORIGIN_SID" "$TB" "$TA" 2>/dev/null)" = "$EXPECTED" ]; }
+prove_shell() { "$AC" _shell-proof "$TB" "$TA" "$TTY_PATH" "$SHELL_PID" "$SHELL_BIRTH"; }
+
+iterm_write() {
+  local result
+  result=$(osascript - "$TA" "$1" <<'AS'
 on run argv
-  set targetId to item 1 of argv
-  set payload to item 2 of argv
   tell application "iTerm2"
     repeat with w in windows
       repeat with t in tabs of w
         repeat with s in sessions of t
-          if (id of s as text) is equal to targetId then
-            tell s to write text payload newline NO
+          if (id of s as text) is equal to (item 1 of argv) then
+            tell s to write text (item 2 of argv) newline NO
             return "ok"
           end if
         end repeat
@@ -31,143 +40,115 @@ on run argv
   return "notfound"
 end run
 AS
+) || return 1
+  [ "$result" = ok ]
 }
 
-itype() { # type text + Enter. Enter is a SEPARATE keystroke: TUIs run with
-  # bracketed paste on, so a newline inside the payload is pasted as literal
-  # content into the input box without submitting.
-  [ -n "$DRY" ] && { log "DRY: would type: $1"; return 0; }
+write_text() {
   case "$TB" in
-    tmux)
-      tmux send-keys -t "$TA" -l -- "$1"
-      tmux send-keys -t "$TA" Enter
-      ;;
-    iterm)
-      iterm_write "$1" >/dev/null
-      sleep 0.2
-      iterm_write $'\r' >/dev/null
-      ;;
+    tmux) tmux send-keys -t "$TA" -l -- "$1";;
+    iterm) iterm_write "$1";;
+    *) return 1;;
   esac
 }
 
-get_tty() {
-  case "$TB" in
-    tmux) tmux display -p -t "$TA" '#{pane_tty}' 2>/dev/null;;
-    iterm)
-      osascript - "$TA" <<'AS'
-on run argv
-  set targetId to item 1 of argv
-  tell application "iTerm2"
-    repeat with w in windows
-      repeat with t in tabs of w
-        repeat with s in sessions of t
-          if (id of s as text) is equal to targetId then return (tty of s)
-        end repeat
-      end repeat
-    end repeat
-  end tell
-  return ""
-end run
-AS
-      ;;
+write_key() {
+  case "$TB:$1" in
+    tmux:enter) tmux send-keys -t "$TA" Enter;;
+    tmux:ctrl-c) tmux send-keys -t "$TA" C-c;;
+    iterm:enter) iterm_write $'\r';;
+    iterm:ctrl-c) iterm_write $'\003';;
+    *) return 1;;
   esac
 }
 
-claude_pid() { # tty short name -> pid of the claude/codex CLI on it (empty if none)
-  ps -t "$1" -o pid=,command= 2>/dev/null | grep -E '^ *[0-9]+ +(\S*/)?(claude|codex)( |$)' | awk '{print $1}' | head -n1
+quit_session() {
+  prove_session || abort "session changed before quit — no keys sent"
+  if [ "$CLI" = codex ]; then
+    # The frontend process is the target, not its terminal input stream. This
+    # also avoids a fresh ownership check exceeding Codex's double-Ctrl-C timer.
+    kill -TERM "$PID" 2>/dev/null || abort "cannot signal captured Codex frontend"
+  else
+    write_text /exit || abort "quit text failed"
+    sleep 1
+    same_process || return 0
+    prove_session || abort "session changed before quit Enter"
+    write_key enter || abort "quit Enter failed"
+  fi
 }
 
-send_exit() { # graceful-quit keystrokes, per CLI
-  case "$CLI" in
-    codex)
-      # codex quits on double ctrl-c at the prompt (no /exit slash command)
-      log "sending double ctrl-c (codex quit)"
-      if [ -n "$DRY" ]; then log "DRY: would send ctrl-c x2"; return 0; fi
-      case "$TB" in
-        tmux)  tmux send-keys -t "$TA" C-c; sleep 0.7; tmux send-keys -t "$TA" C-c;;
-        iterm) iterm_write $'\003' >/dev/null; sleep 0.7; iterm_write $'\003' >/dev/null;;
-      esac
-      ;;
-    *)
-      itype "/exit"
-      ;;
-  esac
-}
-
-wait_pid_gone() { # pid timeout-secs -> rc 0 if gone
-  local pid="$1" deadline=$((SECONDS + $2))
-  while kill -0 "$pid" 2>/dev/null; do
+wait_gone() {
+  local deadline=$((SECONDS + $1))
+  while same_process; do
     [ "$SECONDS" -ge "$deadline" ] && return 1
     sleep 2
   done
-  return 0
 }
 
-log "watcher started ($TB $TA, grace=${GRACE}s, exit-wait=${WAIT_EXIT}s${DRY:+, DRY RUN})"
-log "relaunch command: $RELAUNCH"
+log "watcher started ($TB $TA, original=$ORIGIN_SID pid=$PID birth=$BIRTH, grace=${GRACE}s)"
 sleep "$GRACE"
+# A second scheduled watcher cannot race the first. A later one will fail the
+# original process/shell proof even after the first releases this lock.
+LOCK="$BASE/pane-${TB}-${TA//[^a-zA-Z0-9_-]/_}.lock"
+mkdir "$LOCK" 2>/dev/null || abort "another watcher owns this pane"
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+trap 'exit 1' HUP INT TERM
 
-TTY_PATH=$(get_tty)
-if [ -z "$TTY_PATH" ]; then
-  log "ABORT: terminal $TB $TA not found (window/pane closed?)"
-  exit 1
+if same_process; then
+  prove_session || abort "saved pane no longer holds the original foreground session"
+else
+  prove_shell || abort "original CLI exited but its verified shell isn't ready"
 fi
-SHORT="${TTY_PATH#/dev/}"
-log "target tty: $SHORT"
+[ -z "$DRY" ] || { log "DRY: verified target; would quit, apply swap and launch $RELAUNCH with a prompt argument"; exit 0; }
 
-PID=$(claude_pid "$SHORT")
-if [ -n "$PID" ]; then
-  log "cli pid $PID — sending graceful quit ($CLI)"
-  send_exit
-  if [ -z "$DRY" ] && ! wait_pid_gone "$PID" "$WAIT_EXIT"; then
-    log "still alive after ${WAIT_EXIT}s — SIGTERM"
-    kill "$PID" 2>/dev/null
-    if ! wait_pid_gone "$PID" 15; then
-      log "still alive — SIGKILL"
-      kill -9 "$PID" 2>/dev/null
-      wait_pid_gone "$PID" 10 || { log "ABORT: cannot kill $PID"; exit 1; }
+if same_process; then
+  quit_session
+  if ! wait_gone "$WAIT_EXIT"; then
+    prove_session || abort "ownership changed before SIGTERM"
+    kill -TERM "$PID" 2>/dev/null || abort "cannot signal captured CLI"
+    if ! wait_gone 15; then
+      prove_session || abort "ownership changed before SIGKILL"
+      kill -KILL "$PID" 2>/dev/null || abort "cannot kill captured CLI"
+      wait_gone 10 || abort "captured CLI is still alive"
     fi
   fi
-  log "CLI exited"
-else
-  log "no claude process on tty — going straight to relaunch"
 fi
+prove_shell || abort "original shell is not at the foreground prompt after quit"
 
-# Session surgery in the dead window: the process is confirmed gone, so
-# nothing can append to the JSONL — the only moment a swap is race-free.
-# Fail-open: any refusal/error relaunches the session UNSTRIPPED and the
-# kickoff prompt is rewritten to say so.
+# Only the stopped original Claude session may be swapped. On apply refusal,
+# retain the original and explain it in the prompt argument passed at launch.
 if [ -n "$SWAP" ]; then
-  if [ -n "$DRY" ]; then
-    log "DRY: would apply swap: $SWAP"
-  elif python3 "$STRIPPER" apply "$SWAP" >> "$LOG" 2>&1; then
-    log "swap applied: $SWAP → ${SWAP%.pending}"
+  if python3 "$STRIPPER" apply "$SWAP" >> "$LOG" 2>&1; then
+    log "swap applied: $SWAP"
   else
-    log "WARN: swap FAILED (stripper apply output above) — relaunching UNSTRIPPED"
-    KICKOFF="[respawn] WARNING: your CLI was restarted but the session strip was NOT applied (apply failed — see ~/.claude/respawn/respawn.log). You are resuming the UNSTRIPPED session; the pending copy is still at $SWAP."
+    log "WARN: swap refused; relaunching UNSTRIPPED"
+    KICKOFF="[respawn] WARNING: the strip was NOT applied. You are resuming the UNSTRIPPED session; pending copy: $SWAP. See ~/.claude/respawn/respawn.log."
   fi
 fi
 
-[ -z "$DRY" ] && sleep 2
-itype "$RELAUNCH"
+# No prompt is ever typed into a booting TUI or into a shell after failed boot.
+# Codex and Claude both accept their initial prompt as a command-line argument.
+LAUNCH="$RELAUNCH $(sq "$KICKOFF")"
+prove_shell || abort "shell changed before launch"
+write_text "$LAUNCH" || abort "launch text failed"
+sleep 1
+prove_shell || abort "shell changed before launch Enter — line left unsubmitted"
+write_key enter || abort "launch Enter failed"
 
-if [ -z "$DRY" ]; then
-  deadline=$((SECONDS + 60))
-  NEWPID=""
-  while [ -z "$NEWPID" ] && [ "$SECONDS" -lt "$deadline" ]; do
-    sleep 2
-    NEWPID=$(claude_pid "$SHORT")
-  done
-  if [ -n "$NEWPID" ]; then
-    log "new claude pid $NEWPID — waiting for UI to settle"
-  else
-    log "WARN: new claude process not seen after 60s — typing kickoff anyway"
+# A process existing on the tty is not enough: prove the resumed session and
+# unchanged parent shell. Startup dialogs/timeouts get an error, never more keys.
+deadline=$((SECONDS + 60))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  NEW_PROOF=$("$AC" _session-proof "$CLI" "$SID" "$TB" "$TA" 2>/dev/null) || NEW_PROOF=""
+  if [ -n "$NEW_PROOF" ]; then
+    read -r newtty newpid newbirth newparent newpb <<< "$NEW_PROOF"
+    if [ "$newtty" = "$TTY_PATH" ] && [ "$newparent $newpb" = "$SHELL_PID $SHELL_BIRTH" ] \
+       && [ "$newpid $newbirth" != "$PID $BIRTH" ]; then
+      log "done: resumed session $SID, pid $newpid; kickoff supplied on command line"
+      exit 0
+    fi
+    abort "new CLI doesn't belong to the original shell"
   fi
-  sleep 8
-fi
-
-if [ -n "$KICKOFF" ]; then
-  log "typing kickoff prompt"
-  itype "$KICKOFF"
-fi
-log "done"
+  sleep 2
+done
+abort "resumed session was not verified within 60s — no further input sent"
