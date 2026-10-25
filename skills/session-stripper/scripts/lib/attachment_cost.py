@@ -33,6 +33,14 @@ emits). Attachment types come and go between versions. Therefore:
   * unknown types are NEVER dropped by the default policy.
 
 Cost numbers here are an approximation, not a promise.
+
+THE STORED `rendered` FIELD (CC >= 2.1.277)
+-------------------------------------------
+Newer records carry `rendered`: the exact content blocks CC built for the
+request, which it reuses on resume instead of rendering again. When present it
+IS the cost, and `envelope_rendered_chars()` uses it; the per-type model below
+only serves older records. Records with nothing to send (most hook_success,
+prompt_snapshot, deferred_tools_record) have no `rendered` field.
 """
 
 import json
@@ -114,6 +122,21 @@ DEFAULT_POLICY = {
     "opened_file_in_ide": KEEP_ALL,
     "mcp_resource": KEEP_ALL,
 
+    # (b2) hook-injected content — never drop. A PostToolUse/UserPromptSubmit
+    #      hook's additionalContext and a Stop hook's blocking reason are how
+    #      tools hand the model information mid-session: agent-chat delivers
+    #      every peer message this way. The old "keep last 2" policy only spared
+    #      them because the cost model wrongly sized PostToolUse context at 0.
+    "hook_additional_context": KEEP_ALL,
+    "hook_blocking_error": KEEP_ALL,
+
+    # (b3) what the system prompt and tool list are built from — never drop.
+    #      prompt_snapshot is the recorded system prompt + tools CC reuses on
+    #      every request and resume (--system-prompt-snapshot); deferred tool
+    #      schemas loaded through ToolSearch are recorded once each.
+    "prompt_snapshot": KEEP_ALL,
+    "deferred_tools_record": KEEP_ALL,
+
     # (c) queued_command — NEVER DROP. Learned the hard way.
     #
     # This type looks like disposable system chatter and is not. It carries two
@@ -148,7 +171,6 @@ DEFAULT_POLICY = {
 
     # stale chatter: recent ones may still be relevant, old ones never are
     "hook_success": 2,
-    "hook_additional_context": 2,
     "edited_text_file": 3,
 
     # one per turn, never deduped by CC — grows without bound
@@ -219,6 +241,11 @@ def rendered_chars(att):
         # Renderer returns [] — recorded in the transcript, never sent.
         return 0
 
+    if t == "prompt_snapshot":
+        # Becomes the system prompt and tool list, not a message: counted once
+        # (the latest) by compute_active_chain_tokens, never as an attachment.
+        return 0
+
     if t in ("task_reminder", "todo_reminder"):
         items = att.get("content") or []
         body = sum(
@@ -286,8 +313,38 @@ def attachment_type(obj):
     return att.get("type")
 
 
+def _stored_chars(rendered):
+    """Characters in a stored `rendered` list (blocks or plain strings)."""
+    total = 0
+    for item in rendered:
+        content = item.get("content") if isinstance(item, dict) else item
+        if isinstance(content, str):
+            total += len(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    total += len(block.get("text") or "") or len(json.dumps(block, ensure_ascii=False))
+                else:
+                    total += _slen(block)
+        elif content is not None:
+            total += len(json.dumps(content, ensure_ascii=False))
+    return total
+
+
 def envelope_rendered_chars(obj):
-    """Rendered cost of an `attachment` JSONL envelope (0 for other line types)."""
+    """Rendered cost of an `attachment` JSONL envelope (0 for other line types).
+
+    Exact when CC stored what it sent (`rendered`); modelled otherwise.
+    """
     if not isinstance(obj, dict) or obj.get("type") != "attachment":
         return 0
+    if isinstance(obj.get("rendered"), list):
+        return _stored_chars(obj["rendered"])
     return rendered_chars(obj.get("attachment"))
+
+
+def snapshot_chars(att):
+    """Size of a prompt_snapshot: the system prompt and tool schemas it records."""
+    if not isinstance(att, dict):
+        return 0
+    return _slen(att.get("systemPrompt")) + _slen(att.get("tools"))

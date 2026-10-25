@@ -1,6 +1,7 @@
 """Core functions for parsing and manipulating Claude Code JSONL session files."""
 
 import json
+import os
 import re
 import shutil
 from pathlib import Path
@@ -214,6 +215,11 @@ def remove_objects_and_rewire(objects, uuids_to_remove, protect=None):
         if p in uuids_to_remove:
             obj["parentUuid"] = find_surviving_ancestor(p)
             rewired += 1
+        # CC resumes from the leaf a `last-prompt` record names (`summary`
+        # records point at leaves the same way): keep those pointing at a node
+        # that still exists, like any other child
+        if obj.get("type") in ("last-prompt", "summary") and obj.get("leafUuid") in uuids_to_remove:
+            obj["leafUuid"] = find_surviving_ancestor(obj["leafUuid"])
         survivors.append(obj)
 
     return survivors, len(uuids_to_remove), rewired, anchored_count
@@ -249,7 +255,19 @@ def save_session(path, objects, create_backup=True):
         shutil.copy2(path, _next_backup_path(path))
     with open(path, "w", encoding="utf-8") as f:
         for obj in objects:
-            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+            f.write(dump_line(obj))
+    os.chmod(path, 0o600)  # transcripts are private; CC creates them 0600
+
+
+# Claude Code writes compact JSON, and its fast transcript scanner matches raw
+# byte patterns (`{"parentUuid":`, `"type":"last-prompt"`, ...). The default
+# `json.dumps` separators (", " / ": ") hide every record from that scanner:
+# the background-session dispatcher then decides there is no conversation to
+# restore, starts a fresh one under the same id and moves the file aside as
+# `<id>.orphaned-<ts>-<rand>.jsonl` (seen 2026-10-25, CC 2.1.310). Always write
+# what CC writes.
+def dump_line(obj):
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n"
 
 
 def compute_active_chain_tokens(objects, uuid_index=None):
@@ -264,14 +282,20 @@ def compute_active_chain_tokens(objects, uuid_index=None):
     the real prompt size, so a barely-stripped session would show a reassuring
     number and then snap back to ~100% on the very next turn.
 
-    Still excludes the runtime system prompt and tool schemas (added at send
-    time, unknowable offline), so it remains a floor, not the exact size.
+    The system prompt and tool schemas count too when the session recorded
+    them (a `prompt_snapshot` attachment, CC >= 2.1.267): the latest snapshot
+    on the chain is what every request sends. Older sessions have none, and
+    the estimate then remains a floor, not the exact size.
     """
-    from .attachment_cost import envelope_rendered_chars
+    from .attachment_cost import envelope_rendered_chars, snapshot_chars
 
     chain = walk_active_chain(objects, uuid_index)
     total_chars = sum(count_content_chars(obj)["total"] for obj in chain)
     total_chars += sum(envelope_rendered_chars(obj) for obj in chain)
+    snaps = [o for o in chain if o.get("type") == "attachment"
+             and (o.get("attachment") or {}).get("type") == "prompt_snapshot"]
+    if snaps:
+        total_chars += snapshot_chars(snaps[-1]["attachment"])
     return estimate_tokens(total_chars)
 
 

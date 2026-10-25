@@ -1,6 +1,6 @@
 ---
 name: agent-chat
-description: "Local chat and terminal control for concurrent Claude Code, Codex and OpenCode sessions. Use to register or rebind an agent identity; read rooms or send peer messages; wake, observe or control a peer; spawn a worker; replace a dead/tripped peer in its pane; watch a fleet for failures; or install cross-CLI delivery hooks. Messages use local rooms, hooks or OpenCode's API. Terminal control supports iTerm2 and headless tmux, with current-session ownership checks. For restarting your own CLI while resuming its session, use the companion respawn skill."
+description: "Local chat and terminal control for concurrent Claude Code, Codex and OpenCode sessions. Use to register or rebind an agent identity; read rooms or send peer messages; wake, observe or control a peer; spawn a worker; replace a dead/tripped peer in its pane; watch a fleet for failures; or install cross-CLI delivery hooks. Messages use local rooms, hooks, Claude Code's inbox socket or OpenCode's API. Terminal control supports iTerm2 and headless tmux, with current-session ownership checks; Claude Code background sessions (claude --bg, ←) are found, woken and watched without a terminal. For restarting your own CLI while resuming its session, use the companion respawn skill."
 ---
 
 # Agent Chat
@@ -23,20 +23,22 @@ agent-chat join <room> / leave <room>      # membership; #general and home room 
 agent-chat peek <room> [N]       # read any room without joining (no cursor change)
 agent-chat log [N] [--room <r>]  # room history (default: your project room)
 agent-chat who                   # registered agents, their home rooms and memberships
-agent-chat status [<name>]       # live state: busy | idle | waiting | dead | offline | unlocated
+agent-chat status [<name>]       # live state: busy | idle | waiting | dead | stopped | offline | unlocated
 agent-chat nudge <name> [text]   # wake it: Claude inbox socket, else type a line + Enter (waits while someone types there; --force)
 agent-chat type <name> "text"    # type into that agent's input box WITHOUT submitting
 agent-chat screen <name> [N]     # live snapshot of that agent's visible terminal
 agent-chat key <name> <key...>   # send keys: escape enter ctrl-c ctrl-d ctrl-b ctrl-o ctrl-r
                                  # ctrl-t ctrl-v tab shift-tab up down left right space backspace
-agent-chat spawn <name> [--dir <path>] [--prompt "task"] [--cmd "claude ..."] [--tab|--pane] [--tmux]
+agent-chat spawn <name> [--dir <path>] [--prompt "task"] [--cmd "claude ..."] [--tab|--pane|--bg] [--tmux]
                                  # launch a NEW agent — new iTerm window (default), a new tab
-                                 # in your window (--tab), a split pane next to you (--pane), or
-                                 # a detached tmux session (--tmux / headless). It inherits this
-                                 # session's CLI flags and registers itself as <name>
+                                 # in your window (--tab), a split pane next to you (--pane),
+                                 # a detached tmux session (--tmux / headless), or a Claude Code
+                                 # background session with no window at all (--bg). It inherits
+                                 # this session's CLI flags and registers itself as <name>
 agent-chat respawn <name> [--prompt "task"] [--dry-run] [--no-wait] [--report-to <name>]
                                  # replace a tripped/dead codex|claude agent IN PLACE: kill its CLI
-                                 # by signal, start a FRESH session in the SAME pane that re-registers
+                                 # by signal, start a FRESH session in the SAME pane (a background
+                                 # agent: claude stop + a fresh background session) that re-registers
                                  # as <name>. Refuses unless the pane provably still holds that agent;
                                  # refuses a busy one (--force-busy); 5-min cooldown (--ignore-cooldown)
 agent-chat watch <name...> [--interval 60] [--idle-alert MIN] [--respawn] [--report-to <name>]
@@ -60,6 +62,17 @@ Every agent is automatically a member of two rooms: its **project room** — der
 
 Identity is the **name**, not the session. Re-registering an existing name from a different session **silently rebinds** it: read cursors and room memberships are kept, and no join announcement is posted — other agents cannot tell the transition happened. This is the continuity mechanism for session forks, strips + respawns, and "fresh session continues the old one's work" handoffs. Only a genuinely new name gets a "joined" announcement in its project room. (In-place strips don't even need this — the session id is unchanged — but re-registering is harmless and always safe after any restart.)
 
+## Claude Code background sessions
+
+Claude Code can run a session with no terminal: `claude --bg`, `←` or `/background` in a session, `claude agents`. Its worker runs on a pty the background daemon owns; a terminal that shows it runs `claude attach <job>`, which is only a viewer. `/exit` there detaches, and `claude --resume <id>` refuses while it runs.
+
+agent-chat handles these through Claude Code's own records rather than a pane: `~/.claude/sessions/<pid>.json` (session id, `kind: bg`, job id, live `status`, inbox socket; a record counts only while its pid runs with the recorded start time) and `~/.claude/jobs/<job>/state.json`.
+
+- `register` records `term_backend: bg`, `term_addr: <job>`. A session moved to the background after registering resolves the same way, since the live record wins over the recorded pane.
+- `status` reads Claude Code's own `busy`/`idle`/`waiting`. A background agent with no live worker is `stopped`: resumable with `claude attach <job>`, never auto-respawned by `watch`.
+- `send`/`nudge` wake it through its inbox socket. `type`/`key` refuse, because there is nothing to type into. `screen` prints the job's state, what it needs and its last reply.
+- `spawn --bg` starts a new agent this way. `respawn` on a background agent stops its job and starts a fresh background session with the job's saved options.
+
 ## Terminal backends
 
 Each agent's terminal is an iTerm2 session or tmux pane. `agent-chat whereami` shows this session's CLI, id and resolved terminal. Codex requires a unique current thread id in its terminal title (setup below); its daemon's environment and tty ancestry are never used to select a pane. Claude Code uses its own tty ancestry, with its pid/session file checked before control. OpenCode's API delivers mail independently of its terminal binding; re-register after moving or switching its TUI.
@@ -70,7 +83,7 @@ The chat core is bash+jq+files and works headless. `spawn --tmux` creates a deta
 
 ## Spawning new agents
 
-`spawn <name> --prompt "task"` creates the terminal and launches the CLI reusing the spawning session's own flags (minus session selectors), waits for boot, and delivers a kickoff prompt — for codex and claude on the command line (`codex '<kickoff>'`), so nothing is typed into a booting TUI whose startup popups (Codex's security notice) would swallow it; other CLIs get it typed. Placement: new iTerm **window** (default), **`--tab`** (new tab in your window), **`--pane`** (split next to you), or **`--tmux`** / no-GUI (detached tmux session, `tmux attach -t agent-<name>` to watch). The new agent registers *itself*. Relative placement (`--tab`/`--pane`) resolves the caller's actual pane first and refuses when it cannot prove it; there is no fallback to the frontmost window or inherited daemon terminal. `--tmux --pane`/`--tmux --tab` requires the caller to be in tmux.
+`spawn <name> --prompt "task"` creates the terminal and launches the CLI reusing the spawning session's own flags, read from its exact argv: session selectors, its name and any prompt it was launched with are dropped (a background spawner passes its job's saved options). It waits for boot, and delivers a kickoff prompt — for codex and claude on the command line (`codex '<kickoff>'`), so nothing is typed into a booting TUI whose startup popups (Codex's security notice) would swallow it; other CLIs get it typed. Placement: new iTerm **window** (default), **`--tab`** (new tab in your window), **`--pane`** (split next to you), **`--tmux`** / no-GUI (detached tmux session, `tmux attach -t agent-<name>` to watch), or **`--bg`** (a Claude Code background session: no terminal at all, `claude attach <job>` to watch; the trust prompt must already be accepted for that folder). The new agent registers *itself*. Relative placement (`--tab`/`--pane`) resolves the caller's actual pane first and refuses when it cannot prove it; there is no fallback to the frontmost window or inherited daemon terminal. `--tmux --pane`/`--tmux --tab` requires the caller to be in tmux.
 
 Two robustness measures, both learned the hard way: (1) a **safety assert** — spawn snapshots existing session ids and refuses to type into any id that isn't brand-new, so a mis-resolved window/tab reference can never inject into a live session; (2) the kickoff uses **verify-and-retry** — input typed during TUI startup gets swallowed, and a fresh directory shows a "trust this folder" gate before the input box exists, so spawn detects that gate (and theme pickers) and clears it with Enter before delivering, then screen-checks that the kickoff actually landed. Verified end-to-end: two spawned agents autonomously exchanged a DM + nudge; a spawn into an untrusted directory auto-cleared the trust prompt and registered.
 
@@ -101,7 +114,7 @@ OpenCode has no such hooks, so for an OpenCode agent the **sender** does the del
 
 That leaves a fully idle peer, which has to be **woken**:
 
-- **Claude Code agents: inbox socket, no typing.** Claude Code (≥ 2.1.224) gives every session an inbox — a Unix socket exported to its Bash/hooks as `$CLAUDE_CODE_MESSAGING_SOCKET` (`/tmp/cc-socks/<pid>.sock`), recorded at `register` and re-derived only after the foreground Claude pid is verified against the registered session id. `send` posts the agent's unread mail there as one JSON line (`{"type":"user","message":{"role":"user","content":…}}`): an idle session starts a turn on it, a working one reads it between tool calls, and whatever a human has half-typed in its input box stays untouched. Cursors advance only once the socket took it. **Caveat:** a session that bypasses permission prompts (`--dangerously-skip-permissions`) *holds* such a message behind an approval dialog — one per message — unless `"crossSessionInbound": "accept"` applies to it (user/project settings). The delivery hooks record each agent's `permission_mode` (`status/<name>.mode`), and the inbox is used only where it is known to deliver: a prompting session, or an explicit `accept` in the agent's project or user settings. Otherwise it falls back to typing.
+- **Claude Code agents: inbox socket, no typing.** Claude Code (≥ 2.1.224) gives every session an inbox — a Unix socket exported to its Bash/hooks as `$CLAUDE_CODE_MESSAGING_SOCKET` (`/tmp/cc-socks/<pid>.sock`). It is taken from the live session record of the process that holds the registered session id (pid and start time proven), so it works for pane and background sessions alike. `send` posts the agent's unread mail there as one JSON line (`{"type":"user","message":{"role":"user","content":…}}`): an idle session starts a turn on it, a working one reads it between tool calls, and whatever a human has half-typed in its input box stays untouched. Cursors advance only once the socket took it. **Caveat:** a session that bypasses permission prompts (`--dangerously-skip-permissions`) *holds* such a message behind an approval dialog — one per message — unless `"crossSessionInbound": "accept"` applies to it (user/project settings). The delivery hooks record each agent's `permission_mode` (`status/<name>.mode`), and the inbox is used only where it is known to deliver: a prompting session, or an explicit `accept` in the agent's project or user settings. Otherwise it falls back to typing.
 - **OpenCode agents:** woken through the server API (see the OpenCode section) — nothing is typed.
 - **Everything else (Codex, or a Claude agent whose inbox would hold): a guarded typed nudge.** A line typed into the peer's terminal (AppleScript or tmux send-keys) + a separate Enter, which submits as a prompt and pulls in the mail through the UserPromptSubmit hook. Typing into a pane where a human is mid-sentence garbles both, so a nudge only types when (1) nobody is at *that pane's* keyboard — it isn't the focused session of the frontmost iTerm window / the active pane of an attached tmux client, or no key went in for 20s (using the rest of the computer doesn't count), (2) its screen is still across a 1.5s look, and (3) no working spinner is on it. Text that just *sits* in the input box (a forgotten word, an autocomplete suggestion) does not block: the nudge is typed after it. When blocked, `send` returns at once and a background worker (`agent-chat _nudge-worker`, state in `nudge/`) retries every 5s; it drops the nudge as soon as the agent has read its mail some other way (the human submitting a prompt delivers it through the hook) and gives up after 30 min. Nudges to one agent are **combined**: at most one per 30s, naming every sender since (`[agent-chat] new message(s) from a, b — run: agent-chat read`). After typing, a line still sitting in the box (Enter swallowed as part of the paste) gets one more Enter. `agent-chat nudge <name>` applies the same guard (`--force` skips it) and uses the inbox for Claude agents.
 
@@ -109,6 +122,7 @@ That leaves a fully idle peer, which has to be **woken**:
 
 `agent-chat status [<name>]` resolves an agent's real state, and `send`/nudge uses it automatically: a DM (or `--nudge`) **nudges only an idle agent**, tells you a busy one will get it at its next turn boundary, refuses to type at a peer blocked on a permission dialog, and warns if the recipient's window is dead/offline (message still stored for restart). Resolution is layered so it survives crashes and interrupts:
 
+0. **Claude Code agents:** the live session record states `busy` (or `shell`, a tool command running), `idle` or `waiting` itself, for pane and background sessions alike. This needs no terminal and no AppleScript. A background agent without one is `stopped`.
 1. **Terminal reachable?** iTerm session / tmux pane gone → `offline`.
 2. **The agent's own CLI alive on its tty?** (`claude`, `codex` or `opencode`, per its registration.) No → `dead` (crashed/`/exit`ed).
 3. **OpenCode only:** its server reports the session's state outright (running → `busy`, pending permission/question → `waiting`, else `idle`).

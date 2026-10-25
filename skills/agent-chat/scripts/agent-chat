@@ -7,7 +7,10 @@
 # auto-delivered: Claude Code and Codex pull them through their hooks
 # (UserPromptSubmit, PostToolUse, Stop); OpenCode has them pushed into the
 # session by the sender through OpenCode's own server API.
-# `nudge` wakes an idle session by typing into its iTerm window (AppleScript).
+# `nudge` wakes an idle session: a Claude Code session through its inbox socket,
+# anything else by typing into its iTerm/tmux pane. Claude Code background
+# sessions (`claude --bg`, `←`) have no pane; they are found, woken and watched
+# through Claude Code's own session records.
 #
 # Rooms (mIRC-style): every agent is a member of its project room (derived from
 # the cwd it registered in, like Claude Code's per-folder session storage) and
@@ -32,19 +35,22 @@
 #   agent-chat join <room> / leave <room>   manage room membership
 #   agent-chat peek <room> [N]              read any room without joining (no cursor change)
 #   agent-chat who                          list registered agents and their rooms
-#   agent-chat status [<name>]              live state of an agent: busy|idle|waiting|dead|offline
-#                                           (glyph-primary + hook fallback + process liveness)
-#   agent-chat nudge <name> [text] [--force] type a wake-up line + Enter into that agent's terminal
-#                                           (refuses while someone types in that pane; --force overrides)
+#   agent-chat status [<name>]              live state of an agent: busy|idle|waiting|dead|stopped|offline
+#                                           (Claude Code's own session record first; else title glyph +
+#                                           hook fallback + process liveness)
+#   agent-chat nudge <name> [text] [--force] wake it: Claude Code inbox socket (no typing), else type a
+#                                           wake-up line + Enter into its terminal (refuses while someone
+#                                           types in that pane; --force overrides)
 #   agent-chat type <name> "text"           type into that agent's input box WITHOUT submitting
 #   agent-chat screen <name> [N]            snapshot of that agent's visible terminal (what it is
 #                                           doing right now: spinner, running tool, stuck prompt)
 #   agent-chat key <name> <key...>          send keys/shortcuts: escape (stop current work), enter,
 #                                           ctrl-c, tab, shift-tab, up/down/left/right, ctrl-b/o/r/t/v...
 #                                           e.g. remote slash command: type <n> "/compact" + key <n> enter
-#   agent-chat spawn <name> [--dir <path>] [--prompt "task"] [--cmd "claude ..."] [--tab|--pane] [--tmux]
+#   agent-chat spawn <name> [--dir <path>] [--prompt "task"] [--cmd "claude ..."] [--tab|--pane|--bg] [--tmux]
 #                                           launch a NEW agent: new iTerm window, --tab = tab in your window,
 #                                           --pane = split next to you (or tmux with --tmux / headless),
+#                                           --bg = Claude Code background session (no window at all),
 #                                           reusing this session CLI flags; it registers itself as <name>
 #   agent-chat respawn <name> [--prompt "task"] [--report-to <name>] [--dry-run] [--no-wait]
 #                       [--force-busy] [--ignore-cooldown] [--cmd "codex ..."]
@@ -121,7 +127,9 @@ cli_of_cmd() {
     claude|claude.js)     echo claude;;
     codex|codex.js)       echo codex;;
     opencode|opencode.js) echo opencode;;
-    *) case "$a" in *claude-code*|*@anthropic-ai*) echo claude;; *) return 1;; esac;;
+    # (native builds also run straight from their versioned binary, e.g. the
+    #  workers of background sessions: ~/.local/share/claude/versions/2.1.302)
+    *) case "$a" in *claude-code*|*@anthropic-ai*|*/claude/versions/*) echo claude;; *) return 1;; esac;;
   esac
 }
 
@@ -296,6 +304,7 @@ cmd_register() {
       else
         echo "note: no iTerm/tmux terminal found for this session — chat works, but peers can't wake (nudge), watch or drive it."
       fi;;
+    bg) echo "Background session (Claude Code job $ta): peers wake it through its inbox socket and read its state from Claude Code; there is no terminal to type into or watch (humans: claude attach $ta).";;
     *) echo "Terminal: $tb $ta (found via $tsrc)$([ "$delivery" = api ] && echo '; mail delivery: OpenCode server API')";;
   esac
   [ "$cli" = opencode ] && [ "$delivery" != api ] && \
@@ -411,7 +420,7 @@ cmd_send() {
         echo "  → $name is blocked on a prompt/dialog — NOT typing (would hit a button). It'll see the message when it resumes. Inspect: agent-chat screen $name";;
       idle)
         nudge_request "$name" "$from";;
-      dead|offline)
+      dead|offline|stopped)
         echo "  → $name is $state ($src) — message stored; it'll be delivered when that session restarts and re-registers";;
       unlocated)
         echo "  → $name: $src — NOT typing (no terminal to type into). Message stored; it sees it at its next turn boundary. To make it reachable, have it run: agent-chat register $name";;
@@ -650,11 +659,16 @@ codex_locate() {
 
 # detect_term <cli> <session-id> <name> -> "backend addr src" for THIS session
 # ("none - <why>" when there is no usable terminal). src records how it was
-# found; Codex always needs a unique current thread-id title.
+# found; Codex always needs a unique current thread-id title. A Claude Code
+# background session is "bg <job-id>": it has no pane to find.
 detect_term() {
-  local cli="$1" sid="$2" name="$3" tt="" _ t loc
+  local cli="$1" sid="$2" name="$3" tt="" _ t loc rec
   if [ "$cli" = codex ]; then
     codex_locate "$sid" || echo "none - unlocated"
+    return
+  fi
+  if [ "$cli" = claude ] && rec=$(cc_self "$sid") && cc_is_bg "$rec"; then
+    echo "bg $(cc_field "$rec" 4) session-file"
     return
   fi
   while IFS=$'\t' read -r _ t _; do
@@ -744,12 +758,166 @@ is_shell_pid() {
   return 1
 }
 
+# ---------- Claude Code's own session records ----------
+#
+# Claude Code writes ~/.claude/sessions/<pid>.json for every live session,
+# interactive or background (daemon-hosted, `claude --bg` / `←` / `/background`):
+# sessionId, kind (interactive | bg), jobId (background only), status (idle |
+# busy | shell | waiting, plus waitingFor), messagingSocketPath and procStart
+# (the process start in UTC). A record counts only while its pid is alive with
+# that same start time, the check Claude Code itself makes, so a reused pid
+# never inherits a session. A background session has no pane at all: its
+# worker runs on a daemon-owned pty, and attached terminals run `claude attach`.
+
+CC_HOME="$HOME/.claude"
+
+utc_epoch() { # "Thu Oct 22 04:38:03 2026" (UTC) -> unix seconds
+  LC_ALL=C date -j -u -f '%a %b %d %T %Y' "$1" +%s 2>/dev/null || LC_ALL=C date -u -d "$1" +%s 2>/dev/null
+}
+
+# cc_record <pid> -> pid<US>session<US>kind<US>job<US>status<US>waitingFor<US>socket<US>cwd
+# for a LIVE record; rc 1 when there is none or the pid now belongs to another process
+cc_record() {
+  local f="$CC_HOME/sessions/$1.json" row pid sid kind job st wf sock cwd started
+  [ -f "$f" ] || return 1
+  row=$($JQ -r '[.pid, .sessionId, (.kind // "interactive"), .jobId, .status, .waitingFor,
+                 .messagingSocketPath, .cwd, .procStart] | map(. // "" | tostring) | join("\u001f")' "$f" 2>/dev/null) || return 1
+  IFS="$US" read -r pid sid kind job st wf sock cwd started <<< "$row"
+  [ "$pid" = "$1" ] && [ -n "$sid" ] && [ -n "$started" ] || return 1
+  [ "$(process_token "$pid")" = "$(utc_epoch "$started")" ] || return 1
+  printf '%s\n' "$pid$US$sid$US$kind$US$job$US$st$US$wf$US$sock$US$cwd"
+}
+
+cc_field() { # record field-number (1 pid, 2 session, 3 kind, 4 job, 5 status, 6 waitingFor, 7 socket, 8 cwd)
+  printf '%s' "$1" | cut -d"$US" -f"$2"
+}
+
+# cc_holder <session-id> -> the live record of the one process holding it;
+# rc 1 when none does, or when more than one claims it
+cc_holder() {
+  local f rec out="" n=0
+  [ -n "${1:-}" ] || return 1
+  for f in $(grep -l -F "\"$1\"" "$CC_HOME"/sessions/*.json 2>/dev/null); do
+    rec=$(cc_record "$(basename "$f" .json)") || continue
+    [ "$(cc_field "$rec" 2)" = "$1" ] || continue
+    out="$rec"; n=$((n + 1))
+  done
+  [ "$n" = 1 ] || return 1
+  printf '%s\n' "$out"
+}
+
+# cc_self <session-id> -> live record of the Claude process running this command:
+# the nearest ancestor whose own record holds the id (inherited env never decides)
+cc_self() {
+  local p rec
+  while IFS=$'\t' read -r p _ _; do
+    [ -f "$CC_HOME/sessions/$p.json" ] || continue
+    rec=$(cc_record "$p") || continue
+    [ "$(cc_field "$rec" 2)" = "$1" ] && { printf '%s\n' "$rec"; return 0; }
+  done <<< "$(ancestry)"
+  return 1
+}
+
+cc_is_bg() { [ "$(cc_field "$1" 3)" != interactive ] && [ -n "$(cc_field "$1" 4)" ]; } # record
+
+# cc_holder_line <session-id> -> "pid birth kind job status cwd" for the respawn
+# scripts ("-" for an empty field; cwd last since it may contain spaces)
+cc_holder_line() {
+  local rec pid kind job st
+  rec=$(cc_holder "$1") || return 1
+  pid=$(cc_field "$rec" 1); kind=$(cc_field "$rec" 3); job=$(cc_field "$rec" 4); st=$(cc_field "$rec" 5)
+  printf '%s %s %s %s %s %s\n' "$pid" "$(process_token "$pid")" "${kind:--}" "${job:--}" "${st:--}" "$(cc_field "$rec" 8)"
+}
+
+cc_bin() { command -v claude 2>/dev/null || echo "$HOME/.local/bin/claude"; }
+
+job_get() { $JQ -r --arg k "$2" '.[$k] // empty | tostring' "$CC_HOME/jobs/$1/state.json" 2>/dev/null; } # job field
+
+# job_flags <job> -> the job's saved launch options, shell-quoted (what Claude
+# Code itself restarts the session with)
+job_flags() {
+  local a out=""
+  while IFS= read -r a; do out="$out $(shq "$a")"; done \
+    < <($JQ -r '.respawnFlags // [] | .[]' "$CC_HOME/jobs/$1/state.json" 2>/dev/null)
+  printf '%s' "${out# }"
+}
+
+# launch_cmd <pid> resume|spawn -> the CLI's launch command rebuilt from its
+# exact argv (not `ps`, which joins arguments with spaces and loses quoting),
+# shell-quoted. Drops session selectors, background/worktree creation and the
+# trailing prompt (a kickoff passed on the command line); `spawn` also drops
+# the session name. Claude Code only. (<pid> may be json:[argv...] for tests)
+launch_cmd() {
+  python3 - "$1" "$2" <<'PY'
+import ctypes, ctypes.util, shlex, sys
+import json
+src, mode = sys.argv[1], sys.argv[2]
+
+def argv_of(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return [a.decode("utf-8", "surrogateescape") for a in f.read().split(b"\0")[:-1]]
+    except FileNotFoundError:
+        pass
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    argmax, size = ctypes.c_int(), ctypes.c_size_t(ctypes.sizeof(ctypes.c_int))
+    if libc.sysctl((ctypes.c_int * 2)(1, 8), 2, ctypes.byref(argmax), ctypes.byref(size), None, 0):
+        raise OSError("KERN_ARGMAX")
+    buf, size = ctypes.create_string_buffer(argmax.value), ctypes.c_size_t(argmax.value)
+    if libc.sysctl((ctypes.c_int * 3)(1, 49, pid), 3, buf, ctypes.byref(size), None, 0):
+        raise OSError("KERN_PROCARGS2")
+    raw = buf.raw[:size.value]
+    argc, rest = int.from_bytes(raw[:4], sys.byteorder), raw[4:]
+    rest = rest[rest.index(b"\0"):].lstrip(b"\0")          # skip the exec path
+    return [a.decode("utf-8", "surrogateescape") for a in rest.split(b"\0")[:argc]]
+
+# options that take a value (`claude --help`); variadic ones take one or more
+VALUE = {"--add-dir", "--agent", "--agents", "--allowedTools", "--allowed-tools", "--append-system-prompt",
+         "--append-system-prompt-file", "--autocompact", "--betas", "--debug-file", "--disallowedTools",
+         "--disallowed-tools", "--effort", "--environment", "--fallback-model", "--file", "--input-format",
+         "--json-schema", "--max-budget-usd", "--mcp-config", "--model", "-n", "--name", "--output-format",
+         "--permission-mode", "--permission-prompts", "--plugin-dir", "--plugin-url",
+         "--remote-control-session-name-prefix", "--session-id", "--setting-sources", "--settings",
+         "--system-prompt", "--system-prompt-file", "--system-prompt-snapshot", "--tools"}
+VARIADIC = {"--add-dir", "--allowedTools", "--allowed-tools", "--betas", "--disallowedTools",
+            "--disallowed-tools", "--file", "--mcp-config", "--tools"}
+OPTIONAL = {"-d", "--debug", "-r", "--resume", "--from-pr", "--cloud", "--teleport", "--remote-control",
+            "-w", "--worktree", "--prompt-suggestions", "--tmux"}
+DROP = {"-c", "--continue", "-r", "--resume", "--from-pr", "--session-id", "--fork-session", "-w", "--worktree",
+        "--tmux", "--bg", "--background", "--cloud", "--teleport", "-p", "--print"}
+if mode == "spawn":
+    DROP |= {"-n", "--name"}
+
+argv = json.loads(src[5:]) if src.startswith("json:") else argv_of(int(src))
+# a versioned binary path would pin a version that a later update removes
+out, i = [argv[0] if argv[0].rsplit("/", 1)[-1] == "claude" else "claude"], 1
+while i < len(argv):
+    tok = argv[i]
+    if not tok.startswith("-") or tok in ("-", "--"):
+        break                                            # the prompt: drop it and the rest
+    name = tok.split("=", 1)[0]
+    group = [tok]
+    if "=" not in tok and name in VARIADIC:
+        while i + len(group) < len(argv) and not argv[i + len(group)].startswith("-"):
+            group.append(argv[i + len(group)])
+    elif "=" not in tok and name in VALUE and i + 1 < len(argv):
+        group.append(argv[i + 1])
+    elif "=" not in tok and name in OPTIONAL and i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+        group.append(argv[i + 1])
+    i += len(group)
+    if name not in DROP:
+        out += group
+print(" ".join(shlex.quote(a) for a in out))
+PY
+}
+
 # session_proof cli sid backend addr -> tty pid birth parent-pid parent-birth.
 # Used by both respawn implementations. These checks always bypass snapshots:
 # a fleet snapshot is useful for observation, never permission to send input.
 session_proof() {
   local cli="$1" sid="$2" tb="$3" ta="$4" tty pids pid born parent pb stat
   local _TERM_LIST _CODEX_CANDS; unset _TERM_LIST _CODEX_CANDS
+  case "$tb" in iterm|tmux) ;; *) return 1;; esac   # a background session has no pane to prove
   warm_terms || return 1
   tty=$(agent_tty "$tb" "$ta"); [ -n "$tty" ] || return 1
   pids=$(agent_pids "$tty" "$cli")
@@ -764,7 +932,7 @@ session_proof() {
       found=$(codex_locate "$sid") || return 1
       [ "$found" = "$tb $ta title" ] || return 1;;
     claude)
-      [ "$($JQ -r '.sessionId // empty' "$HOME/.claude/sessions/$pid.json" 2>/dev/null)" = "$sid" ] || return 1;;
+      [ "$($JQ -r '.sessionId // empty' "$CC_HOME/sessions/$pid.json" 2>/dev/null)" = "$sid" ] || return 1;;
     *) return 1;;
   esac
   born=$(process_token "$pid") || return 1
@@ -812,10 +980,15 @@ saved_shell_proof() {
 # resolve_term name -> backend addr. 2 means unlocated, 3 means pane closed.
 # Codex always needs a unique CURRENT title. Historical hints are never proof.
 resolve_term() {
-  local f="$REG/$1.json" tb ta cli sid loc src
+  local f="$REG/$1.json" tb ta cli sid loc src rec
   [ -e "$f" ] || return 1
   tb=$(reg_get "$1" term_backend); ta=$(reg_get "$1" term_addr)
   cli=$(reg_get "$1" cli); sid=$(reg_get "$1" session_id)
+  # a Claude session running in the background has no pane, whatever was
+  # recorded at registration (it may have been moved there with ← since)
+  if [ "$cli" = claude ] && rec=$(cc_holder "$sid") && cc_is_bg "$rec"; then
+    printf 'bg %s' "$(cc_field "$rec" 4)"; return 0
+  fi
   if [ -z "$tb" ]; then
     ta=$(reg_get "$1" iterm_session_id); ta="${ta#*:}"
     [ -n "$ta" ] && tb=iterm
@@ -860,11 +1033,13 @@ control_proof() { # name backend addr expected-sid
 }
 
 control_type() { # name backend addr sid text
+  [ "$2" != bg ] || term_type bg "$3" ""   # (refuses: a background session has no terminal)
   control_proof "$1" "$2" "$3" "$4" || { echo "agent-chat: terminal ownership changed or cannot be proved — no input sent" >&2; return 1; }
   term_type "$2" "$3" "$5"
 }
 
 control_key() { # name backend addr sid key
+  [ "$2" != bg ] || term_key bg "$3" "$5"
   control_proof "$1" "$2" "$3" "$4" || { echo "agent-chat: terminal ownership changed or cannot be proved — no key sent" >&2; return 1; }
   term_key "$2" "$3" "$5"
 }
@@ -912,11 +1087,16 @@ APPLESCRIPT
   echo ok
 }
 
-# terminal I/O primitives — dispatch on backend ("iterm" uuid | "tmux" pane-id)
+# terminal I/O primitives — dispatch on backend ("iterm" uuid | "tmux" pane-id;
+# "bg" job-id is a Claude Code background session, which has no terminal)
+NO_BG_INPUT="background session (Claude Code job %s) has no terminal to type into — wake it with send/nudge (inbox), or open it yourself: claude attach %s"
+
 term_type() { # backend addr text — type WITHOUT submitting
   case "$1" in
     iterm) iterm_write "$2" "$3";;
     tmux)  tmux send-keys -t "$2" -l -- "$3" && echo ok;;
+    # shellcheck disable=SC2059
+    bg) die "$(printf "$NO_BG_INPUT" "$2" "$2")";;
     *) die "unsupported terminal backend '$1'";;
   esac
 }
@@ -930,6 +1110,8 @@ term_enter() { # backend addr — a real Enter keypress (separate from the text:
     # missed sometimes with Claude Code 2.1.3xx; iTerm's two osascript calls
     # are naturally far enough apart)
     tmux)  sleep 1; tmux send-keys -t "$2" Enter && echo ok;;
+    # shellcheck disable=SC2059
+    bg) die "$(printf "$NO_BG_INPUT" "$2" "$2")";;
     *) die "unsupported terminal backend '$1'";;
   esac
 }
@@ -937,6 +1119,8 @@ term_enter() { # backend addr — a real Enter keypress (separate from the text:
 term_key() { # backend addr keyname
   local b="$1" a="$2" k="$3"
   case "$b" in
+    # shellcheck disable=SC2059
+    bg) die "$(printf "$NO_BG_INPUT" "$a" "$a")";;
     iterm)
       local seq
       case "$k" in
@@ -991,13 +1175,42 @@ end run
 APPLESCRIPT
       ;;
     tmux) tmux capture-pane -p -t "$2";;
+    bg) bg_screen "$2";;
     *) die "unsupported terminal backend '$1'";;
   esac
+}
+
+# bg_screen <job> — what a background session is doing, from Claude Code's own
+# job record and its transcript. (`claude logs` is the raw pty stream, which
+# only renders correctly from its start, so it is not a screen.)
+bg_screen() {
+  local job="$1" sid rec st wf transcript
+  [ -f "$CC_HOME/jobs/$job/state.json" ] || { echo "agent-chat: no Claude Code job '$job'" >&2; return 1; }
+  sid=$(job_get "$job" sessionId)
+  if rec=$(cc_holder "$sid"); then
+    st=$(cc_field "$rec" 5); wf=$(cc_field "$rec" 6)
+    echo "[background session, job $job, pid $(cc_field "$rec" 1): ${st:-unknown}${wf:+ — waiting for $wf}]"
+  else
+    echo "[background session, job $job: not running]"
+  fi
+  echo "state:  $(job_get "$job" state)$(d=$(job_get "$job" detail); [ -n "$d" ] && printf ' — %s' "$d")"
+  local needs; needs=$(job_get "$job" needs); [ -n "$needs" ] && echo "needs:  $needs"
+  transcript=$(job_get "$job" linkScanPath)
+  [ -f "$transcript" ] || transcript=$(ls "$CC_HOME"/projects/*/"$sid.jsonl" 2>/dev/null | head -n1)
+  if [ -f "$transcript" ]; then
+    echo "last reply:"
+    tail -n 400 "$transcript" | $JQ -r 'select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text' 2>/dev/null \
+      | tail -n 20 | sed 's/^/  /'
+  fi
+  echo "(no terminal: humans can open it with 'claude attach $job')"
 }
 
 # ---------- liveness & status ----------
 #
 # Layered status, most-authoritative first:
+#   0. Claude Code only: the live session record (~/.claude/sessions/<pid>.json)
+#      states busy / idle / waiting itself, for interactive and background
+#      sessions alike. A background session without a live record is STOPPED.
 #   1. terminal reachable? (iterm session / tmux pane exists)  — else OFFLINE
 #   2. the agent's CLI (claude / codex / opencode) alive on its tty? — else DEAD
 #   3. OpenCode only: its server says busy / waiting / idle outright
@@ -1099,17 +1312,40 @@ tty_has_cli() {
   return 1
 }
 
+# cc_state <record> -> "STATE\tSOURCE" from Claude Code's own session status
+cc_state() {
+  local st wf src="claude"
+  st=$(cc_field "$1" 5); wf=$(cc_field "$1" 6)
+  cc_is_bg "$1" && src="claude, background job $(cc_field "$1" 4)"
+  case "$st" in
+    busy|shell) printf 'busy\t%s\n' "$src";;    # shell: a tool command is running
+    waiting)    printf 'waiting\t%s%s\n' "$src" "${wf:+, waiting for $wf}";;
+    idle)       printf 'idle\t%s\n' "$src";;
+    *)          printf 'unknown\t%s reports status "%s"\n' "$src" "$st";;
+  esac
+}
+
 # agent_state <name> -> prints "STATE\tSOURCE"
-# STATE: busy | idle | waiting | dead | offline | unknown | unlocated
-# (unlocated = alive or not, there is no terminal we could check or type into)
+# STATE: busy | idle | waiting | dead | stopped | offline | unknown | unlocated
+# (unlocated = alive or not, there is no terminal we could check or type into;
+#  stopped = a Claude Code background session that isn't running — resumable)
 agent_state() {
-  local name="$1" cli api=0 term rc tb="" ta="" tty g title hstate hepoch age st
+  local name="$1" cli api=0 term rc tb="" ta="" tty g title hstate hepoch age st rec
+  cli=$(reg_get "$name" cli); [ -n "$cli" ] || cli=claude
+  if [ "$cli" = claude ] && rec=$(cc_holder "$(reg_get "$name" session_id)"); then
+    cc_state "$rec"; return
+  fi
+  if [ "$(reg_get "$name" term_backend)" = bg ]; then
+    ta=$(reg_get "$name" term_addr)
+    printf 'stopped\tbackground job %s is not running (%s) — resume: claude attach %s\n' \
+      "$ta" "$(job_get "$ta" state || true)" "$ta"
+    return
+  fi
   # one look at the terminals answers every question below (tty, title, Codex location)
   if [ -z "${_TERM_LIST+x}" ]; then
     local _TERM_LIST
     _TERM_LIST=$(_term_list_raw) || { printf 'unlocated\tterminal inventory unavailable\n'; return; }
   fi
-  cli=$(reg_get "$name" cli); [ -n "$cli" ] || cli=claude
   [ "$(reg_get "$name" delivery)" = api ] && api=1
   term=$(resolve_term "$name"); rc=$?
   if [ "$rc" = 0 ]; then
@@ -1217,17 +1453,14 @@ cmd_whereami() { # [--porcelain] — what THIS session resolves to (also used by
 # is only used where it is known to deliver, and typing stays the fallback.
 
 cc_inbox() { # name -> the agent's live inbox socket; rc 1 if it has none we can use
-  local reg dir term tb ta tty pid born parent pb proof
-  reg=$(reg_get "$1" inbox)
-  term=$(resolve_term "$1") || return 1
-  read -r tb ta <<< "$term"
-  proof=$(session_proof claude "$(reg_get "$1" session_id)" "$tb" "$ta") || return 1
-  read -r tty pid born parent pb <<< "$proof"
-  dir=$(dirname "${reg:-/tmp/cc-socks/x}")
-  # the socket is named after its session's pid: only trust one whose claude
-  # still runs on this agent's tty (a restart in the pane gets a new socket)
-  [ -S "$dir/$pid.sock" ] && { echo "$dir/$pid.sock"; return 0; }
-  return 1
+  local rec pid sock
+  # the process that holds the registered session right now (pid + start time
+  # proven), whether it runs in a pane or in the background — never a terminal guess
+  rec=$(cc_holder "$(reg_get "$1" session_id)") || return 1
+  pid=$(cc_field "$rec" 1); sock=$(cc_field "$rec" 7)
+  # the socket is named after its session's pid (a restart gets a new one)
+  [ -n "$sock" ] && [ "$(basename "$sock")" = "$pid.sock" ] && [ -S "$sock" ] || return 1
+  echo "$sock"
 }
 
 cc_inbound_accepts() { # name — will its session deliver an outside message without a dialog?
@@ -1386,6 +1619,10 @@ nudge_request() {
       0) echo "  → $name was idle — delivered to its inbox (woken without typing)"; return;;
       1) echo "  → $name has nothing unread from this"; return;;
     esac
+    if [ "$(reg_get "$name" term_backend)" = bg ]; then
+      echo "  → $name: background session, and its inbox won't take the message (it bypasses permission prompts without \"crossSessionInbound\": \"accept\", or the socket is gone) — nothing to type into; stored, it sees it at its next turn"
+      return
+    fi
   fi
   mkdir -p "$NUDGE_DIR"
   printf '%s\n' "$2" >> "$NUDGE_DIR/$name.from"
@@ -1443,6 +1680,8 @@ cmd_nudge() { # name [text] [--force] — type a wake-up line + Enter (same guar
     $JQ -cn --arg t "$text" '{type:"user", message:{role:"user", content:$t}}' | nc -U -w 2 "$sock" >/dev/null 2>&1 \
       && { echo "ok (inbox)"; return; }
   fi
+  [ "$(reg_get "$name" term_backend)" = bg ] \
+    && die "$name is a background session and its inbox won't take a message (bypass mode without \"crossSessionInbound\": \"accept\", or it isn't running: agent-chat status $name)"
   sid=$(reg_get "$name" session_id)
   term=$(agent_term "$name") || return 1
   read -r tb ta <<< "$term"
@@ -1489,7 +1728,39 @@ cmd_key() { # name key... — send special keys / Claude Code shortcuts
   echo ok
 }
 
-cmd_spawn() { # <name> [--dir d] [--cmd "claude ..."] [--prompt "task"] [--tab|--pane] [--tmux]
+# spawner_cmd -> launch command for a new agent, taken from the CLI running this
+# command: Claude Code's exact flags minus session selectors and its name (a
+# background caller's saved job options); Codex and OpenCode keep theirs in config
+spawner_cmd() {
+  local p acmd rec flags
+  while IFS=$'\t' read -r p _ acmd; do
+    case "$(cli_of_cmd "$acmd")" in
+      claude)
+        if rec=$(cc_record "$p") && cc_is_bg "$rec"; then
+          flags=$(job_flags "$(cc_field "$rec" 4)")
+          echo "claude${flags:+ $flags}"
+        else
+          launch_cmd "$p" spawn 2>/dev/null || echo claude
+        fi
+        return;;
+      codex)    echo codex; return;;
+      opencode) echo opencode; return;;
+    esac
+  done <<< "$(ancestry)"
+  echo claude
+}
+
+# bg_launch <dir> <shell command> -> job id of the Claude Code background session
+# it started (`claude --bg` prints "backgrounded · <job> · <name>" and returns)
+bg_launch() {
+  local out job
+  out=$(cd "$1" && /bin/sh -c "$2" </dev/null 2>&1) || { echo "agent-chat: claude --bg failed: $out" >&2; return 1; }
+  job=$(printf '%s\n' "$out" | sed -nE 's/^backgrounded · ([0-9a-f]+) · .*/\1/p' | head -n1)
+  [ -n "$job" ] || { echo "agent-chat: claude --bg printed no job id: $out" >&2; return 1; }
+  echo "$job"
+}
+
+cmd_spawn() { # <name> [--dir d] [--cmd "claude ..."] [--prompt "task"] [--tab|--pane|--bg] [--tmux]
   local name="" dir="$PWD" cmd="" task="" force_tmux=0 place="window"
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1498,35 +1769,33 @@ cmd_spawn() { # <name> [--dir d] [--cmd "claude ..."] [--prompt "task"] [--tab|-
       --prompt) task="$2"; shift 2;;
       --tab) place="tab"; shift;;
       --pane) place="pane"; shift;;
+      --bg) place="bg"; shift;;
       --tmux) force_tmux=1; shift;;
       -*) die "spawn: unknown arg '$1'";;
       *) [ -n "$name" ] && die "spawn: one name only"; name="$1"; shift;;
     esac
   done
-  [ -n "$name" ] || die 'usage: agent-chat spawn <name> [--dir <path>] [--prompt "task"] [--cmd "claude ..."] [--tab|--pane] [--tmux]'
+  [ -n "$name" ] || die 'usage: agent-chat spawn <name> [--dir <path>] [--prompt "task"] [--cmd "claude ..."] [--tab|--pane|--bg] [--tmux]'
   printf '%s' "$name" | grep -Eq '^[a-z0-9][a-z0-9_-]{0,31}$' || die "invalid agent name '$name'"
   [ -d "$dir" ] || die "no such directory: $dir"
+  [ "$place" != bg ] || [ "$force_tmux" = 0 ] || die "spawn: --bg and --tmux are different placements — pick one"
 
   # default launch command: reuse this session's own CLI flags (minus session
   # selectors), so e.g. --dangerously-skip-permissions carries over
-  if [ -z "$cmd" ]; then
-    # the nearest CLI above this command is the one spawning: launch the same
-    local _ acmd
-    while IFS=$'\t' read -r _ _ acmd; do
-      case "$(cli_of_cmd "$acmd")" in
-        claude)
-          cmd=$(printf '%s' "$acmd" \
-            | sed -E 's/ (--resume|-r|--session-id|--from-pr) [^ ]+//g; s/ (--resume|-r|--continue|-c|--fork-session|--from-pr)( |$)/ /g')
-          break;;
-        codex)    cmd="codex"; break;;      # (its flags live in config/profile, not on the daemon's command line)
-        opencode) cmd="opencode"; break;;
-      esac
-    done <<< "$(ancestry)"
-    [ -n "$cmd" ] || cmd="claude"
-  fi
+  [ -n "$cmd" ] || cmd=$(spawner_cmd)
 
   local kickoff="You are a fresh agent. First, register on the local agent chat: agent-chat register $name — then check in with: agent-chat read."
   [ -n "$task" ] && kickoff="$kickoff Your task: $(printf '%s' "$task" | tr '\r\n' '  ')"
+
+  if [ "$place" = bg ]; then
+    [ "$(cli_of_cmd "$cmd")" = claude ] || die "spawn --bg starts a Claude Code background session; '$cmd' isn't claude"
+    local job
+    job=$(bg_launch "$dir" "$cmd --bg -n $(sq "$name") $(sq "$kickoff")") || exit 1
+    echo "Spawned '$name' as Claude Code background session $job (dir: $dir) — no window; humans: claude attach $job"
+    echo "Launch: $cmd --bg -n $name"
+    echo "Kickoff passed on the command line — it will register itself as '$name' (check: agent-chat who)"
+    return 0
+  fi
   # codex and claude take their first prompt as an argument: hand the kickoff
   # over on the command line, so nothing is typed into a booting TUI (startup
   # popups such as Codex's security notice swallow typed text, and the retries
@@ -1713,6 +1982,7 @@ rlog() { mkdir -p "$RESPAWN_DIR"; echo "[$(date '+%F %T')] $*" >> "$RESPAWN_LOG"
 # (Not printf %q: bash 3.2 escapes multi-byte UTF-8 into a mix of raw and
 # octal bytes, which iTerm's AppleScript rejects as invalid text.)
 sq() { local s="$1" q="'"; s=${s//$q/$q\\$q$q}; printf '%s%s%s' "$q" "$s" "$q"; }
+shq() { case "$1" in ''|*[!A-Za-z0-9_./:=@%+,-]*) sq "$1";; *) printf '%s' "$1";; esac; } # quote only if needed
 
 agent_pids() { # tty-path cli -> pids of the TOP-LEVEL processes of that agent CLI on the tty
   local rows pid ppid cmd mine="" e
@@ -1766,6 +2036,7 @@ cmd_respawn() ( # <name> [--prompt "task"] [--cmd "codex ..."] [--report-to <nam
   cli=$(reg_get "$name" cli); sid=$(reg_get "$name" session_id); cwd=$(reg_get "$name" cwd)
   case "$cli" in codex|claude) ;; *) die "respawn: '$name' is a '$cli' agent — only codex and claude agents can be respawned";; esac
   [ -d "$cwd" ] || cwd="$HOME"
+  local cmd_given=0; [ -n "$cmd" ] && cmd_given=1
   [ -n "$cmd" ] || cmd="$cli"
   if [ -z "$report" ]; then report=$(resolve_name 2>/dev/null) || report=""; [ "$report" = "$name" ] && report=""; fi
 
@@ -1782,6 +2053,21 @@ cmd_respawn() ( # <name> [--prompt "task"] [--cmd "codex ..."] [--report-to <nam
     trap 'rmdir "$lock" 2>/dev/null' EXIT
     trap 'exit 1' HUP INT TERM
   fi
+
+  local kickoff launch bg=0 bgjob="" where="in this same terminal"
+  case "$(resolve_term "$name" 2>/dev/null)" in
+    "bg "*) bg=1; bgjob=$(resolve_term "$name"); bgjob="${bgjob#bg }"; where="as a Claude Code background session";;
+  esac
+  task=$(printf '%s' "$task" | tr '\r\n' '  ')
+  kickoff="You are a FRESH session replacing agent '$name' (its previous session tripped or died and was restarted $where). First run: agent-chat register $name - then run: agent-chat read."
+  if [ -n "$task" ]; then
+    kickoff="$kickoff Your task: $task"
+  elif [ -n "$report" ]; then
+    kickoff="$kickoff Then tell $report you are back: agent-chat send --to $report \"$name: respawned as a fresh session, ready for a task\" - and wait for instructions."
+  else
+    kickoff="$kickoff Then wait for instructions in the chat."
+  fi
+  [ "$bg" = 0 ] || { respawn_bg; return; }
 
   warm_terms || die "respawn: can't list the terminals right now — nothing was touched"
   term=$(resolve_term "$name"); rc=$?
@@ -1807,19 +2093,11 @@ cmd_respawn() ( # <name> [--prompt "task"] [--cmd "codex ..."] [--report-to <nam
         die "respawn: '$name' looks BUSY — refusing (--force-busy if truly stuck)"
       fi
     fi
+    # a fresh Claude session keeps the old one's flags (e.g. bypass mode)
+    if [ "$cli" = claude ] && [ "$cmd_given" = 0 ]; then cmd=$(launch_cmd "$p" spawn 2>/dev/null) || cmd=claude; fi
   fi
 
   # 3. build + validate the launch line BEFORE anything is killed
-  local kickoff launch
-  task=$(printf '%s' "$task" | tr '\r\n' '  ')
-  kickoff="You are a FRESH session replacing agent '$name' (its previous session tripped or died and was restarted in this same terminal). First run: agent-chat register $name - then run: agent-chat read."
-  if [ -n "$task" ]; then
-    kickoff="$kickoff Your task: $task"
-  elif [ -n "$report" ]; then
-    kickoff="$kickoff Then tell $report you are back: agent-chat send --to $report \"$name: respawned as a fresh session, ready for a task\" - and wait for instructions."
-  else
-    kickoff="$kickoff Then wait for instructions in the chat."
-  fi
   launch="reset; cd $(sq "$cwd") && $cmd $(sq "$kickoff")"
   printf '%s' "$launch" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 || die "respawn: launch line is not valid UTF-8 — nothing was touched"
 
@@ -1888,6 +2166,59 @@ cmd_respawn() ( # <name> [--prompt "task"] [--cmd "codex ..."] [--report-to <nam
     return 1
   fi
 )
+
+# respawn_bg — cmd_respawn's path for a Claude Code background agent, run with
+# its locals. Stops the registered job only while Claude Code's live record still
+# proves it (same session, job and process), then starts a FRESH background
+# session with the job's saved options and the kickoff on its command line.
+respawn_bg() {
+  local job="$bgjob" rec="" again pid="" flags newjob nsid deadline
+  [ "$cli" = claude ] || die "respawn: '$name' has a background registration but is a '$cli' agent"
+  if rec=$(cc_holder "$sid"); then
+    pid=$(cc_field "$rec" 1)
+    [ "$(cc_field "$rec" 4)" = "$job" ] || die "respawn: session $sid now runs as job $(cc_field "$rec" 4), not the registered $job — refusing"
+    if [ "$force_busy" = 0 ]; then
+      case "$(cc_field "$rec" 5)" in busy|shell) die "respawn: '$name' is BUSY — refusing (--force-busy if truly stuck)";; esac
+    fi
+  fi
+  if [ "$cmd_given" = 0 ]; then flags=$(job_flags "$job"); cmd="claude${flags:+ $flags}"; fi
+  launch="$cmd --bg -n $(sq "$name") $(sq "$kickoff")"
+  printf '%s' "$launch" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 || die "respawn: launch line is not valid UTF-8 — nothing was touched"
+  if [ "$dry" = 1 ]; then
+    echo "DRY RUN — would respawn '$name': ${pid:+stop background job $job (pid $pid), then }in $cwd run: $launch"
+    return 0
+  fi
+  rlog "$name: respawn (background job $job pid=${pid:-none} old=$sid report=${report:-none})"
+  date +%s > "$RESPAWN_DIR/$name.last"
+  if [ -n "$pid" ]; then
+    again=$(cc_holder "$sid") && [ "$(cc_field "$again" 1)" = "$pid" ] && [ "$(cc_field "$again" 4)" = "$job" ] \
+      && [ "$(reg_get "$name" session_id)" = "$sid" ] || die "respawn: ownership changed before stop — refusing"
+    "$(cc_bin)" stop "$job" >/dev/null 2>&1 || die "respawn: 'claude stop $job' failed"
+    deadline=$((SECONDS + 30))
+    while cc_record "$pid" >/dev/null && [ "$SECONDS" -lt "$deadline" ]; do sleep 1; done
+    cc_record "$pid" >/dev/null && die "respawn: background job $job is still running after claude stop"
+  fi
+  [ "$(reg_get "$name" session_id)" = "$sid" ] || die "respawn: identity rebound while stopping — refusing to launch"
+  newjob=$(bg_launch "$cwd" "$launch") || { rlog "$name: FAILED no new background session"; die "respawn: old job stopped, but the new background session didn't start"; }
+  rlog "$name: fresh background session $newjob"
+  echo "Respawned '$name' as background session $newjob (old job $job stopped) in $cwd."
+  [ "$wait" = 1 ] || { echo "Not waiting for it to re-register (--no-wait)."; return 0; }
+  deadline=$((SECONDS + 180)); nsid=""
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    sleep 5
+    nsid=$(reg_get "$name" session_id)
+    if [ -n "$nsid" ] && [ "$nsid" != "$sid" ] && [ "$(reg_get "$name" term_addr)" = "$newjob" ]; then break; fi
+    nsid=""
+  done
+  if [ -n "$nsid" ]; then
+    rlog "$name: re-registered as session $nsid"
+    echo "Re-registered: '$name' -> session $nsid (background job $newjob)."
+  else
+    rlog "$name: WARNING not re-registered after 180s"
+    echo "WARNING: '$name' has not re-registered after 180s — look: agent-chat screen $name (or claude attach $newjob)"
+    return 1
+  fi
+}
 
 # ---------- watch (blocking fleet watchdog) ----------
 #
@@ -1972,12 +2303,13 @@ Re-arm (as a background shell again): agent-chat watch $argv"
       case "$state" in
         dead)    kind=dead;;
         offline) kind=offline;;
+        stopped) kind=stopped;;
         unlocated) kind=unlocated; line="$why";;
         busy) ;;
         *)
           tb=""; ta=""
           read -r tb ta <<< "$(resolve_term "$n" 2>/dev/null)"
-          if [ -n "$ta" ]; then
+          if [ -n "$ta" ] && [ "$tb" != bg ]; then   # (a background session has no screen to classify)
             scr=$(term_screen "$tb" "$ta" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 16)
             cls=$(watch_classify "$scr")
             if [ -n "$cls" ]; then kind="${cls%%$'\t'*}"; line="${cls#*$'\t'}"; fi
@@ -1997,7 +2329,7 @@ Re-arm (as a background shell again): agent-chat watch $argv"
       # every condition must hold on two polls in a row: not a frame mid-redraw,
       # not one bad terminal snapshot (idle is already a long-lived condition)
       case "$kind" in
-        dead|offline|unlocated|filter|error|limit|paste)
+        dead|offline|stopped|unlocated|filter|error|limit|paste)
           pend=$(cat "$WATCH_DIR/$n.pending" 2>/dev/null)
           [ "$pend" = "$sig" ] || { printf '%s' "$sig" > "$WATCH_DIR/$n.pending"; continue; };;
       esac
@@ -2006,6 +2338,7 @@ Re-arm (as a background shell again): agent-chat watch $argv"
       case "$kind" in
         dead)    out="DEAD — its $(reg_get "$n" cli) exited/crashed ($why)";;
         offline) out="OFFLINE — $why";;
+        stopped) out="STOPPED — $why (never auto-respawned: resuming keeps its context, a respawn would not)";;
         unlocated) out="UNLOCATED — cannot watch this worker ($why); terminal control and auto-respawn are disabled";;
         filter)  out="CONTENT-FILTER TRIP — the chat is gated (do NOT type into it)";;
         error)   out="ERROR — $(printf '%s' "$line" | sed 's/^[[:space:]]*//' | cut -c1-160)";;
@@ -2205,6 +2538,11 @@ case "$cmd" in
   _session-proof) session_proof "$@";;
   _shell-proof) shell_proof "$@";;
   _process-token) process_token "$@";;
+  _cc-holder)   cc_holder_line "$@";;
+  _launch-cmd)  launch_cmd "$@";;
+  _job-flags)   job_flags "$@";;
+  _screen)      term_screen "$@";;
+  _term-by-tty) term_by_tty "$@";;
   web)        cmd_web "$@";;
   hook)       cmd_hook "$@";;
   help|--help|-h)

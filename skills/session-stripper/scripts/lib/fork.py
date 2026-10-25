@@ -20,13 +20,30 @@ Returns the absolute Path of the new JSONL.
 from __future__ import annotations
 
 import json
+import os
 import re
 import uuid as _uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .chain import dump_line
+
 TOOL_NAME = "session-stripper"
 DEFAULT_SUFFIX = "Stripped"
+
+# Records that belong to the original session, not to its conversation. CC's
+# own `--fork-session` does not carry them (checked on 2.1.302/2.1.310):
+#   bridge-session  — its Remote Control link; two sessions on one bridge
+#                     would receive each other's claude.ai messages
+#   continued-in    — "this session went on as <id>": a fork that kept it
+#                     would point resumes elsewhere
+#   cost-state      — the original's spend and timers
+#   api-request*    — the journal of requests the original sent (a fork
+#                     starts its own; resume rebuilds from the chain anyway)
+SESSION_BOUND_TYPES = frozenset({
+    "bridge-session", "continued-in", "cost-state",
+    "api-request", "api-request-blob", "api-request-shape",
+})
 
 
 def _read_envelopes(path: Path):
@@ -42,7 +59,8 @@ def _read_envelopes(path: Path):
 def _write_envelopes(path: Path, envelopes):
     with open(path, "w", encoding="utf-8") as f:
         for e in envelopes:
-            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+            f.write(dump_line(e))
+    os.chmod(path, 0o600)
 
 
 def _existing_titles(project_dir: Path) -> set[str]:
@@ -144,6 +162,8 @@ def fork_session(session_path, *,
 
     forked: list[dict] = []
     for env in envelopes:
+        if env.get("type") in SESSION_BOUND_TYPES:
+            continue
         # Pass through meta-only entries that aren't part of the conversation
         # chain unchanged in shape — but rewrite their sessionId so the entire
         # file is internally consistent.

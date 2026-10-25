@@ -327,6 +327,31 @@ def analyze_session(session_path, show_cut_points=True):
         print(f"  → stripper strip-tools clears these alongside their tool_result block.")
         print()
 
+    # ── 3c. Recorded system prompt and request journal (CC >= 2.1.267/2.1.300)
+    # The latest prompt_snapshot is the system prompt + tools every request
+    # sends (real context, not strippable). api-request* lines journal what was
+    # sent, for sharing a transcript; resume rebuilds from the chain, so they
+    # are file size only. Neither is ever dropped.
+    from .attachment_cost import snapshot_chars
+    snaps = [o for o in objects if o.get("type") == "attachment"
+             and (o.get("attachment") or {}).get("type") == "prompt_snapshot"]
+    journal = [o for o in objects if str(o.get("type", "")).startswith("api-request")]
+    if snaps or journal:
+        print("-" * 72)
+        print("RECORDED BY CLAUDE CODE (kept by every command)")
+        print("-" * 72)
+        print()
+        if snaps:
+            snap_tok = estimate_tokens(snapshot_chars(snaps[-1]["attachment"]))
+            stats["prompt_snapshot_tokens"] = snap_tok
+            print(f"  System prompt + tools (latest of {len(snaps)} prompt_snapshot): ~{snap_tok:,} tokens,")
+            print(f"  sent on every request — included in the context estimate, not strippable.")
+        if journal:
+            jchars = sum(len(json.dumps(o, ensure_ascii=False)) for o in journal)
+            print(f"  Request journal (api-request*): {len(journal):,} lines, {jchars:,} chars on disk —")
+            print(f"  never sent to the model; resume rebuilds the request from the chain.")
+        print()
+
     # ── 4. Cut point candidates ─────────────────────────────────────────
 
     if show_cut_points:

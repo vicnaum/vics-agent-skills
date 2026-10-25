@@ -53,7 +53,12 @@ Stripping shrinks the pending copy on disk, but the running CLI keeps its pre-st
 - **In-place strip of the current session**: strip (writes the pending copy), then `respawn.sh --swap <session.jsonl>.pending`. The watcher runs `apply` after process death; if apply refuses, it relaunches the UNSTRIPPED session and says so in the kickoff prompt (fail-open).
 - **Forked strip** (new session id from `--fork`): no swap needed — `respawn.sh <new-session-id>`.
 
-Call `respawn.sh` as the LAST action, then end the turn (see the respawn skill). Without respawn, tell the user to `/exit`, then run `apply` yourself from any shell, then `claude -r <id>`.
+This works the same for a Claude Code **background session** (`claude --bg`, or moved there with `←` / `/background`): respawn stops it through the daemon, applies the swap and resumes the same job.
+
+Call `respawn.sh` as the LAST action, then end the turn (see the respawn skill). Without respawn, the manual steps depend on where the session runs:
+
+- **In a terminal:** `/exit`, `apply` from any shell, `claude -r <id>`.
+- **In the background** (`claude agents` lists it, or `$CLAUDE_JOB_DIR` is set): `/exit` in an attached terminal only detaches, and `claude -r` refuses while it runs. Run `claude stop <job>`, wait a few seconds, `apply`, then `claude attach <job>` (or `claude --bg --resume <id>`).
 
 ## Quick Reference
 
@@ -105,7 +110,7 @@ To fix this, `strip-tools`, `strip-thinking`, and `strip-all` now **automaticall
 
 - Opt out with `--no-usage-reset`.
 - Run it standalone with `reset-usage` on an already-stripped session whose meter is still stuck (no need to re-strip). It also accepts `--fork`.
-- The estimate counts message content **and attachments** (which CC re-sends every request). It still excludes the runtime system prompt + tool schemas (added at send time, unknowable offline), so it's a floor — the first live turn corrects it precisely.
+- The estimate counts message content **and attachments** (which CC re-sends every request). It also counts the system prompt + tool schemas when the session recorded them (`prompt_snapshot`, CC ≥ 2.1.267). Older sessions don't have that record, so for them the estimate is a floor. Either way, the first live turn corrects it precisely.
 
 > **The gauge can only lie in your favour.** Because the reset writes an *estimate* into the JSONL, a session that was barely stripped will still show a reassuring number — and then snap back to ~100% on the first real turn, which is the only number that was ever measured. If a strip freed little, the meter dropping is not evidence that it worked. Check what `analyze` says is left, and treat a real API turn (one with non-zero `cache_read`/`cache_creation`) as the only ground truth. Attachments were excluded from this estimate until they were found to be worth six figures of tokens on long sessions — that omission made the gauge read far below the true prompt size.
 
@@ -186,6 +191,12 @@ stripper strip-attachments <session.jsonl> --types task_reminder,hook_success --
 # that tell the model which tools and skills exist.
 stripper strip-attachments <session.jsonl> --types skill_listing --drop-all
 ```
+
+**Hook-injected context is always kept.** `hook_additional_context` (a PostToolUse/UserPromptSubmit hook's `additionalContext`) and `hook_blocking_error` (a Stop hook's block reason) are how hooks hand the model information mid-session; agent-chat delivers every peer message this way. An older policy kept only the last 2. An older cost model also sized PostToolUse context at 0, and that error is the only reason most mail survived.
+
+**Records that build the system prompt are kept and are not messages.** `prompt_snapshot` is the system prompt + tool list Claude Code records once and reuses on every request and resume. Only the latest one counts, and it is counted once in the context estimate. `deferred_tools_record` holds the schemas of tools loaded through ToolSearch.
+
+**Cost is exact where Claude Code stored it.** Since CC 2.1.277 attachment lines carry `rendered`: the content blocks actually sent, reused on resume instead of rendered again. `--list` and the estimates use it, and fall back to the per-type model only for older lines.
 
 **Unknown attachment types are always kept** and sized conservatively. CC adds and renames these between releases (`total_tokens_reminder` became `token_usage`), so the policy never drops what it doesn't recognize.
 
@@ -318,6 +329,7 @@ Matches Claude Code's `/branch` convention exactly (verified against `~/github/c
 
 - New `sessionId` (random UUID), written to `<project-dir>/<newSessionId>.jsonl`
 - `forkedFrom = {sessionId: <original>, messageUuid: <env's original uuid>}` on every conversation envelope
+- Records bound to the original session are not copied, matching CC's own `--fork-session`: `bridge-session` (its Remote Control link), `continued-in`, `cost-state`, and the `api-request*` journal
 - Root envelope's `parentUuid` stays `null` (CC convention; the fork pointer is `forkedFrom`)
 - A `custom-title` entry appended with " (Stripped)" suffix; collisions auto-increment to "(Stripped 2)", etc. `--fork-title` overrides
 - **Plus a session-stripper-specific** `strippedBy = {tool, operation, at}` field on every envelope so future tooling can show strip lineage. CC ignores unknown fields, so this doesn't break anything.
@@ -452,6 +464,9 @@ Output is a new session file. Resume with `claude -r <session-id>`.
 - **`strip-thinking` alone is usually a rounding error.** Thinking is often only ~3% of a session. If a session keeps hitting the context limit right after a strip, check *which* strip ran: the `strippedBy` stamp on every forked envelope records the exact operation. A session stripped three times with `strip-thinking` has been stripped ~9%.
 - **Thinking weight is mostly the encrypted `signature`, not the text.** Recent sessions store each thinking block as near-empty `thinking` text plus a signature of several thousand chars (one real session: 801 readable chars vs 104,624 signature chars across 30 blocks). `strip-thinking`, `show-thinking` and `persist-thinking(s)` size blocks as text + signature, and `analyze` sizes whole blocks. The `<persisted-thinking>` marker still advertises only the readable chars, because that is all the sidecar holds. The off-chain line of `strip-thinking` stays text-only on purpose: it reports signature-only blocks as "already emptied", since those blocks are not removed. A savings report near 0 while `analyze` shows a large thinking bucket means a pre-fix version.
 - **Attachments are real context, not metadata** — CC re-expands each into a `<system-reminder>` on every request and never dedupes them. They are also `parentUuid` chain participants, so they cannot simply be deleted; `strip-attachments` re-parents their children. See the attachments section above.
+- **Every write is compact JSON, mode 0600, the way CC writes.** Claude Code's fast transcript scanner matches raw bytes such as `{"parentUuid":` and `"type":"last-prompt"`. A file written with Python's default `", "`/`": "` separators looks empty to it. Incident 2026-10-25 (CC 2.1.310): after a strip, the background-session dispatcher decided there was nothing to restore. It started a fresh conversation under the same id and moved the stripped file aside as `<id>.orphaned-<ts>-<rand>.jsonl`. A plain `claude -r` still loaded the file, because it parses fully. If you find such an `.orphaned-` file, it holds the real conversation; nothing was deleted.
+- **`last-prompt` records point at the resume leaf** (`leafUuid`). Removing a record re-points them at the nearest surviving ancestor, as it does for children.
+- **The request journal is not context.** Since CC 2.1.300, transcripts record every request (`api-request`, `api-request-blob`, `api-request-shape`; often 10-15% of the file), so a shared transcript can reproduce it. Resume rebuilds the request from the chain (verified: the first request after a swap starts with `keep: 0`), so stripping works regardless; `analyze` shows the journal as on-disk only.
 - No external dependencies -- Python 3.8+ stdlib only
 
 For the full technical deep-dive, see [references/surgery-report.md](references/surgery-report.md).
