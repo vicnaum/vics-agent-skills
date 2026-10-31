@@ -412,7 +412,7 @@ A Claude Code status line that shows how much of your weekly plan is left and ho
 ![Status line: Opus 5.5 (medium), weekly usage 95% at pace ×3.0, context 8%](extras/claude-statusline/screenshot.png)
 
 - **`Opus 5.5 (medium)`**: the model and the reasoning effort.
-- **`[95% ×3.0]`**: weekly (7-day) usage, then the pace. The pace is the share of the week left divided by the share of the limit left. `×1.0` means you're on track for an even spread. `×2.0` means you have half the budget the calendar says you should, so slow down to half your average rate until the reset. The usual used-vs-elapsed ratio drifts toward 1.0 near the end of the week however far behind you are. This one reads ×2.4 with 10% left and 24% of the week to go.
+- **`[95% ×3.0]`**: weekly (7-day) usage, then the pace. The pace is the share of the week left divided by the share of the limit left. `×1.0` means you're on track for an even spread. `×2.0` means you have half the budget the calendar says you should, so slow down to half your average rate until the reset.
 - **The bar**: how full the context window is, with the percentage inside.
 
 Usage and context turn yellow at 50% and red at 80%. The pace turns yellow at ×1.0 and red at ×1.25.
