@@ -401,6 +401,30 @@ Style flags:
 Symlink `skills/slopcheck/scripts/slopcheck`, `scripts/slopmark` and `scripts/structcheck` onto your PATH, then run `slopcheck install`. It backs up `~/.claude/settings.json` and `~/.claude/CLAUDE.md`, wires the hooks and the reminder, and writes the rules block into CLAUDE.md between markers. `slopcheck install-structure` adds the structure layer. The full steps and the config are in the skill.
 
 
+## Extras
+
+One-time setups that aren't skills. They stay out of `skills/` so they don't add to every session's skill list. Point an agent at the README to install one.
+
+### [claude-statusline](extras/claude-statusline/README.md)
+
+A Claude Code status line that shows how much of your weekly plan is left and how full the context is:
+
+![Status line: Opus 5.5 (medium), weekly usage 95% at pace ×3.0, context 8%](extras/claude-statusline/screenshot.png)
+
+- **`Opus 5.5 (medium)`**: the model and the reasoning effort.
+- **`[95% ×3.0]`**: weekly (7-day) usage, then the pace. The pace is the share of the week left divided by the share of the limit left. `×1.0` means you're on track for an even spread. `×2.0` means you have half the budget the calendar says you should, so slow down to half your average rate until the reset. The usual used-vs-elapsed ratio drifts toward 1.0 near the end of the week however far behind you are. This one reads ×2.4 with 10% left and 24% of the week to go.
+- **The bar**: how full the context window is, with the percentage inside.
+
+Usage and context turn yellow at 50% and red at 80%. The pace turns yellow at ×1.0 and red at ×1.25.
+
+> Needs `jq`. Runs on macOS and Linux; on Windows, use WSL or Git Bash.
+
+#### Example ask
+
+```
+Install the status line from extras/claude-statusline/README.md
+```
+
 ## Install / use
 
 ### Cursor
