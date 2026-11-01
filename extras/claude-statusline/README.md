@@ -10,7 +10,7 @@ Not a skill: a one-time install, kept out of `skills/` so it doesn't sit in ever
 |---|---|---|
 | `Opus 5.5 (medium)` | `.model.display_name`, `.effort.level` | Model (the `(1M context)` suffix is trimmed) and reasoning effort. |
 | `[95% …]` | `.rate_limits.seven_day.used_percentage` | Weekly (7-day) plan usage. Present only on Pro/Max subscription auth, after the first response. |
-| `×3.0` | `.rate_limits.seven_day.resets_at` | Pace: share of the week left divided by share of the limit left. `1.0` = on track for an even spread. `2.0` = half the budget the calendar says should remain, so spend at half the average rate until reset. Capped at `9.9` (limit exhausted). |
+| `×3.0` | `.rate_limits.seven_day.resets_at` | Pace: share of the week left divided by share of the limit left. `1.0` = on track for an even spread. `2.0` = half the budget the calendar says should remain, so spend at half the average rate until reset. Capped at `9.99` (limit exhausted). |
 | `8%` bar | `.context_window.total_input_tokens / context_window_size` | Context window fill. |
 
 Colors: usage and context are green under 50%, yellow under 80%, red beyond. Pace is green under ×1.0, yellow to ×1.25, red beyond.

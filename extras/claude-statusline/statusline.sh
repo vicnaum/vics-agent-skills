@@ -40,7 +40,7 @@ if [ -n "$weekly_raw" ] && [ -n "$resets_at" ]; then
   if (( left >= 0 && left <= WEEK )); then
     pace=$(awk -v u="$weekly_raw" -v l="$left" -v w="$WEEK" \
       -v m="${STATUSLINE_PACE_MARGIN:-1}" \
-      'BEGIN { b = 100 - u; p = (b > 0) ? m * (l * 100 / w) / b : 9.9; if (p > 9.9) p = 9.9; printf "%.1f", p }')
+      'BEGIN { b = 100 - u; p = (b > 0) ? m * (l * 100 / w) / b : 9.99; if (p > 9.99) p = 9.99; printf "%.2f", p }')
   fi
 fi
 
