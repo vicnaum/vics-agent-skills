@@ -44,6 +44,16 @@ Requires bash, `jq` (`brew install jq` / `apt install jq`), awk. macOS or Linux;
 
    Expect a magenta `Opus` and a green bar with `25%`.
 
+## Safe version
+
+To keep a buffer, make the pace read 10% high: an even spread then shows `×1.1` instead of `×1.0`, and the yellow and red colors kick in sooner. Use this command in step 2 instead:
+
+```json
+"statusLine": { "type": "command", "command": "STATUSLINE_PACE_MARGIN=1.1 ~/.claude/statusline.sh" }
+```
+
+Any factor works: `1.2` for a 20% buffer, `1` (the default) for the plain version.
+
 ## Customizing
 
 The script reads all fields in one `jq` call near the top, then appends segments to `$out`. To add a field (for example `.session_id` or `.workspace.current_dir`), add it to the `jq` `@sh` string and append a segment before the final `printf`. Full field list: https://code.claude.com/docs/en/statusline.md

@@ -417,6 +417,8 @@ A Claude Code status line that shows how much of your weekly plan is left and ho
 
 Usage and context turn yellow at 50% and red at 80%. The pace turns yellow at ×1.0 and red at ×1.25.
 
+There's also a **safe version** that shows the pace 10% high, so you keep a buffer. You turn it on with one setting; see the [README](extras/claude-statusline/README.md#safe-version).
+
 > Needs `jq`. Runs on macOS and Linux; on Windows, use WSL or Git Bash.
 
 #### Example ask

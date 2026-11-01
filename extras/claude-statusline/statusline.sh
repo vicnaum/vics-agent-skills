@@ -32,13 +32,15 @@ level_code() {
 # weekly pace: share of the week left vs share of the limit left.
 # 1.0x = on track for an even spread; 2.0x = only half the budget the clock says you should still have,
 # i.e. you must spend at half the average rate until reset. Below 1.0x you have budget to spare.
+# STATUSLINE_PACE_MARGIN scales the shown pace (1.1 = safe version: reads 10% high, so you keep a buffer).
 WEEK=604800
 pace=""
 if [ -n "$weekly_raw" ] && [ -n "$resets_at" ]; then
   left=$(( resets_at - $(date +%s) ))
   if (( left >= 0 && left <= WEEK )); then
     pace=$(awk -v u="$weekly_raw" -v l="$left" -v w="$WEEK" \
-      'BEGIN { b = 100 - u; p = (b > 0) ? (l * 100 / w) / b : 9.9; if (p > 9.9) p = 9.9; printf "%.1f", p }')
+      -v m="${STATUSLINE_PACE_MARGIN:-1}" \
+      'BEGIN { b = 100 - u; p = (b > 0) ? m * (l * 100 / w) / b : 9.9; if (p > 9.9) p = 9.9; printf "%.1f", p }')
   fi
 fi
 
