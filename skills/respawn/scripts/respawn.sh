@@ -140,6 +140,8 @@ fi
 if [ -z "$KICKOFF" ]; then
   if [ -n "$SWAP" ]; then
     KICKOFF="[respawn] Your CLI was restarted after a session strip: the stripped pending copy was swapped in while the CLI was dead. The tail of your final pre-restart turn (the stripping commands themselves) was discarded by design — do NOT re-run the strip. Re-read your recent context and continue where you left off."
+  elif [ "$SID" != "$ORIGIN_SID" ]; then
+    KICKOFF="[respawn] Your CLI was restarted into the stripped fork of your session (new session id $SID; the original $ORIGIN_SID is untouched). The stripping turn itself is not in the fork — do NOT re-run the strip. Anything keyed to the old id is stale: if you were registered on agent-chat, register again under the same name (agent-chat register NAME). Re-read your recent context and continue where you left off."
   else
     KICKOFF="[respawn] Your CLI was restarted, resuming your session. Re-read your recent context and continue exactly where you left off."
   fi

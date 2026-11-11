@@ -5,11 +5,12 @@ content type and tool name, cut point candidates, and chain health checks.
 """
 
 import json
+from pathlib import Path
 from collections import Counter, defaultdict
 
 from .chain import (load_session, build_uuid_index, walk_active_chain, count_content_chars,
                     estimate_tokens, compact_relink, effective_parent, obj_image_tokens,
-                    session_model)
+                    session_model, calibration, compute_active_chain_tokens)
 from .image_tokens import content_image_stats, tier_for_model
 from .strip_attachments import collect_stats as collect_attachment_stats
 
@@ -59,7 +60,7 @@ def _build_tool_result_index(chain):
     return index
 
 
-def analyze_session(session_path, show_cut_points=True):
+def analyze_session(session_path, show_cut_points=True, cal=None):
     """Analyze a Claude Code JSONL session and print a formatted report.
 
     Args:
@@ -231,6 +232,42 @@ def analyze_session(session_path, show_cut_points=True):
         print(f"  (ceil(w/28)×ceil(h/28) after resize to ≤{tier.max_edge}px / "
               f"≤{tier.max_tokens:,} tokens; chars/4 on their base64 would say "
               f"{image_tokens_naive:,}) → list-images, replace-images, strip-tools")
+    print()
+
+    # ── 2a. Context estimate, calibrated to what CC actually measured ───
+    # chars/4 is an English rule of thumb: measured 1.16x low on an English
+    # coding session and 1.5x low on a Russian one. The newest assistant turn
+    # with real usage says what this session's content really costs.
+    raw_ctx = compute_active_chain_tokens(objects, uuid_index)
+    if cal is None:
+        cal = calibration(objects, uuid_index)
+    stats["context_estimate_raw"] = raw_ctx
+    stats["calibration"] = cal
+    stats["context_estimate"] = (compute_active_chain_tokens(objects, uuid_index,
+                                                             factor=cal["factor"])
+                                 if cal else raw_ctx)
+    print("-" * 72)
+    print("CONTEXT ESTIMATE (what the next request sends, system prompt included)")
+    print("-" * 72)
+    print()
+    print(f"  chars/4 + image formula:      {raw_ctx:>12,}")
+    if cal:
+        if cal.get("inherited_from"):
+            print(f"  Scale inherited from the original this fork was stripped from "
+                  f"({Path(cal['inherited_from']).stem}):")
+            print(f"    measured {cal['real']:,} where the estimate said {cal['estimate']:,} "
+                  f"→ text ×{cal['factor']:.2f}")
+        else:
+            print(f"  Measured by the API at pos {cal['pos']}: {cal['real']:>9,}  "
+                  f"(the estimate said {cal['estimate']:,} for that prompt → text ×{cal['factor']:.2f})")
+        print(f"  Calibrated estimate now:      ~{stats['context_estimate']:,}")
+        print(f"  Strip commands, the context gauge reset and their reports use this "
+              f"scale for this session.")
+    else:
+        print("  No measured API usage on the chain (fresh session, or its usage was "
+              "rewritten by a strip):")
+        print("  this is the uncalibrated chars/4 figure, which runs 1.2–1.5x low on "
+              "real sessions.")
     print()
 
     # ── 2b. Attachment breakdown ────────────────────────────────────────

@@ -24,6 +24,8 @@ No external dependencies — Python 3.8+ stdlib only, mirroring the production c
 | `test_chain_integrity_after_persist.py` | Cross-cutting: every persist command leaves the parentUuid chain unbroken, slug consistent, timestamps monotonic. |
 | `test_compact_relink.py` | Records a compact boundary preserves (`preservedMessages` / `preservedSegment`, CC ≥ 2.1.3xx) are on the chain the way CC splices them in; deleting one prunes the list; a broken list fails `verify`/`apply`; `compact` chains copies in chain order. |
 | `test_nested_images.py` | Images nested inside a `tool_result` are listed, replaced, stripped (also under `--keep-last-lines`), and priced by the pixel formula in `analyze` and the gauge estimate. |
+| `test_fork_first.py` | Mutating commands write a fork by default and never the original; back-to-back passes reuse an unresumed fork; a resumed fork is never edited; `--new-fork`, `--in-place`, dry runs, stale pending copies. |
+| `test_calibration.py` | Estimates are scaled to the session's last REAL API measurement (cache fields non-zero); rewritten usage and older turns don't count; the gauge reset lands on the calibrated size; forks keep the factor in their state. |
 | `test_image_tokens.py` | The vision docs' token table on both resolution tiers, the resize reference, model → tier mapping, the header parsers. |
 
 ## Expected state right now (before the persist-everything implementation lands)

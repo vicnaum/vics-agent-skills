@@ -25,40 +25,60 @@ python3 "$SKILL" strip-all "$SESS"
 
 When the user names a *specific* session id or file (e.g. "strip session abc123"), use that instead; `current` is only for "strip *this*/*my* session".
 
-## Copy-first: mutations never touch the real session file
+## Fork-first: mutations never touch the session you pass
 
-**Mutating commands do not write the session file you pass.** They snapshot it to `<session>.jsonl.pending`, mutate only that copy, and print the apply hint. The original stays byte-identical until you run `apply`, which swaps the copy in with one atomic rename:
+**Mutating commands write a fork by default.** The result is a new session, `<newSessionId>.jsonl` next to the original, with `forkedFrom` stamped on every record. The original is only read. Every command ends with the resume line:
 
 ```bash
-python3 stripper.py strip-all <session.jsonl>     # writes <session.jsonl>.pending, NOT the original
-python3 stripper.py verify  <session.jsonl>.pending
-python3 stripper.py apply   <session.jsonl>       # atomic swap (only write to the real file)
+python3 stripper.py strip-all <session.jsonl>
+# ...
+# Stripped session: ~/.claude/projects/<dir>/<newSessionId>.jsonl
+# Resume it:        claude -r <newSessionId>
 ```
 
-Why (incident 2026-08-05): a running CC CLI flushes appends to its JSONL every 100ms, takes no lock, and `--resume` silently truncates the chain at the first missing `parentUuid`. Any in-place rewrite of a live session races those appends — one live `compact-range` collapsed a 763-message chain to 14. Copy-first makes that impossible at the architecture level: there is no in-place write left to race.
+Nothing has to be swapped in, and nothing the original records later is ever discarded. The original can keep running while you strip; quit it whenever you like and `claude -r <newSessionId>`. If you kept working in the original after stripping, its newer turns are not in the fork: strip again (`--new-fork`) to include them.
+
+Why (incident 2026-11-11): the old default wrote `<session>.jsonl.pending` and needed the CLI to quit so `apply` could swap it in. The user kept working in the session meanwhile, so the copy went stale: swapping it in would have discarded those turns, and the session never got smaller. Before that (incident 2026-08-05), in-place rewrites raced the live CLI's appends; one collapsed a 763-message chain to 14. A fork has neither problem.
 
 Mechanics:
 
-- Multi-pass strips reuse the same pending copy (`analyze` → `compact-range` → `strip-tools` → …), so iterate freely. `snapshot --refresh` discards it and re-snapshots.
-- `apply` accepts either path (original or `.pending`) and refuses to swap when: the original is **being written right now** (it grew during a 400ms settle check — a live CLI is appending), the original was **rewritten since the snapshot** (prefix-hash mismatch: the copy no longer descends from it — re-snapshot), or the pending copy **fails `verify`**. Refusals leave everything in place.
-- Anything appended to the original *after* the snapshot is **discarded by apply, by design** (counted and reported). In the self-strip flow that tail is the stripping turn itself — noise the session is better off without. Don't snapshot a session mid-way through work you care about.
-- The one `.bak` of the original is made at apply time. While mutating the pending copy no `.bak`s are written — the untouched original *is* the backup.
-- `--fork` is unchanged and needs no apply: the fork is a brand-new file no CLI writes to, so it is mutated directly.
-- A `"Prompt is too long"` session can't run anything, so its file is quiescent even if the stuck CLI is still open — strip + `apply` immediately, then `claude -r <id>`.
+- **Back-to-back passes build ONE fork.** A second mutating command on the same session reuses its fork while nobody has resumed it (`analyze` → `persist-range` → `strip-all` → …). It says so, and notes if the original has grown since. A command aimed at the fork itself edits it in place, too.
+- **A resumed fork is never edited.** The stripper records each fork's size and mtime after its last write, in `<fork>.jsonl.stripper.json` (outside CC's `*.jsonl` glob). Once a CLI has appended to the fork, the next command forks the original afresh. `--new-fork` always takes a fresh one.
+- Dry runs never create a fork.
+- No `.bak`s are written while mutating a fork: the untouched original is the backup.
+- `compact` always writes a new session file anyway. `migrate-persisted` moves shared sidecar files on disk, so it keeps the in-place flow below.
+- After a fork, anything keyed to the old session id is stale; for example, re-register on agent-chat in the resumed session.
+
+### `--in-place`: keep the session id
+
+For a session that must keep its id, `--in-place` keeps the older copy-first flow. It mutates `<session>.jsonl.pending` and swaps it over the original with one atomic rename:
+
+```bash
+python3 stripper.py strip-all <session.jsonl> --in-place   # writes <session.jsonl>.pending
+python3 stripper.py apply     <session.jsonl>              # the one write to the real file
+```
+
+- Multi-pass `--in-place` strips reuse the same pending copy. `snapshot --refresh` re-snapshots.
+- `apply` accepts either path (original or `.pending`). It refuses to swap when the original is **being written right now** (it grew during a 400ms settle check), when the original was **rewritten since the snapshot** (prefix-hash mismatch), or when the pending copy **fails `verify`**. Refusals leave everything in place.
+- Anything appended to the original *after* the snapshot is **discarded by apply**, by design (counted and reported). In the self-strip flow that tail is the stripping turn itself.
+- **`apply` refuses if someone typed messages into the session after the snapshot**: the copy is stale, and swapping it in would discard them. Slash commands, tool results and task notifications don't count, so the self-strip tail never trips this. Strip again (a fork loses nothing), or pass `--discard-tail`. `analyze` and fork-mode commands also warn when a stale copy is lying around.
+- The one `.bak` of the original is made at apply time.
+- A `"Prompt is too long"` session can't run anything, so its file is quiescent even if the stuck CLI is still open.
 
 ## Restarting into the stripped session (respawn)
 
-Stripping shrinks the pending copy on disk, but the running CLI keeps its pre-strip context until it restarts — and for your OWN session the apply must happen while the CLI is dead. The **`respawn` skill**'s watcher does exactly that: it `/exit`s the CLI, waits for the process to die, applies the swap in that dead window, and relaunches:
+The running CLI keeps its pre-strip context until it restarts into the stripped file. The **`respawn` skill** quits the CLI and relaunches it for a session stripping itself:
 
-- **In-place strip of the current session**: strip (writes the pending copy), then `respawn.sh --swap <session.jsonl>.pending`. The watcher runs `apply` after process death; if apply refuses, it relaunches the UNSTRIPPED session and says so in the kickoff prompt (fail-open).
-- **Forked strip** (new session id from `--fork`): no swap needed — `respawn.sh <new-session-id>`.
+- **Fork (default):** `respawn.sh <newSessionId>`. Nothing to swap.
+- **`--in-place` strip:** `respawn.sh --swap <session.jsonl>.pending`. The watcher runs `apply` after the process has died. If apply refuses, it relaunches the UNSTRIPPED session and says so in the kickoff prompt (fail-open).
 
-This works the same for a Claude Code **background session** (`claude --bg`, or moved there with `←` / `/background`): respawn stops it through the daemon, applies the swap and resumes the same job.
+This works the same for a Claude Code **background session** (`claude --bg`, or moved there with `←` / `/background`): respawn stops it through the daemon and resumes it.
 
-Call `respawn.sh` as the LAST action, then end the turn (see the respawn skill). Without respawn, the manual steps depend on where the session runs:
+Call `respawn.sh` as the LAST action, then end the turn (see the respawn skill). Stripping **another** session (not your own): strip it into a fork and hand over `claude -r <newSessionId>`; the user restarts it. Without respawn:
 
-- **In a terminal:** `/exit`, `apply` from any shell, `claude -r <id>`.
-- **In the background** (`claude agents` lists it, or `$CLAUDE_JOB_DIR` is set): `/exit` in an attached terminal only detaches, and `claude -r` refuses while it runs. Run `claude stop <job>`, wait a few seconds, `apply`, then `claude attach <job>` (or `claude --bg --resume <id>`).
+- **Fork, in a terminal:** `/exit`, then `claude -r <newSessionId>`.
+- **`--in-place`, in a terminal:** `/exit`, `apply` from any shell, `claude -r <id>`.
+- **In the background** (`claude agents` lists it, or `$CLAUDE_JOB_DIR` is set): `/exit` in an attached terminal only detaches. Run `claude stop <job>`, wait a few seconds, then `claude --bg --resume <newSessionId>` (fork), or `apply` and `claude attach <job>` (`--in-place`).
 
 ## Quick Reference
 
@@ -68,7 +88,8 @@ Run scripts from `<skill-dir>/scripts/`:
 # Analyze session — token breakdown by type and tool name, cut points, health check
 python3 <skill-dir>/scripts/stripper.py analyze <session.jsonl>
 
-# Strip all tool content + thinking (most common — frees 60-90% of context)
+# Strip all tool content + thinking (most common — frees 60-90% of context).
+# Writes a fork and prints `claude -r <newSessionId>`; the original is untouched.
 python3 <skill-dir>/scripts/stripper.py strip-all <session.jsonl>
 
 # Strip only specific tools, keep last 3 lines of results
@@ -87,8 +108,8 @@ python3 <skill-dir>/scripts/stripper.py compact <session.jsonl> --before 150
 # Verify chain integrity
 python3 <skill-dir>/scripts/stripper.py verify <session.jsonl>
 
-# Copy-first plumbing: explicit snapshot; atomic swap of the pending copy
-python3 <skill-dir>/scripts/stripper.py snapshot <session.jsonl>            # optional — mutating commands auto-create it
+# --in-place plumbing (keep the session id): explicit snapshot; atomic swap of the pending copy
+python3 <skill-dir>/scripts/stripper.py snapshot <session.jsonl>            # optional — --in-place commands auto-create it
 python3 <skill-dir>/scripts/stripper.py apply <session.jsonl>               # THE one write to the real file
 python3 <skill-dir>/scripts/stripper.py apply <session.jsonl> --dry-run     # run all apply checks, swap nothing
 
@@ -109,10 +130,16 @@ All commands support `--dry-run` (report only) and `--no-backup` (skip backup). 
 To fix this, `strip-tools`, `strip-thinking`, and `strip-all` now **automatically rewrite the stale `usage` counts** to the post-strip active-chain content estimate once stripping finishes. Every assistant turn whose recorded context exceeds the estimate is capped down to it (smaller turns are left alone), and the active chain's final assistant turn is pinned to the estimate — even if it recorded 0 (e.g. a blocked "Prompt is too long" turn). The next real turn re-establishes exact counts.
 
 - Opt out with `--no-usage-reset`.
-- Run it standalone with `reset-usage` on an already-stripped session whose meter is still stuck (no need to re-strip). It also accepts `--fork`.
+- Run it standalone with `reset-usage` on an already-stripped session whose meter is still stuck (no need to re-strip).
 - The estimate counts message content **and attachments** (which CC re-sends every request). It also counts the system prompt + tool schemas when the session recorded them (`prompt_snapshot`, CC ≥ 2.1.267). Older sessions don't have that record, so for them the estimate is a floor. Either way, the first live turn corrects it precisely.
 
-> **The gauge can only lie in your favour.** Because the reset writes an *estimate* into the JSONL, a session that was barely stripped will still show a reassuring number — and then snap back to ~100% on the first real turn, which is the only number that was ever measured. If a strip freed little, the meter dropping is not evidence that it worked. Check what `analyze` says is left, and treat a real API turn (one with non-zero `cache_read`/`cache_creation`) as the only ground truth. Attachments were excluded from this estimate until they were found to be worth six figures of tokens on long sessions — that omission made the gauge read far below the true prompt size.
+**Estimates are calibrated to what Claude Code measured.** Text is sized at chars/4, an English rule of thumb. Real sessions measured 1.18× above it (English coding) and 1.51× (Russian genealogy: archive text at ~2.35 chars/token). The newest assistant turn with real usage gives the true size of exactly the prompt it was sent. So the stripper scales its text estimate by measured ÷ estimated, taken from the untouched original before anything changes; images are already exact and are not scaled. The gauge reset, `reset-usage` and `analyze` (CONTEXT ESTIMATE section) all use it, and the strip prints `Context: <measured> measured at the last API call → ~<estimate> now`.
+
+- **Incident 2026-11-11:** uncalibrated, `analyze` said ~650k for a session CC measured at 971,681. A strip promised ~300k and would have left ~510k.
+- A measurement is real only when its usage reads or writes the prompt cache. A strip's reset zeroes those fields. So once a strip has rewritten the newest turn, the file has no calibration until its next real turn; a fork keeps the factor in its `.stripper.json` state for later commands.
+- On the stripped result the factor can drift: window-cam measured 1.18 before its strip and 1.26 after. That leaves the estimate ~6% low instead of ~20%.
+
+> **The gauge can still lie in your favour.** The reset writes an *estimate* into the JSONL. A session that was barely stripped will still show a reassuring number, then snap back on the first real turn, which is the only number ever measured. If a strip freed little, the meter dropping is not evidence that it worked. Check what `analyze` says is left, and treat a real API turn (non-zero `cache_read`/`cache_creation`) as the only ground truth. Attachments were excluded from this estimate until they were found to be worth six figures of tokens on long sessions; that omission made the gauge read far below the true prompt size.
 
 ### Preserved thinking: an edit drops every later thinking block
 
@@ -213,10 +240,10 @@ stripper strip-attachments <session.jsonl> --types skill_listing --drop-all
 ## Workflow
 
 1. **Analyze first** -- Run `analyze` to see token breakdown and identify what to strip
-2. **Strip** -- Run `strip-all` for maximum savings, or use granular flags (writes the `.pending` copy; iterate freely, the original is untouched)
-3. **Verify after** -- Run `verify` on the `.pending` copy to confirm chain integrity
+2. **Strip** -- Run `strip-all` for maximum savings, or use granular flags. It writes a fork; repeat passes on the same session build on that fork while nobody has resumed it, and the original is untouched
+3. **Verify after** -- Run `verify` on the fork (the path in the "Stripped session:" line) to confirm chain integrity
 4. **Compact if needed** -- Use `compact --before N` to summarize old work and keep recent work intact
-5. **Apply** -- `apply <session.jsonl>` for a dead/stuck session, or `respawn.sh --swap <session.jsonl>.pending` for your own live one
+5. **Resume** -- `claude -r <newSessionId>`, or `respawn.sh <newSessionId>` for your own live session. (`--in-place` strips: `apply <session.jsonl>`, or `respawn.sh --swap <session.jsonl>.pending`)
 
 ## Tool Stripping Options
 
@@ -315,19 +342,20 @@ Preview:
 | Persist N messages with N tailored summaries (per-message granularity) | `persist-message` per position (loop or external script) |
 | Persist individual text/thinking blocks across a range, leaving message structure intact | `persist-range --kinds text,thinking` |
 
-## Fork Mode (any mutating command)
+## Fork Mode (the default for every mutating command)
 
-Every mutating command (`strip-*`, `persist-*`, `replace-images`, `compact`, `migrate-persisted`) accepts `--fork` and `--fork-title <title>`.
-
-When `--fork` is set, the operation runs against a **forked copy** of the session — written to a new `<newSessionId>.jsonl` next to the original — leaving the original untouched. Both sessions remain resumable via `claude -r`.
+Every mutating command (`strip-*`, `persist-*`, `replace-images`, `compact-range`, `reset-usage`) runs against a **fork** of the session: a new `<newSessionId>.jsonl` next to the original, which is left untouched. Both sessions remain resumable via `claude -r`. See "Fork-first" above for reuse across passes, `--new-fork`, and `--in-place`. (`--fork` is still accepted and changes nothing.)
 
 ```bash
-# In-place (default)
+# Default: fork, titled "<original title> (Stripped)"
 python3 <skill-dir>/scripts/stripper.py persist-range <session.jsonl> --from 0 --to 90 --kinds text,thinking
 
-# Fork mode — keeps original intact
+# Custom title for the fork
 python3 <skill-dir>/scripts/stripper.py persist-range <session.jsonl> --from 0 --to 90 --kinds text,thinking \
-    --fork --fork-title "Polymarket-only thread (stripped)"
+    --fork-title "Polymarket-only thread (stripped)"
+
+# Keep the session id instead (pending copy + apply)
+python3 <skill-dir>/scripts/stripper.py persist-range <session.jsonl> --from 0 --to 90 --kinds text,thinking --in-place
 
 # Standalone fork without any operation
 python3 <skill-dir>/scripts/stripper.py fork <session.jsonl> --fork-title "checkpoint"

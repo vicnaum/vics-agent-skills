@@ -519,7 +519,7 @@ def dump_line(obj):
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n"
 
 
-def compute_active_chain_tokens(objects, uuid_index=None):
+def compute_active_chain_tokens(objects, uuid_index=None, factor=None):
     """Estimate the token weight of the active chain — roughly what CC re-sends
     to the model on the next turn.
 
@@ -539,18 +539,103 @@ def compute_active_chain_tokens(objects, uuid_index=None):
     Images are priced by Anthropic's pixel formula for the session model's
     tier, never as base64 text: chars/4 on a screenshot's base64 reads 20-100x
     too high, enough to pin the gauge past the context limit.
-    """
-    from .attachment_cost import envelope_rendered_chars, snapshot_chars
 
+    `factor` (from `calibration()`) scales the text part to what this
+    session's content really costs; without it the text is sized at chars/4.
+    """
     chain = walk_active_chain(objects, uuid_index)
     tier = tier_for_model(session_model(chain))
-    text_chars, image_tokens = chain_token_parts(chain, tier)
-    text_chars += sum(envelope_rendered_chars(obj) for obj in chain)
-    snaps = [o for o in chain if o.get("type") == "attachment"
+    text_chars, image_tokens = _prompt_parts(chain, tier)
+    return round(estimate_tokens(text_chars) * (factor or 1.0)) + image_tokens
+
+
+def _prompt_parts(records, tier):
+    """(text_chars, image_tokens) of a request built from `records`: content,
+    rendered attachments, and the latest recorded system prompt + tools."""
+    from .attachment_cost import envelope_rendered_chars, snapshot_chars
+    text_chars, image_tokens = chain_token_parts(records, tier)
+    text_chars += sum(envelope_rendered_chars(obj) for obj in records)
+    snaps = [o for o in records if o.get("type") == "attachment"
              and (o.get("attachment") or {}).get("type") == "prompt_snapshot"]
     if snaps:
         text_chars += snapshot_chars(snaps[-1]["attachment"])
-    return estimate_tokens(text_chars) + image_tokens
+    return text_chars, image_tokens
+
+
+# chars/4 is a rule of thumb for English prose. Measured on real sessions it
+# runs 1.16x low on an English coding session and 1.5x low on a Russian
+# genealogy one (archive text tokenized at ~2.35 chars/token). Calibrating
+# against the session's own recorded usage fixes the scale per session.
+CALIBRATION_RANGE = (0.5, 3.0)
+
+
+def _measured_usage(obj):
+    """Real context size of the API call behind an assistant record, or None
+    when the record carries no measurement: CC's "<synthetic>" records, and
+    usage a previous strip rewrote (`reset_usage_metadata` zeroes the cache
+    fields; a real Claude Code call always reads or writes the prompt cache)."""
+    if not isinstance(obj, dict) or obj.get("type") != "assistant":
+        return None
+    msg = obj.get("message")
+    if not isinstance(msg, dict) or str(msg.get("model") or "").startswith("<"):
+        return None
+    u = msg.get("usage")
+    if not isinstance(u, dict):
+        return None
+    parts = [u] + [it for it in (u.get("iterations") or []) if isinstance(it, dict)]
+    cached = sum((p.get("cache_read_input_tokens") or 0)
+                 + (p.get("cache_creation_input_tokens") or 0) for p in parts)
+    if cached <= 0:
+        return None
+    return _usage_context_total(u)
+
+
+def calibration(objects, uuid_index=None):
+    """Scale factor from this session's chars/4 estimate to what Claude Code
+    actually measured, or None when nothing was measured.
+
+    Ground truth is the newest assistant turn with real usage: its context
+    size is exactly the prompt of that API call — every chain record before
+    the turn, its attachments, and the system prompt + tools. The factor is
+    (real − images) / (text estimate of that same prompt), since images are
+    already priced exactly. Clamped to CALIBRATION_RANGE.
+
+    Only valid on a file whose history has not been edited since that call:
+    take it from the live original, before stripping. Only the NEWEST real
+    turn counts: once a strip has rewritten it (the gauge reset always pins
+    the last turn), older turns measured a history that no longer exists, so
+    a stripped file has no calibration until its next real turn.
+
+    Returns {"factor", "real", "estimate", "pos"} (pos: chain position of the
+    measured turn).
+    """
+    chain = walk_active_chain(objects, uuid_index)
+    tier = tier_for_model(session_model(chain))
+    for i in range(len(chain) - 1, -1, -1):
+        obj = chain[i]
+        msg = obj.get("message") if obj.get("type") == "assistant" else None
+        if (not isinstance(msg, dict) or not isinstance(msg.get("usage"), dict)
+                or str(msg.get("model") or "").startswith("<")):
+            continue  # not a turn, no usage, or a local "<synthetic>" record
+        real = _measured_usage(obj)
+        if real is None:
+            return None  # the newest turn's usage was rewritten by a strip
+        # One API response is written as several assistant records sharing a
+        # message id; the prompt is everything before the first of them.
+        mid = chain[i]["message"].get("id")
+        start = i
+        while (mid and start > 0 and chain[start - 1].get("type") == "assistant"
+               and (chain[start - 1].get("message") or {}).get("id") == mid):
+            start -= 1
+        text_chars, image_tokens = _prompt_parts(chain[:start], tier)
+        text_est = estimate_tokens(text_chars)
+        if text_est <= 0:
+            return None
+        lo, hi = CALIBRATION_RANGE
+        factor = min(hi, max(lo, (real - image_tokens) / text_est))
+        return {"factor": factor, "real": real, "estimate": text_est + image_tokens,
+                "pos": start}
+    return None
 
 
 def session_model(chain):

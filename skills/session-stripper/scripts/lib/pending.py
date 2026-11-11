@@ -125,8 +125,38 @@ def ensure_pending(session_path):
     return create_snapshot(session_path), True
 
 
+def human_prompts(tail: bytes) -> int:
+    """Messages a person typed into the session in `tail` (raw JSONL bytes).
+
+    Tool results, meta records, compact summaries, and the `<...>`-wrapped
+    records Claude Code writes for slash commands (`<command-name>`), their
+    output and task notifications are not counted: the self-strip flow's tail
+    (the stripping turn, the `/exit`) has none of these prompts."""
+    n = 0
+    for line in tail.splitlines():
+        try:
+            o = json.loads(line)
+        except ValueError:
+            continue
+        if (not isinstance(o, dict) or o.get("type") != "user" or o.get("isMeta")
+                or o.get("isCompactSummary") or o.get("isSidechain")):
+            continue
+        content = (o.get("message") or {}).get("content")
+        if isinstance(content, list):
+            if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+                continue
+            text = " ".join(b.get("text", "") for b in content
+                            if isinstance(b, dict) and b.get("type") == "text")
+        else:
+            text = content if isinstance(content, str) else ""
+        text = text.strip()
+        if text and not text.startswith("<"):
+            n += 1
+    return n
+
+
 def apply_pending(path, dry_run: bool = False, no_backup: bool = False,
-                  settle_ms: int = 400) -> dict:
+                  settle_ms: int = 400, discard_tail: bool = False) -> dict:
     """Atomically swap the pending copy over its original.
 
     `path` may be either the original session or the pending copy.
@@ -197,7 +227,21 @@ def apply_pending(path, dry_run: bool = False, no_backup: bool = False,
         if tail_bytes:
             with open(orig, "rb") as f:
                 f.seek(base)
-                tail_lines = f.read().count(b"\n")
+                tail = f.read()
+            tail_lines = tail.count(b"\n")
+            # Incident 2026-11-11: the user kept working in a session after an
+            # in-place strip's snapshot. Swapping that copy in would have
+            # discarded every turn since. The self-strip tail (the stripping
+            # turn itself) holds no typed prompts, so this never blocks it.
+            prompts = human_prompts(tail)
+            if prompts and not discard_tail:
+                raise ApplyRefused(
+                    f"the session went on after the snapshot: {prompts} message(s) "
+                    f"were typed into it since {meta.get('created_at', 'then')}, and "
+                    f"swapping this copy in would discard them. Strip again instead "
+                    f"(the default writes a fork and discards nothing), or pass "
+                    f"--discard-tail to swap anyway."
+                )
     else:
         print("WARNING: no meta sidecar — skipping lineage check "
               "(snapshot predates it, or sidecar was deleted).")

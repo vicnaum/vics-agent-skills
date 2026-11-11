@@ -34,7 +34,8 @@ from lib.pending import (
 
 def _cleanup(path: Path):
     """Remove a session file and every sibling artifact tests may create."""
-    for suffix in ("", ".pending", ".pending.meta.json", ".bak", ".bak.1"):
+    for suffix in ("", ".pending", ".pending.meta.json", ".bak", ".bak.1",
+                   ".stripper.json"):
         Path(str(path) + suffix).unlink(missing_ok=True)
 
 
@@ -101,7 +102,8 @@ class TestSnapshot(unittest.TestCase):
 
 
 class TestCliRedirect(unittest.TestCase):
-    """Mutating CLI commands must leave the original byte-identical."""
+    """Mutating CLI commands must leave the original byte-identical. These
+    cover the opt-in `--in-place` flow; the fork default is in test_fork_first."""
 
     def test_strip_thinking_targets_pending_not_original(self):
         import stripper
@@ -114,7 +116,7 @@ class TestCliRedirect(unittest.TestCase):
         ])
         try:
             before = path.read_bytes()
-            stripper.cmd_strip_thinking(_strip_thinking_args(path))
+            stripper.cmd_strip_thinking(_strip_thinking_args(path, in_place=True))
             self.assertEqual(path.read_bytes(), before,
                              "mutating command wrote the original!")
             pend = pending_path(path)
@@ -128,7 +130,7 @@ class TestCliRedirect(unittest.TestCase):
         import stripper
         path, _ = build_session([("user", "hi"), ("assistant", "yo")])
         try:
-            stripper.cmd_strip_thinking(_strip_thinking_args(path, dry_run=True))
+            stripper.cmd_strip_thinking(_strip_thinking_args(path, dry_run=True, in_place=True))
             self.assertFalse(pending_path(path).exists())
         finally:
             _cleanup(path)
@@ -172,9 +174,9 @@ class TestApply(unittest.TestCase):
     def test_apply_swaps_and_discards_tail(self):
         path, pend = self._stripped_pair()
         try:
-            with open(path, "a") as f:  # post-snapshot appends (the tail)
-                f.write('{"type":"user","uuid":"tail-1","parentUuid":null,'
-                        '"message":{"role":"user","content":"tail"}}\n')
+            with open(path, "a") as f:  # post-snapshot appends: the stripping turn
+                f.write('{"type":"assistant","uuid":"tail-1","parentUuid":null,'
+                        '"message":{"role":"assistant","content":[{"type":"text","text":"stripping"}]}}\n')
             stats = apply_pending(path, no_backup=False, settle_ms=50)
             self.assertNotIn("deep deep", path.read_text())      # strip landed
             self.assertNotIn("tail-1", path.read_text())         # tail gone
@@ -185,6 +187,55 @@ class TestApply(unittest.TestCase):
             self.assertTrue(bak.exists())
             self.assertIn("tail-1", bak.read_text())             # bak = pre-swap
             assert_chain_valid(path)
+        finally:
+            _cleanup(path)
+
+    def _append(self, path, *records):
+        with open(path, "a") as f:
+            for r in records:
+                f.write(json.dumps(r) + "\n")
+
+    def test_apply_refuses_when_messages_were_typed_after_snapshot(self):
+        # Incident 2026-11-11: the user kept working after the snapshot.
+        path, pend = self._stripped_pair()
+        try:
+            self._append(path, {"type": "user", "uuid": "typed-1", "parentUuid": None,
+                                "message": {"role": "user", "content": "and also this"}})
+            before = path.read_bytes()
+            with self.assertRaises(ApplyRefused) as cm:
+                apply_pending(path, settle_ms=50)
+            self.assertIn("typed into it", str(cm.exception))
+            self.assertEqual(path.read_bytes(), before)
+            self.assertTrue(pend.exists())
+        finally:
+            _cleanup(path)
+
+    def test_discard_tail_swaps_anyway(self):
+        path, pend = self._stripped_pair()
+        try:
+            self._append(path, {"type": "user", "uuid": "typed-1", "parentUuid": None,
+                                "message": {"role": "user", "content": "and also this"}})
+            apply_pending(path, settle_ms=50, discard_tail=True)
+            self.assertNotIn("typed-1", path.read_text())
+        finally:
+            _cleanup(path)
+
+    def test_slash_commands_and_tool_results_are_not_typed_messages(self):
+        # The self-strip tail: tool results, the /exit command's records.
+        path, pend = self._stripped_pair()
+        try:
+            self._append(
+                path,
+                {"type": "user", "uuid": "r1", "parentUuid": None, "message": {
+                    "role": "user", "content": [{"type": "tool_result",
+                                                  "tool_use_id": "t", "content": "ok"}]}},
+                {"type": "user", "uuid": "c1", "parentUuid": None, "message": {
+                    "role": "user", "content": "<command-name>/exit</command-name>"}},
+                {"type": "user", "uuid": "m1", "parentUuid": None, "isMeta": True,
+                 "message": {"role": "user", "content": "Caveat: local command"}},
+            )
+            apply_pending(path, settle_ms=50)
+            self.assertFalse(pend.exists())
         finally:
             _cleanup(path)
 

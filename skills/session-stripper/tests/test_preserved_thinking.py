@@ -177,28 +177,43 @@ def _run(args):
 
 
 class TestCliStep(unittest.TestCase):
+    """The step through the CLI. The result is a fork (the default); the
+    original must stay byte-identical."""
+
     def setUp(self):
         self.path = _session()
         self.original = self.path.read_bytes()
+        self._forks = []
 
     def tearDown(self):
-        _cleanup(self.path)
+        _cleanup(self.path, *self._forks)
+
+    def _result(self, args):
+        fork = Path(args._fork_result)
+        self._forks.append(fork)
+        return fork
 
     def test_default_removes_dropped_blocks_from_result(self):
-        out = _run(_strip_tools_args(self.path))
+        args = _strip_tools_args(self.path)
+        out = _run(args)
         self.assertIn("Preserved thinking (claude-fable-5-1)", out)
         self.assertIn("invalidates 2 later thinking block(s)", out)
-        self.assertEqual(_signatures(pending_path(self.path)), ["SIG1"])
+        self.assertEqual(_signatures(self._result(args)), ["SIG1"])
         self.assertEqual(self.path.read_bytes(), self.original)
 
     def test_keep_flag_leaves_blocks(self):
-        out = _run(_strip_tools_args(self.path, keep_dropped_thinking=True))
+        args = _strip_tools_args(self.path, keep_dropped_thinking=True)
+        out = _run(args)
         self.assertIn("Kept in the file", out)
-        self.assertEqual(_signatures(pending_path(self.path)), ["SIG1", "SIG2", "SIG3"])
+        self.assertEqual(_signatures(self._result(args)), ["SIG1", "SIG2", "SIG3"])
 
     def test_dry_run_reports_and_writes_nothing(self):
-        out = _run(_strip_tools_args(self.path, dry_run=True))
+        before = sorted(self.path.parent.glob("*.jsonl"))
+        args = _strip_tools_args(self.path, dry_run=True)
+        out = _run(args)
         self.assertIn("Would remove", out)
+        self.assertFalse(hasattr(args, "_fork_result"))
+        self.assertEqual(sorted(self.path.parent.glob("*.jsonl")), before)
         self.assertFalse(pending_path(self.path).exists())
         self.assertEqual(self.path.read_bytes(), self.original)
 
@@ -207,16 +222,23 @@ class TestCliStep(unittest.TestCase):
                                  from_pos=0, to_pos=1)
         out = _run(args)
         self.assertNotIn("Preserved thinking", out)
-        self.assertEqual(_signatures(pending_path(self.path)), ["SIG2", "SIG3"])
+        self.assertEqual(_signatures(self._result(args)), ["SIG2", "SIG3"])
 
     def test_unbound_model_is_untouched(self):
         path = _session(model="claude-opus-4-8")
         try:
-            out = _run(_strip_tools_args(path))
+            args = _strip_tools_args(path)
+            out = _run(args)
             self.assertNotIn("Preserved thinking", out)
-            self.assertEqual(_signatures(pending_path(path)), ["SIG1", "SIG2", "SIG3"])
+            self.assertEqual(_signatures(self._result(args)), ["SIG1", "SIG2", "SIG3"])
         finally:
             _cleanup(path)
+
+    def test_in_place_flow_still_writes_the_pending_copy(self):
+        args = _strip_tools_args(self.path, in_place=True)
+        _run(args)
+        self.assertEqual(_signatures(pending_path(self.path)), ["SIG1"])
+        self.assertEqual(self.path.read_bytes(), self.original)
 
 
 if __name__ == "__main__":

@@ -11,12 +11,12 @@ Restarts the calling Claude Code or Codex CLI in its verified iTerm2 session or 
 
 Run inside the session that needs restarting:
 
-1. **Strip first** — use the `session-stripper` skill. Its mutating commands are copy-first: they write `<session>.jsonl.pending` and never touch the live file, so stripping your own running session is safe. Verify the pending copy. (If stripping forked to a NEW session id instead, note that id for step 2 — forks need no swap.)
+1. **Strip first** — use the `session-stripper` skill. Its mutating commands write a fork by default: a NEW session id, printed as `Resume it: claude -r <new-session-id>`. The live file is never touched, so stripping your own running session is safe. Note the new id for step 2. (With `--in-place` the stripper instead writes `<session>.jsonl.pending` and keeps the id; that copy needs `--swap`.)
 2. **Schedule the respawn** — this must be the LAST tool call of the turn:
 
 ```bash
-<skill-dir>/scripts/respawn.sh --swap <session.jsonl>.pending   # stripped in place: swap + resume this session's id
-<skill-dir>/scripts/respawn.sh <new-session-id>                 # forked strip: resume the fork (no swap)
+<skill-dir>/scripts/respawn.sh <new-session-id>                 # forked strip (the default): resume the fork
+<skill-dir>/scripts/respawn.sh --swap <session.jsonl>.pending   # --in-place strip: swap + resume this session's id
 <skill-dir>/scripts/respawn.sh                                  # plain restart, nothing to swap
 ```
 

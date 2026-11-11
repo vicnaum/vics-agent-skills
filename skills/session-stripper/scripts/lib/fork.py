@@ -195,6 +195,85 @@ def fork_session(session_path, *,
     return dst
 
 
+# ── Fork-first bookkeeping ───────────────────────────────────────────────
+#
+# Mutating commands write a fork by default. A sidecar next to each fork,
+# `<fork>.jsonl.stripper.json`, records where it came from and its size and
+# mtime after the stripper's last write. While those still match, nobody has
+# resumed the fork (a resumed CLI appends at once), so the next command on the
+# same source — or on the fork itself — edits it in place instead of forking
+# again: multi-pass strips (persist-range, then strip-all) land in ONE fork.
+# The suffix keeps it out of CC's `*.jsonl` session glob.
+
+STATE_SUFFIX = ".stripper.json"
+
+
+def state_path(fork_path) -> Path:
+    return Path(str(Path(fork_path).expanduser().absolute()) + STATE_SUFFIX)
+
+
+def read_state(fork_path):
+    try:
+        return json.loads(state_path(fork_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def write_state(fork_path, source=None, source_size=None, calibration=None):
+    """Record (or refresh after a write) a fork's state. Fields not given are
+    kept from the existing record."""
+    fork_path = Path(fork_path).expanduser().absolute()
+    state = read_state(fork_path) or {}
+    if source is not None:
+        state["source"] = str(Path(source).expanduser().absolute())
+    if source_size is not None:
+        state["source_size"] = int(source_size)
+    if calibration is not None:
+        state["calibration"] = calibration
+    st = fork_path.stat()
+    state["size"] = st.st_size
+    state["mtime_ns"] = st.st_mtime_ns
+    state["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    p = state_path(fork_path)
+    p.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    os.chmod(p, 0o600)
+    return state
+
+
+def is_untouched(fork_path, state) -> bool:
+    """True while the fork is byte-for-byte what the stripper last wrote."""
+    try:
+        st = Path(fork_path).stat()
+    except OSError:
+        return False
+    return (isinstance(state, dict) and st.st_size == state.get("size")
+            and st.st_mtime_ns == state.get("mtime_ns"))
+
+
+def find_reusable_fork(source_path):
+    """(fork_path, state) of the newest untouched fork of `source_path`, or
+    None. A source rewritten since (smaller than when it was forked) has none:
+    the fork no longer descends from it."""
+    source = Path(source_path).expanduser().absolute()
+    try:
+        source_size = source.stat().st_size
+    except OSError:
+        return None
+    best = None
+    for sp in source.parent.glob("*.jsonl" + STATE_SUFFIX):
+        fork_path = Path(str(sp)[: -len(STATE_SUFFIX)])
+        state = read_state(fork_path)
+        if not state or state.get("source") != str(source):
+            continue
+        if not is_untouched(fork_path, state):
+            continue
+        if source_size < state.get("source_size", 0):
+            continue
+        if best is None or state.get("updated_at", "") > best[1].get("updated_at", ""):
+            best = (fork_path, state)
+    return best
+
+
 # CLI-level convenience: a wrapper that validates the source, prints
 # user-facing details, and returns the new path.
 def cli_fork(session_path, *, custom_title: str | None = None,

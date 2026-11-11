@@ -22,21 +22,53 @@ from lib.fork import fork_session, cli_fork
 from lib.compact_range import compact_range
 
 
-def _reset_usage_after_strip(session_path, dry_run, enabled=True):
+def _reset_usage_after_strip(session_path, dry_run, enabled=True, calibration=None):
     """After a strip, rewrite stale assistant `usage` counts so CC's context
     gauge reflects the post-strip size. Without this, the meter keeps reading
     the pre-strip token count and CC blocks new input even though the
-    conversation is now tiny. Off when --dry-run or --no-usage-reset."""
+    conversation is now tiny. Off when --dry-run or --no-usage-reset.
+
+    `calibration` (lib.chain.calibration of the untouched source) scales the
+    estimate to what this session's content really costs."""
     if dry_run or not enabled:
         return
     from lib.chain import (load_session, save_session,
                            compute_active_chain_tokens, reset_usage_metadata)
     objects = load_session(session_path)
-    est = compute_active_chain_tokens(objects)
+    factor = calibration["factor"] if calibration else None
+    est = compute_active_chain_tokens(objects, factor=factor)
     n = reset_usage_metadata(objects, est)
     save_session(session_path, objects, create_backup=False)
     print(f"Context gauge reset: {n} usage record(s) capped to ~{est:,} tokens "
-          f"(active-chain content estimate) so CC's meter reflects the stripped size.")
+          f"so CC's meter reflects the stripped size.")
+    print(_calibration_note(calibration, est))
+
+
+def _calibration_note(calibration, est=None):
+    if not calibration:
+        return ("  (uncalibrated chars/4 estimate: this session records no real API "
+                "usage to scale it by, e.g. it was stripped before)")
+    before = f"{calibration['real']:,} measured at the last API call"
+    after = f" → ~{est:,} now" if est is not None else ""
+    return (f"  Context: {before}{after} (estimate calibrated ×{calibration['factor']:.2f} "
+            f"to that measurement)")
+
+
+def _calibration_of(path):
+    """Calibration from a session file's own recorded usage, else from the
+    stripper state of a fork made earlier (whose usage the gauge reset
+    rewrote), else None."""
+    from lib.chain import calibration, load_session
+    from lib.fork import read_state
+    try:
+        cal = calibration(load_session(path))
+    except (OSError, ValueError):
+        cal = None
+    if cal is None:
+        state = read_state(path) or {}
+        if state.get("calibration"):
+            cal = dict(state["calibration"], inherited_from=state.get("source"))
+    return cal
 
 
 def resolve_current_session(cwd=None):
@@ -95,49 +127,87 @@ def cmd_current(args):
     sys.exit(0 if exists else 1)
 
 
-def _maybe_fork(args, operation: str):
-    """If `--fork` is set, fork the session in place and rewrite args.session
-    to point at the fork. Subsequent command logic then mutates the fork
-    instead of the original. Returns the (possibly-new) session path.
-    """
-    if not getattr(args, "fork", False):
-        return args.session
-    forked = fork_session(
-        args.session,
-        custom_title=getattr(args, "fork_title", None),
-        operation=operation,
-    )
-    print(f"Forked: {forked}")
-    print(f"New sessionId: {forked.stem}\n")
-    args.session = str(forked)
-    return args.session
+def _prepare_target(args, operation: str, default_mode: str = "fork"):
+    """Mutating commands never write the session file they are given.
 
+    Default — FORK: the result is a new session (`<newSessionId>.jsonl`,
+    `forkedFrom` on every record) that you resume with `claude -r <id>`. The
+    original is only read: nothing has to be swapped in, nothing it records
+    later is ever discarded, and it can keep running while you strip.
+      - The target is itself a stripper fork nobody has resumed yet: edit it
+        in place (chained passes).
+      - The target has such a fork already: reuse it, so back-to-back passes
+        on the same session build ONE fork (`--new-fork` takes a fresh one).
+      - Otherwise: fork it.
 
-def _prepare_target(args, operation: str):
-    """Copy-first: mutating commands never write a real session file in place.
+    `--in-place` — the older copy-first flow, for a session that must keep its
+    id: mutate `<file>.jsonl.pending` and swap it over the original later with
+    `apply` (or `respawn.sh --swap` for a session stripping itself). Records
+    the original gains after the snapshot are discarded at the swap.
 
-    - `--fork`: fork the original (a read of the source) and mutate the fork
-      directly — the fork is a brand-new file no CLI appends to.
-    - target is already a `.pending` copy: mutate it directly.
-    - otherwise: materialize (or reuse) the session's `.pending` snapshot and
-      mutate THAT. The original stays byte-identical until `apply` swaps the
-      copy in atomically — immediately for dead sessions, or via
-      `respawn.sh --swap` for a session stripping itself.
-
-    While mutating a pending copy, per-op .bak files are pointless (the
-    untouched original IS the backup), so backups are disabled; `apply` makes
-    the one real .bak at swap time.
+    No backups are made while mutating a fork or a pending copy — the
+    untouched original is the backup.
     """
     from lib.pending import is_pending, ensure_pending, pending_path, original_of
-    # The live file whose history produced the thinking signatures. The
-    # preserved-thinking step compares the result against it (run_command).
-    args._pt_source = str(original_of(args.session) if is_pending(args.session)
-                          else args.session)
-    if getattr(args, "fork", False):
-        return _maybe_fork(args, operation)
-    if is_pending(args.session):
+    from lib.fork import find_reusable_fork, read_state, is_untouched, write_state
+    target = Path(args.session).expanduser().absolute()
+    if is_pending(target):
+        # An explicit pending copy: the in-place flow, whatever the default.
+        # (The preserved-thinking step and calibration read the live original.)
+        args._pt_source = str(original_of(target))
+        args._calibration = _calibration_of(args._pt_source)
         args.no_backup = True
         return args.session
+
+    in_place = getattr(args, "in_place", False) or default_mode == "in-place"
+    if not in_place:
+        args.no_backup = True
+        state = read_state(target)
+        if state and state.get("source") and is_untouched(target, state):
+            # A stripper fork nobody has resumed: chain this pass onto it.
+            args._pt_source = state["source"]
+            args._calibration = _calibration_of(state["source"]) or state.get("calibration")
+            args._fork_result = str(target)
+            if not args.dry_run:
+                print(f"Editing stripper fork in place (not resumed yet): {target.stem}\n")
+            return args.session
+        args._pt_source = str(target)
+        _hint_pending(str(target))
+        # Calibrate against the untouched source, before anything changes.
+        args._calibration = _calibration_of(target)
+        reuse = None if getattr(args, "new_fork", False) else find_reusable_fork(target)
+        if args.dry_run:
+            # Never create a fork for a preview. Preview against the fork the
+            # next real run would edit, if there is one.
+            if reuse:
+                args.session = str(reuse[0])
+            return args.session
+        if reuse:
+            fork_path, state = reuse
+            print(f"Reusing stripper fork {fork_path.stem} (not resumed yet). "
+                  f"--new-fork takes a fresh one.")
+            grown = target.stat().st_size - state.get("source_size", 0)
+            if grown > 0:
+                print(f"  note: {target.name} has grown by {grown:,} bytes since that "
+                      f"fork was taken; what it recorded since is NOT in the fork.")
+            print()
+        else:
+            source_size = target.stat().st_size
+            fork_path = fork_session(target, custom_title=getattr(args, "fork_title", None),
+                                     operation=operation)
+            write_state(fork_path, source=target, source_size=source_size,
+                        calibration=args._calibration)
+            print(f"Forked: {fork_path}")
+            print(f"New sessionId: {fork_path.stem}  (original untouched)\n")
+        args.session = str(fork_path)
+        args._fork_result = str(fork_path)
+        return args.session
+
+    # ── --in-place: the copy-first pending flow ──
+    # The live file whose history produced the thinking signatures. The
+    # preserved-thinking step compares the result against it (run_command).
+    args._pt_source = str(target)
+    args._calibration = _calibration_of(target)
     if getattr(args, "dry_run", False) and not pending_path(args.session).exists():
         # Dry runs write nothing — no point materializing a snapshot. If a
         # pending copy already exists, preview against IT (falls through),
@@ -169,6 +239,8 @@ def _preview_result_via_copy(args):
     clone.session = str(copy_path)
     clone.dry_run = False
     clone.fork = False
+    clone.in_place = True   # mutate the throwaway copy itself, never fork it
+    clone.new_fork = False
     clone.no_backup = True
     clone.no_usage_reset = True
     if hasattr(clone, "output"):
@@ -218,30 +290,61 @@ def _preserved_thinking_step(args):
     strip_thinking(result, dry_run=False, no_backup=True,
                    from_pos=report["first_pos"])
     _reset_usage_after_strip(result, False,
-                             enabled=not getattr(args, "no_usage_reset", False))
+                             enabled=not getattr(args, "no_usage_reset", False),
+                             calibration=getattr(args, "_calibration", None))
 
 
 def run_command(args):
-    """Run a parsed command, then the preserved-thinking step."""
+    """Run a parsed command, then the preserved-thinking step, then (fork
+    mode) record the fork's state and say how to resume it."""
     args.func(args)
     _preserved_thinking_step(args)
+    _finish_fork(args)
+
+
+def _finish_fork(args):
+    fork = getattr(args, "_fork_result", None)
+    if not fork or getattr(args, "dry_run", False):
+        return
+    from lib.fork import write_state
+    # Refresh size/mtime so the next pass can tell nobody resumed it yet.
+    write_state(fork, calibration=getattr(args, "_calibration", None))
+    sid = Path(fork).stem
+    print()
+    print(f"Stripped session: {fork}")
+    print(f"Resume it:        claude -r {sid}")
+    print(f"  (stripping your own live session? respawn.sh {sid}; the original "
+          f"{Path(args._pt_source).stem} is untouched)")
 
 
 def _hint_pending(session):
-    """One-line reminder when a pending copy exists for the given session."""
-    from lib.pending import is_pending, pending_path
+    """Warn when an in-place strip's pending copy exists for the session: it
+    is a snapshot, and `apply` would discard everything recorded after it."""
+    from lib.pending import is_pending, pending_path, meta_path_for
     if is_pending(session):
         return
     p = pending_path(session)
-    if p.exists():
-        print(f"note: pending copy exists — mutations target it, `apply` swaps "
-              f"it in: {p}\n")
+    if not p.exists():
+        return
+    import json as _json
+    try:
+        meta = _json.loads(meta_path_for(p).read_text(encoding="utf-8"))
+        base = int(meta.get("base_size", 0))
+        taken = meta.get("created_at", "?")
+        grown = Path(session).expanduser().stat().st_size - base
+    except (OSError, ValueError):
+        taken, grown = "?", 0
+    print(f"note: an in-place strip's pending copy exists (taken {taken}): {p}")
+    if grown > 0:
+        print(f"  The session has recorded {grown:,} more bytes since; `apply` would "
+              f"discard them. Delete the copy if it is stale.")
+    print("  (forks, the default, ignore it; `--in-place` commands keep editing it)\n")
 
 
 def cmd_analyze(args):
     """Run full session analysis with token breakdown and health check."""
     _hint_pending(args.session)
-    analyze_session(args.session)
+    analyze_session(args.session, cal=_calibration_of(args.session))
 
 
 def cmd_strip_tools(args):
@@ -263,7 +366,8 @@ def cmd_strip_tools(args):
         keep_last_lines=args.keep_last_lines,
     )
     _reset_usage_after_strip(args.session, args.dry_run,
-                             enabled=not getattr(args, "no_usage_reset", False))
+                             enabled=not getattr(args, "no_usage_reset", False),
+                             calibration=getattr(args, "_calibration", None))
 
 
 def cmd_strip_thinking(args):
@@ -277,7 +381,8 @@ def cmd_strip_thinking(args):
         to_pos=args.to_pos,
     )
     _reset_usage_after_strip(args.session, args.dry_run,
-                             enabled=not getattr(args, "no_usage_reset", False))
+                             enabled=not getattr(args, "no_usage_reset", False),
+                             calibration=getattr(args, "_calibration", None))
 
 
 def cmd_strip_attachments(args):
@@ -299,7 +404,8 @@ def cmd_strip_attachments(args):
         include_free=args.include_free,
     )
     _reset_usage_after_strip(args.session, args.dry_run,
-                             enabled=not getattr(args, "no_usage_reset", False))
+                             enabled=not getattr(args, "no_usage_reset", False),
+                             calibration=getattr(args, "_calibration", None))
 
 
 def cmd_strip_all(args):
@@ -342,7 +448,8 @@ def cmd_strip_all(args):
         )
 
     _reset_usage_after_strip(args.session, args.dry_run,
-                             enabled=not getattr(args, "no_usage_reset", False))
+                             enabled=not getattr(args, "no_usage_reset", False),
+                             calibration=getattr(args, "_calibration", None))
 
 
 def cmd_reset_usage(args):
@@ -352,22 +459,24 @@ def cmd_reset_usage(args):
     from lib.chain import (load_session, save_session,
                            compute_active_chain_tokens, reset_usage_metadata)
     _prepare_target(args, "reset-usage")
+    cal = getattr(args, "_calibration", None)
     objects = load_session(args.session)
-    est = compute_active_chain_tokens(objects)
+    est = compute_active_chain_tokens(objects, factor=cal["factor"] if cal else None)
     if args.dry_run:
-        print(f"[dry run] would cap stale assistant usage to ~{est:,} tokens "
-              f"(active-chain content estimate).")
+        print(f"[dry run] would cap stale assistant usage to ~{est:,} tokens.")
+        print(_calibration_note(cal, est))
         return
     n = reset_usage_metadata(objects, est)
     save_session(args.session, objects, create_backup=not args.no_backup)
     print(f"Reset {n} usage record(s) to ~{est:,} tokens. "
           f"CC's context gauge will now reflect the on-disk size.")
+    print(_calibration_note(cal, est))
 
 
 def cmd_compact(args):
-    """Compact messages before a given chain position."""
+    """Compact messages before a given chain position. It always writes a NEW
+    session file, so there is nothing to fork."""
     args._pt_source = args.session  # for the preserved-thinking step
-    _maybe_fork(args, f"compact --before {args.before}")  # compact writes a NEW file; no in-place write to redirect
     stats = compact_before(
         args.session,
         before_pos=args.before,
@@ -405,7 +514,8 @@ def cmd_apply(args):
     from lib.pending import apply_pending, ApplyRefused
     try:
         apply_pending(args.session, dry_run=args.dry_run,
-                      no_backup=args.no_backup)
+                      no_backup=args.no_backup,
+                      discard_tail=getattr(args, "discard_tail", False))
     except ApplyRefused as e:
         print(f"refused: {e}", file=sys.stderr)
         sys.exit(2)
@@ -538,7 +648,9 @@ def cmd_persist_range(args):
 
 def cmd_migrate_persisted(args):
     """One-shot migration of pre-persist-everything layouts."""
-    _prepare_target(args, "migrate-persisted")
+    # Moves shared sidecar files on disk, so a fork would strand the
+    # original's references: this one stays on the in-place flow.
+    _prepare_target(args, "migrate-persisted", default_mode="in-place")
     migrate_persisted(args.session, dry_run=args.dry_run, no_backup=args.no_backup)
 
 
@@ -590,13 +702,19 @@ def add_common_args(parser):
 
 
 def add_fork_args(parser):
-    """Add --fork / --fork-title flags. When --fork is set, mutating commands
-    operate on a forked copy (new sessionId, forkedFrom stamped on every
-    envelope) and leave the original untouched."""
+    """Where a mutating command writes. Default: a fork (new sessionId,
+    forkedFrom stamped on every envelope); the original is only read."""
     parser.add_argument("--fork", action="store_true",
-                        help="Fork the session before mutating: writes to a "
-                             "new <newSessionId>.jsonl with forkedFrom "
-                             "metadata; original is left untouched")
+                        help="Write the result to a fork (the default; kept for "
+                             "older invocations)")
+    parser.add_argument("--in-place", action="store_true",
+                        help="Keep the session id: mutate <session>.jsonl.pending "
+                             "and swap it in later with `apply` (or respawn.sh "
+                             "--swap). Records the original gains after the "
+                             "snapshot are discarded at the swap")
+    parser.add_argument("--new-fork", action="store_true",
+                        help="Take a fresh fork even if an unresumed fork of this "
+                             "session exists (default: keep building on that one)")
     parser.add_argument("--fork-title", type=str, default=None,
                         help="Custom title for the forked session "
                              "(default: <orig title> (Stripped))")
@@ -742,8 +860,9 @@ def main():
         "apply",
         help="Atomically swap the .pending copy over its original. Refuses if "
              "the original is being written right now, was rewritten since "
-             "the snapshot, or the pending copy fails verify. Post-snapshot "
-             "appends to the original are discarded by design.",
+             "the snapshot, the pending copy fails verify, or someone typed new "
+             "messages into the session since the snapshot. Other post-snapshot "
+             "appends (the stripping turn itself) are discarded by design.",
     )
     p_apply.add_argument("session",
                          help="Path to the session JSONL or its .pending copy")
@@ -751,6 +870,9 @@ def main():
                          help="Run all checks and report; swap nothing")
     p_apply.add_argument("--no-backup", action="store_true",
                          help="Skip the .bak of the original at swap time")
+    p_apply.add_argument("--discard-tail", action="store_true",
+                         help="Swap even though messages were typed into the session "
+                              "after the snapshot (they are discarded)")
     p_apply.set_defaults(func=cmd_apply)
 
     # show-tool
