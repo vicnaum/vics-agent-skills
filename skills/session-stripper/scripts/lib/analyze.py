@@ -7,23 +7,18 @@ content type and tool name, cut point candidates, and chain health checks.
 import json
 from collections import Counter, defaultdict
 
-from .chain import load_session, build_uuid_index, walk_active_chain, count_content_chars, estimate_tokens
-from .image_tokens import image_block_tokens
+from .chain import (load_session, build_uuid_index, walk_active_chain, count_content_chars,
+                    estimate_tokens, compact_relink, effective_parent, obj_image_tokens,
+                    session_model)
+from .image_tokens import content_image_stats, tier_for_model
 from .strip_attachments import collect_stats as collect_attachment_stats
 
 
-def _accurate_image_tokens(obj):
-    """Sum Anthropic-correct image tokens for all image blocks in obj's content.
-    The chars/4 estimate over-counts image cost ~50-100x; this corrects it."""
-    msg = obj.get("message", {}) if isinstance(obj, dict) else {}
-    content = msg.get("content") if isinstance(msg, dict) else obj.get("content")
-    if not isinstance(content, list):
-        return 0
-    total = 0
-    for block in content:
-        if isinstance(block, dict) and block.get("type") == "image":
-            total += image_block_tokens(block)
-    return total
+def _accurate_image_tokens(obj, tier=None):
+    """Anthropic-correct tokens for every image in obj's content — top-level
+    and nested inside tool results. The chars/4 estimate over-counts image
+    cost 20-100x; this corrects it."""
+    return obj_image_tokens(obj, tier)
 
 
 def _extract_text_from_content(content):
@@ -76,7 +71,10 @@ def analyze_session(session_path, show_cut_points=True):
     """
     objects = load_session(session_path)
     uuid_index = build_uuid_index(objects)
-    chain = walk_active_chain(objects, uuid_index)
+    relink = compact_relink(objects)
+    chain = walk_active_chain(objects, uuid_index, relink=relink)
+    model = session_model(chain)
+    tier = tier_for_model(model)
 
     stats = {}
 
@@ -115,27 +113,66 @@ def analyze_session(session_path, show_cut_points=True):
     print(f"  Total lines:       {stats['total_lines']}")
     print(f"  Active chain:      {stats['active_chain_length']} messages")
     print(f"  Compact boundaries:{stats['compact_boundary_count']}")
+    print(f"  Model:             {model or '(unknown)'} — {tier.name} image tier")
     print()
     print("  Message type breakdown:")
     for t, count in sorted(type_counts.items(), key=lambda x: -x[1]):
         print(f"    {t:<20s} {count:>6d}")
     print()
 
+    # ── 1b. Compaction: records a compact boundary keeps ────────────────
+    stats["relink_status"] = relink["status"]
+    stats["preserved_records"] = len(relink["preserved"])
+    if relink["status"] != "none":
+        print("-" * 72)
+        print("COMPACTION (records the last compact boundary keeps)")
+        print("-" * 72)
+        print()
+        if relink["status"] == "ok" and relink["preserved"]:
+            on_chain = {o.get("uuid") for o in chain}
+            kept = sum(1 for u in relink["preserved"] if u in on_chain)
+            print(f"  The last compact boundary preserves {len(relink['preserved']):,} records "
+                  f"from before it ({relink['source']}).")
+            print(f"  Claude Code splices them back in after the boundary on every load, so")
+            print(f"  they are sent on every request. {kept:,} of them are on the chain below,")
+            print(f"  and every command here covers them.")
+        elif relink["status"] == "ok":
+            print("  The last compact boundary preserves nothing: the chain starts at it.")
+        else:
+            missing = len(relink["missing"])
+            what = (f"{missing:,} of its {len(relink['preserved']):,} listed records are missing"
+                    if missing else "its preserved segment no longer resolves")
+            print(f"  BROKEN: the last compact boundary preserves records, but {what}.")
+            print(f"  Claude Code then relinks nothing and drops every preserved record from")
+            print(f"  the conversation. See CHAIN HEALTH.")
+        print()
+
     # ── 2. Token breakdown by content type ──────────────────────────────
 
     totals = {"tool_use": 0, "tool_result": 0, "thinking": 0, "text": 0, "image": 0, "other": 0, "total": 0}
     image_tokens_real = 0  # Anthropic formula for images, not chars/4
+    image_count = 0
+    image_nested = 0
 
     for obj in chain:
         cc = count_content_chars(obj)
         for key in totals:
             totals[key] += cc[key]
-        image_tokens_real += _accurate_image_tokens(obj)
+        msg = obj.get("message")
+        s = content_image_stats(msg.get("content") if isinstance(msg, dict) else obj.get("content"),
+                                tier)
+        image_tokens_real += s["tokens"]
+        image_count += s["count"]
+        image_nested += s["nested"]
 
     stats["char_totals"] = dict(totals)
+    stats["image_count"] = image_count
+    stats["image_nested_count"] = image_nested
     # Token totals: chars/4 for everything except images, which use Anthropic's
-    # (w*h)/750 formula. The chars/4 estimate over-counts images by 50-100x
-    # because base64 expansion has nothing to do with the actual model cost.
+    # pixel formula (28px patches, tier-capped). The chars/4 estimate
+    # over-counts images 20-100x because base64 size has nothing to do with
+    # what the model is charged. Images nested in tool results are in the
+    # "image" bucket too (count_content_chars moves them there).
     token_totals = {k: estimate_tokens(v) for k, v in totals.items()}
     image_tokens_naive = token_totals["image"]
     token_totals["image"] = image_tokens_real
@@ -179,7 +216,7 @@ def analyze_session(session_path, show_cut_points=True):
         tokens = token_totals[key]
         pct = (tokens / grand_total) * 100
         if key == "image":
-            note = "strippable · (w×h)/750 capped 1600"
+            note = f"strippable · 28px patches, ≤{tier.max_tokens:,}/img"
         elif key == "attachment":
             note = "reducible · strip-attachments"
         else:
@@ -188,10 +225,12 @@ def analyze_session(session_path, show_cut_points=True):
     print(f"  {'─' * 16} {'─' * 12} {'─' * 12} {'─' * 7}")
     print(f"  {'TOTAL':<16s} {totals['total']:>12,d} {token_totals['total']:>12,d} {'100.0%':>7s}")
     print(f"  {'STRIPPABLE':<16s} {'':>12s} {strippable_tokens:>12,d} {(strippable_tokens / grand_total) * 100:>6.1f}%")
-    if image_tokens_naive != image_tokens_real:
-        delta = image_tokens_naive - image_tokens_real
-        print(f"  (image col uses Anthropic formula; chars/4 would say {image_tokens_naive:,} — "
-              f"over by {delta:,} tokens)")
+    if image_count:
+        print(f"  Images: {image_count:,} on the chain ({image_nested:,} inside tool results), "
+              f"~{image_tokens_real:,} tokens on the {tier.name} tier")
+        print(f"  (ceil(w/28)×ceil(h/28) after resize to ≤{tier.max_edge}px / "
+              f"≤{tier.max_tokens:,} tokens; chars/4 on their base64 would say "
+              f"{image_tokens_naive:,}) → list-images, replace-images, strip-tools")
     print()
 
     # ── 2b. Attachment breakdown ────────────────────────────────────────
@@ -229,8 +268,10 @@ def analyze_session(session_path, show_cut_points=True):
 
     tool_result_index = _build_tool_result_index(chain)
 
-    # Collect tool_use blocks with their IDs
-    tool_stats = defaultdict(lambda: {"use_chars": 0, "result_chars": 0, "count": 0})
+    # Collect tool_use blocks with their IDs. Images a tool returned are
+    # priced by the pixel formula (result_image_tokens), not as result chars.
+    tool_stats = defaultdict(lambda: {"use_chars": 0, "result_chars": 0, "count": 0,
+                                      "result_images": 0, "result_image_tokens": 0})
 
     for obj in chain:
         content = _get_content(obj)
@@ -251,24 +292,30 @@ def analyze_session(session_path, show_cut_points=True):
                         if isinstance(result_content, str):
                             tool_stats[name]["result_chars"] += len(result_content)
                         elif isinstance(result_content, list):
+                            img = content_image_stats(result_content, tier)
                             tool_stats[name]["result_chars"] += len(
                                 json.dumps(result_content, ensure_ascii=False)
-                            )
+                            ) - img["chars"]
+                            tool_stats[name]["result_images"] += img["count"]
+                            tool_stats[name]["result_image_tokens"] += img["tokens"]
+
+    def _tok(s):
+        use_tok = estimate_tokens(s["use_chars"])
+        res_tok = estimate_tokens(s["result_chars"]) + s["result_image_tokens"]
+        return use_tok, res_tok
 
     # Sort by total impact
-    sorted_tools = sorted(
-        tool_stats.items(),
-        key=lambda x: x[1]["use_chars"] + x[1]["result_chars"],
-        reverse=True,
-    )
+    sorted_tools = sorted(tool_stats.items(), key=lambda x: sum(_tok(x[1])), reverse=True)
 
     stats["tool_breakdown"] = {
         name: {
             "use_chars": s["use_chars"],
             "result_chars": s["result_chars"],
-            "use_tokens": estimate_tokens(s["use_chars"]),
-            "result_tokens": estimate_tokens(s["result_chars"]),
-            "total_tokens": estimate_tokens(s["use_chars"] + s["result_chars"]),
+            "result_images": s["result_images"],
+            "result_image_tokens": s["result_image_tokens"],
+            "use_tokens": _tok(s)[0],
+            "result_tokens": _tok(s)[1],
+            "total_tokens": sum(_tok(s)),
             "count": s["count"],
         }
         for name, s in sorted_tools
@@ -283,17 +330,16 @@ def analyze_session(session_path, show_cut_points=True):
     )
     print(f"  {'─' * 28} {'─' * 6} {'─' * 10} {'─' * 10} {'─' * 10} {'─' * 7}")
 
-    tool_token_grand = sum(
-        estimate_tokens(s["use_chars"] + s["result_chars"]) for _, s in sorted_tools
-    ) or 1
+    tool_token_grand = sum(sum(_tok(s)) for _, s in sorted_tools) or 1
 
     for name, s in sorted_tools:
-        use_tok = estimate_tokens(s["use_chars"])
-        res_tok = estimate_tokens(s["result_chars"])
+        use_tok, res_tok = _tok(s)
         total_tok = use_tok + res_tok
         pct = (total_tok / tool_token_grand) * 100
+        imgs = (f"  incl. {s['result_images']} image(s), {s['result_image_tokens']:,} tok"
+                if s["result_images"] else "")
         print(
-            f"  {name:<28s} {s['count']:>6d} {use_tok:>10,d} {res_tok:>10,d} {total_tok:>10,d} {pct:>6.1f}%"
+            f"  {name:<28s} {s['count']:>6d} {use_tok:>10,d} {res_tok:>10,d} {total_tok:>10,d} {pct:>6.1f}%{imgs}"
         )
 
     print()
@@ -363,16 +409,18 @@ def analyze_session(session_path, show_cut_points=True):
         print(f"  {'─' * 5} {'─' * 12}  {'─' * 50}")
 
         cumulative_chars = 0
+        cumulative_image_tokens = 0
         cut_points = []
         for i, obj in enumerate(chain):
             cc = count_content_chars(obj)
-            cumulative_chars += cc["total"]
+            cumulative_chars += cc["total"] - cc["image"]
+            cumulative_image_tokens += _accurate_image_tokens(obj, tier)
             if obj.get("type") == "user":
                 text = _extract_text_from_content(_get_content(obj))
                 preview = text.replace("\n", " ").strip()
                 if len(preview) > 100:
                     preview = preview[:100] + "..."
-                cum_tokens = estimate_tokens(cumulative_chars)
+                cum_tokens = estimate_tokens(cumulative_chars) + cumulative_image_tokens
                 cut_points.append({
                     "position": i,
                     "cumulative_tokens": cum_tokens,
@@ -385,7 +433,7 @@ def analyze_session(session_path, show_cut_points=True):
 
     # ── 5. Chain health ─────────────────────────────────────────────────
 
-    issues, warnings = _check_chain_health(objects, chain, uuid_index)
+    issues, warnings = _check_chain_health(objects, chain, uuid_index, relink)
     stats["health_issues"] = issues
     stats["health_warnings"] = warnings
 
@@ -425,7 +473,8 @@ def _subtree_size(children, root_uuid):
     return total
 
 
-def _check_chain_health(objects, chain, uuid_index):
+def _check_chain_health(objects, chain, uuid_index, relink=None,
+                        allow_broken_relink=False):
     """Run health checks on the session chain.
 
     Returns (issues, warnings).
@@ -434,22 +483,57 @@ def _check_chain_health(objects, chain, uuid_index):
     `apply` must refuse to swap it in. `warnings` are advisory: conditions that
     occur in healthy, untouched Claude Code sessions and therefore must not gate
     a strip.
+
+    Parent links are checked as Claude Code sees them (`compact_relink`): a
+    preserved record's on-disk parent is irrelevant, CC re-links it.
     """
     issues = []
     warnings = []
+    if relink is None:
+        relink = compact_relink(objects)
+
+    # ── Hard: preserved records a compact boundary keeps must resolve ────
+    # If one listed uuid is missing (or the segment walk breaks), CC relinks
+    # nothing and drops every preserved record from the conversation — a
+    # silent truncation like the ones below, just larger.
+    if relink["status"] == "broken":
+        if relink["missing"]:
+            msg = (f"Compact boundary {relink['boundary']} preserves "
+                   f"{len(relink['preserved']):,} records but {len(relink['missing']):,} "
+                   f"are missing from the file (e.g. {relink['missing'][0]})")
+        else:
+            msg = (f"Compact boundary {relink['boundary']} preserves a segment that no "
+                   f"longer resolves (the tail→head parentUuid walk breaks)")
+        msg += " — Claude Code will relink nothing and drop every preserved record"
+        (warnings if allow_broken_relink else issues).append(
+            msg + (" (already broken in the original)" if allow_broken_relink else ""))
 
     # ── Hard: parentUuid integrity along the active chain ────────────────
     for i, obj in enumerate(chain):
-        parent_uuid = obj.get("parentUuid")
-        if parent_uuid is not None and parent_uuid not in uuid_index:
+        parent_uuid = effective_parent(obj, relink)
+        if parent_uuid is None:
+            continue
+        if parent_uuid not in uuid_index:
             issues.append(
                 f"Broken parent link at chain pos {i}: "
                 f"uuid={obj.get('uuid', '?')} references missing parentUuid={parent_uuid}"
             )
+        elif parent_uuid in relink["dropped"]:
+            warnings.append(
+                f"Chain starts at pos {i} on a parent Claude Code drops on load "
+                f"(uuid={obj.get('uuid', '?')} → {parent_uuid}, before the last compact "
+                f"boundary); CC falls back to a timestamp match there"
+            )
 
     # ── Hard: slug consistency ───────────────────────────────────────────
+    # Records a compact boundary preserved are exempt: they can predate a
+    # `/branch` and carry the parent session's slug, and CC itself splices
+    # them in (seen 2026-11-10: a branched session's chain held both slugs).
+    preserved = set(relink["preserved"]) if relink["status"] == "ok" else set()
     slugs = set()
     for obj in chain:
+        if obj.get("uuid") in preserved:
+            continue
         s = obj.get("slug")
         if s is not None:
             slugs.add(s)
@@ -499,11 +583,17 @@ def _check_chain_health(objects, chain, uuid_index):
     # the attachment is stamped a few ms early), and session resume/fork
     # re-links records that keep much older timestamps. Neither indicates
     # corruption, so neither should block a swap.
+    #
+    # Edges CC re-links on load (a compact boundary's preserved records) are
+    # skipped: older preserved records following a newer boundary is the
+    # design, not disorder.
     prev_ts = None
+    relinked = relink["parents"]
     for i, obj in enumerate(chain):
         ts = obj.get("timestamp")
         if ts is not None:
-            if prev_ts is not None and ts < prev_ts:
+            if (prev_ts is not None and ts < prev_ts
+                    and obj.get("uuid") not in relinked):
                 warnings.append(
                     f"Timestamp out of order at chain pos {i}: "
                     f"{ts} < previous {prev_ts}"
@@ -513,20 +603,25 @@ def _check_chain_health(objects, chain, uuid_index):
     return issues, warnings
 
 
-def health_check(session_path):
+def health_check(session_path, allow_broken_relink=False):
     """Quick chain health verification.
 
     Args:
         session_path: Path to the .jsonl session file.
+        allow_broken_relink: report a broken compact-boundary relink as a
+            warning, not an issue (apply passes this when the ORIGINAL was
+            already broken, so a pre-existing break cannot block every strip).
 
     Returns:
         True if all checks pass, False otherwise.
     """
     objects = load_session(session_path)
     uuid_index = build_uuid_index(objects)
-    chain = walk_active_chain(objects, uuid_index)
+    relink = compact_relink(objects)
+    chain = walk_active_chain(objects, uuid_index, relink=relink)
 
-    issues, warnings = _check_chain_health(objects, chain, uuid_index)
+    issues, warnings = _check_chain_health(objects, chain, uuid_index, relink,
+                                           allow_broken_relink=allow_broken_relink)
 
     if not issues:
         print("HEALTH CHECK: PASS")

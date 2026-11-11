@@ -14,7 +14,9 @@ import json
 # would inflate the context saving the caller thinks they got.
 TOOL_USE_RESULT_PLACEHOLDER = "[stripped by session-stripper]"
 
-from .chain import load_session, build_uuid_index, walk_active_chain, resolve_range, save_session, estimate_tokens
+from .chain import (load_session, build_uuid_index, walk_active_chain, resolve_range,
+                    save_session, estimate_tokens, session_model)
+from .image_tokens import content_image_stats, tier_for_model
 
 
 def _get_content(obj):
@@ -100,11 +102,13 @@ def strip_tools(session_path, dry_run=False, no_backup=False,
     if not chain:
         print("No active chain found.")
         return {"tool_use_cleared": 0, "tool_result_cleared": 0, "images_cleared": 0,
+                "nested_images_cleared": 0, "image_tokens_saved": 0,
                 "tool_use_result_cleared": 0, "sidecar_chars_saved": 0,
                 "chars_saved": 0, "est_tokens_saved": 0, "by_tool": {}}
 
     start, end = resolve_range(chain, from_pos, to_pos)
     target_uuids = {chain[i]["uuid"] for i in range(start, end + 1)}
+    tier = tier_for_model(session_model(chain))
 
     # Build tool_use_id -> tool_name mapping from the entire session
     tool_id_to_name = _build_tool_use_id_to_name(objects)
@@ -115,13 +119,24 @@ def strip_tools(session_path, dry_run=False, no_backup=False,
     stats = {
         "tool_use_cleared": 0,
         "tool_result_cleared": 0,
-        "images_cleared": 0,
+        "images_cleared": 0,          # every image removed, top-level or nested
+        "nested_images_cleared": 0,   # of those, inside a tool_result
+        "image_tokens_saved": 0,      # pixel formula, not chars/4
         "tool_use_result_cleared": 0,
         "sidecar_chars_saved": 0,
         "chars_saved": 0,
         "est_tokens_saved": 0,
         "by_tool": {},
     }
+    image_chars = 0  # serialized image chars inside chars_saved
+
+    def _count_removed_images(content):
+        nonlocal image_chars
+        s = content_image_stats(content, tier)
+        stats["images_cleared"] += s["count"]
+        stats["nested_images_cleared"] += s["nested"]
+        stats["image_tokens_saved"] += s["tokens"]
+        image_chars += s["chars"]
 
     for obj in objects:
         obj_uuid = obj.get("uuid")
@@ -149,7 +164,7 @@ def strip_tools(session_path, dry_run=False, no_backup=False,
                     new_content.append(block)
                 else:
                     chars = _content_char_count(block)
-                    stats["images_cleared"] += 1
+                    _count_removed_images([block])
                     stats["chars_saved"] += chars
                 continue
 
@@ -197,6 +212,12 @@ def strip_tools(session_path, dry_run=False, no_backup=False,
 
                 result_content = block.get("content")
                 old_chars = _content_char_count(result_content)
+                if isinstance(result_content, list):
+                    # Images a tool returned (Read on an image, screenshots)
+                    # sit INSIDE the result. Every branch below removes them:
+                    # they are not "lines", so --keep-last-lines drops them too.
+                    # (Counted via the block itself, so they register as nested.)
+                    _count_removed_images([block])
 
                 if keep_last_lines is not None:
                     # Preserve last N lines
@@ -205,6 +226,8 @@ def strip_tools(session_path, dry_run=False, no_backup=False,
                     elif isinstance(result_content, list):
                         new_items = []
                         for item in result_content:
+                            if isinstance(item, dict) and item.get("type") == "image":
+                                continue
                             if isinstance(item, dict) and item.get("type") == "text":
                                 trimmed = _keep_last_lines(item.get("text", ""), keep_last_lines)
                                 if not trimmed:
@@ -263,12 +286,19 @@ def strip_tools(session_path, dry_run=False, no_backup=False,
                 cleared_result_tools[0], {"cleared": 0, "chars_saved": 0})
             by_tool["sidecar_chars_saved"] = by_tool.get("sidecar_chars_saved", 0) + saved
 
-    stats["est_tokens_saved"] = estimate_tokens(stats["chars_saved"])
+    # Text sized at chars/4; images by the pixel formula (their base64 at
+    # chars/4 would claim 20-100x what the model was actually charged).
+    stats["est_tokens_saved"] = (estimate_tokens(max(0, stats["chars_saved"] - image_chars))
+                                 + stats["image_tokens_saved"])
 
     # Print summary
     print(f"Tool use inputs cleared:  {stats['tool_use_cleared']}")
     print(f"Tool results cleared:     {stats['tool_result_cleared']}")
-    print(f"Images removed:           {stats['images_cleared']}")
+    nested = stats["nested_images_cleared"]
+    print(f"Images removed:           {stats['images_cleared']}"
+          + (f" ({nested} inside tool results)" if nested else "")
+          + (f", ~{stats['image_tokens_saved']:,} tokens ({tier.name} tier)"
+             if stats["images_cleared"] else ""))
     print(f"Characters saved:         {stats['chars_saved']:,}")
     print(f"Est. tokens saved:        {stats['est_tokens_saved']:,}")
     if stats["tool_use_result_cleared"]:

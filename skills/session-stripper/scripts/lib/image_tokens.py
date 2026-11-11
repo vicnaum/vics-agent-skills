@@ -1,22 +1,40 @@
 """Anthropic-accurate image token estimation.
 
 The bytes-divided-by-4 heuristic the rest of session-stripper uses is fine for
-text/tool_use/tool_result/thinking but wildly wrong for images — base64 expands
-~33% on top of the raw bytes, and a screenshot's actual Anthropic token cost is
-based on pixel dimensions, not byte size. The error can be 50-100×.
+text/tool_use/tool_result/thinking but wildly wrong for images: an image's
+token cost depends on its pixel dimensions, not on its base64 size. Sizing a
+screenshot's base64 as text over-counts it 20-100x.
 
-Anthropic's documented formula:
+THE FORMULA (Anthropic vision docs, checked 2026-11)
+----------------------------------------------------
+Claude processes images in 28×28-pixel patches ("visual tokens"):
 
-    tokens ≈ (width_px × height_px) / 750
+    tokens = ceil(width / 28) × ceil(height / 28)
 
-…clamped to a minimum of 1 and a maximum of 1600 (roughly the cost of a 1092×1092
-image; larger images are downscaled to fit). This module:
+after downscaling the image (aspect preserved) to the largest size that fits
+BOTH of its model's limits:
 
-1. Parses width/height from raw image bytes for PNG, JPEG, WebP (VP8/VP8L/VP8X),
-   and GIF — the formats that actually appear in claude.ai / CC sessions.
-2. Applies the formula.
-3. Falls back to the cap (1600) when dimensions can't be parsed — over-counting
-   beats under-counting for context budgeting.
+    tier             models                    max long edge   max tokens
+    high-resolution  Claude 4.7 and later      2,576 px        4,784
+    standard         all other models          1,568 px        1,568
+
+`resized_size()` is a straight port of the reference implementation in
+platform.claude.com/docs/en/build-with-claude/vision-coordinates ("How Claude
+resizes and pads images"), including Python's round-half-to-even.
+
+The previous rule here, (w×h)/750 capped at 1,600, is the standard tier's
+older approximation. On the high-resolution tier it under-counts every image
+past ~1.2 MP by up to 3x. Measured on a claude-opus-5-5 session: across 69
+turns that each added images, the usage delta was this formula's figure plus a
+steady ~40-90 tokens of per-turn overhead (2325×1300 cost 4,040 tokens; the
+formula says 3,948, the old rule said 1,600).
+
+WHERE IMAGES LIVE IN A CLAUDE CODE TRANSCRIPT
+---------------------------------------------
+Pasted images are top-level `image` blocks in a user message. Images that a
+tool returns (Read on a .png/.jpg, screenshots, MCP tools) are NESTED inside
+the `tool_result` block's `content` list. Both are sent to the model.
+`iter_image_blocks()` yields both kinds.
 
 Pure stdlib. No external dependencies.
 """
@@ -24,19 +42,91 @@ Pure stdlib. No external dependencies.
 from __future__ import annotations
 
 import base64
+import json
+import math
+import re
 import struct
+from collections import namedtuple
 
-# Anthropic constants — see https://docs.anthropic.com/ vision pricing.
-_PIXELS_PER_TOKEN = 750
-_MAX_TOKENS_PER_IMAGE = 1600
+PATCH_PX = 28
+
+ImageTier = namedtuple("ImageTier", "name max_edge max_tokens")
+
+HIGH_RES = ImageTier("high-resolution", 2576, 4784)
+STANDARD = ImageTier("standard", 1568, 1568)
+
+# Claude Code's default models are all on the high-resolution tier, and an
+# over-count is safer than an under-count for context budgeting.
+DEFAULT_TIER = HIGH_RES
 
 
-def anthropic_image_tokens(width: int, height: int) -> int:
-    """Anthropic's image token cost: ceil((w × h) / 750), clamped to [1, 1600]."""
+def tier_for_model(model) -> ImageTier:
+    """Resolution tier of a model id ("Claude 4.7 and later" = high-res).
+
+    Accepts bare ids (claude-opus-5-5), dated ids (claude-haiku-4-5-20251001),
+    legacy ids (claude-3-7-sonnet-20250219) and platform-prefixed ids
+    (us.anthropic.claude-sonnet-4-6). Unknown or missing ids get DEFAULT_TIER.
+    """
+    if not isinstance(model, str) or not model or model.startswith("<"):
+        return DEFAULT_TIER
+    m = model.lower()
+    if "fable" in m or "mythos" in m:
+        return HIGH_RES
+    # claude-<family>-<major>[-<minor>]  (current naming)
+    hit = re.search(r"claude-(?:opus|sonnet|haiku)-(\d+)(?:-(\d{1,2}))?(?!\d)", m)
+    if hit:
+        major = int(hit.group(1))
+        minor = int(hit.group(2)) if hit.group(2) else 0
+        return HIGH_RES if (major, minor) >= (4, 7) else STANDARD
+    # claude-<major>[-<minor>]-<family>  (Claude 3.x naming)
+    if re.search(r"claude-\d", m):
+        return STANDARD
+    return DEFAULT_TIER
+
+
+def count_image_tokens(width: int, height: int) -> int:
+    """Visual tokens of an image as sent: one per 28×28 patch."""
+    return math.ceil(width / PATCH_PX) * math.ceil(height / PATCH_PX)
+
+
+def resized_size(width: int, height: int, tier: ImageTier = DEFAULT_TIER):
+    """(width, height) Claude resizes an image to before padding.
+
+    Port of the docs' reference implementation. Images that already fit both
+    limits come back unchanged.
+    """
+    max_edge, max_tokens = tier.max_edge, tier.max_tokens
+
+    def fits(w: int, h: int) -> bool:
+        return (math.ceil(w / PATCH_PX) * PATCH_PX <= max_edge
+                and math.ceil(h / PATCH_PX) * PATCH_PX <= max_edge
+                and count_image_tokens(w, h) <= max_tokens)
+
+    if fits(width, height):
+        return (width, height)
+    if height > width:
+        resized_h, resized_w = resized_size(height, width, tier)
+        return (resized_w, resized_h)
+
+    # Binary search along the long edge for the largest aspect-preserving
+    # size that fits.
+    aspect_ratio = width / height
+    lo, hi = 1, width  # lo always fits; hi never fits
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        if fits(mid, max(round(mid / aspect_ratio), 1)):
+            lo = mid
+        else:
+            hi = mid
+    return (lo, max(round(lo / aspect_ratio), 1))
+
+
+def anthropic_image_tokens(width: int, height: int,
+                           tier: ImageTier = DEFAULT_TIER) -> int:
+    """Token cost of a width×height image on `tier`, after Claude's resize."""
     if width <= 0 or height <= 0:
         return 1
-    raw = (width * height) / _PIXELS_PER_TOKEN
-    return max(1, min(_MAX_TOKENS_PER_IMAGE, round(raw)))
+    return count_image_tokens(*resized_size(width, height, tier))
 
 
 def image_dims_from_bytes(data: bytes) -> tuple[int, int] | None:
@@ -141,19 +231,30 @@ def image_dims_from_base64(data_b64: str) -> tuple[int, int] | None:
     if not isinstance(data_b64, str) or not data_b64:
         return None
     try:
-        # Image headers live in the first ~64 bytes; decoding the whole payload
-        # is fine (base64 is fast and we already paid the cost reading the JSONL).
+        # Image headers usually sit in the first few hundred bytes, but a JPEG
+        # can carry EXIF/ICC segments before its SOF marker, so decode it all
+        # (base64 is fast and we already paid the cost reading the JSONL).
         decoded = base64.b64decode(data_b64, validate=False)
     except Exception:
         return None
     return image_dims_from_bytes(decoded)
 
 
-def image_block_tokens(block) -> int:
+def image_block_dims(block):
+    """(width, height) of a base64 image block, or None."""
+    if not isinstance(block, dict) or block.get("type") != "image":
+        return None
+    src = block.get("source")
+    if not isinstance(src, dict) or src.get("type") != "base64":
+        return None
+    return image_dims_from_base64(src.get("data", ""))
+
+
+def image_block_tokens(block, tier: ImageTier = DEFAULT_TIER) -> int:
     """Anthropic token cost for an image content block in a CC envelope.
 
-    Returns 0 if the block isn't an image. Falls back to the cap (1600) when
-    dimensions can't be parsed — conservative for context budgeting.
+    Returns 0 if the block isn't a base64 image. Falls back to the tier's cap
+    when dimensions can't be parsed — conservative for context budgeting.
     """
     if not isinstance(block, dict) or block.get("type") != "image":
         return 0
@@ -162,5 +263,42 @@ def image_block_tokens(block) -> int:
         return 0
     dims = image_dims_from_base64(src.get("data", ""))
     if dims is None:
-        return _MAX_TOKENS_PER_IMAGE
-    return anthropic_image_tokens(*dims)
+        return tier.max_tokens
+    return anthropic_image_tokens(*dims, tier=tier)
+
+
+def iter_image_blocks(content, _parent=None):
+    """Yield (image_block, parent_block) for every image in a content list.
+
+    `parent_block` is None for a top-level image and the containing block
+    (a `tool_result`, in practice) for a nested one. Recurses into any block
+    whose `content` is a list, so images inside tool results are found.
+    """
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "image":
+            yield block, _parent
+        elif isinstance(block.get("content"), list):
+            yield from iter_image_blocks(block["content"], block)
+
+
+def image_payload_chars(block) -> int:
+    """Characters an image block occupies when serialized (what chars/4
+    sizing would have charged for it)."""
+    return len(json.dumps(block, ensure_ascii=False))
+
+
+def content_image_stats(content, tier: ImageTier = DEFAULT_TIER) -> dict:
+    """Images in a content list: count, nested count, serialized chars and
+    token cost on `tier`."""
+    stats = {"count": 0, "nested": 0, "chars": 0, "tokens": 0}
+    for block, parent in iter_image_blocks(content):
+        stats["count"] += 1
+        if parent is not None:
+            stats["nested"] += 1
+        stats["chars"] += image_payload_chars(block)
+        stats["tokens"] += image_block_tokens(block, tier)
+    return stats

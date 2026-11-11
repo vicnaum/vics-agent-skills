@@ -140,6 +140,16 @@ If you edit an earlier turn, the API drops every later thinking block. Claude Co
 
 **Practical rule: strip once, and deeply.** Each mid-session strip wipes the reasoning built up since the previous one.
 
+### Compact boundaries can keep earlier messages
+
+Since CC 2.1.3xx a `/compact` can keep a run of records from **before** its boundary verbatim. The boundary (`type: system`, `subtype: compact_boundary`, `parentUuid: null`) lists them in `compactMetadata.preservedMessages` (`{anchorUuid, uuids}`) and/or `preservedSegment` (`{headUuid, anchorUuid, tailUuid}`). On every load Claude Code splices them back in after the anchor and drops the rest of the pre-boundary records. No on-disk `parentUuid` leads from the leaf to them, but they are sent on every request.
+
+Every command walks the chain the way CC does (`compact_relink()` in `lib/chain.py`, a port of CC 2.1.322's loader). `analyze` prints a COMPACTION section with the number of preserved records.
+
+- **Incident 2026-11-10:** a session at 913k tokens showed ~174k to `analyze`. The walk stopped at the boundary, so 3,122 preserved records (thinking, tool calls, 64 tool-result images) were invisible. `strip-all` freed almost nothing, and the gauge went back to 91% on the next turn.
+- **Deleting a preserved record must update the list.** CC refuses the whole relink if one listed uuid is missing. It then drops every preserved record from the conversation, silently. `remove_objects_and_rewire()` prunes deleted uuids from the list and moves a segment's head, tail and anchor to surviving records. `verify` and `apply` treat a broken list as a hard failure. A break already present in the original is only a warning, so it cannot block every strip.
+- Preserved records can predate a `/branch` and carry the parent session's slug. The slug check skips them.
+
 ## What Gets Stripped
 
 | Target | Impact | Command |
@@ -148,7 +158,7 @@ If you edit an earlier turn, the API drops every later thinking block. Claude Co
 | Tool results (`tool_result.content`) | 40-60% of context | `strip-tools --only-results` |
 | Thinking blocks | 10-20% of context | `strip-thinking` |
 | Superseded attachments (system-reminders) | 5-15% of context, more on long sessions | `strip-attachments` |
-| Images | Variable (can be 50%+) | `strip-tools` (auto) |
+| Images (pasted, or returned by a tool inside its `tool_result`) | ~1.1k tokens per typical frame, up to 4,784 each | `strip-tools` (auto) |
 | Images → text transcripts | Variable (often 90%+) | `replace-images` |
 | Everything above | 60-90% of context | `strip-all` |
 
@@ -415,13 +425,18 @@ Session-stripper does not generate summaries itself (it stays stdlib-pure). The 
 
 ## Image Replacement
 
-Images in CC JSONL are base64-inlined. A 53-image session can be 1M+ tokens of base64 while the *information* in the images is often an order of magnitude smaller (chat screenshots, UIs, memes). `replace-images` swaps each image block for a text block carrying a pre-generated transcript.
+Images in CC JSONL are base64-inlined. A 53-image session holds megabytes of base64, but the model is charged by pixels (see Key Facts). The *information* in the images is often far smaller still (chat screenshots, UIs, memes). `replace-images` swaps each image block for a text block carrying a pre-generated transcript.
+
+Images live in two places, and every image command handles both:
+
+- **Pasted images:** top-level `image` blocks in a user message.
+- **Images a tool returned:** Read on a `.png`/`.jpg`, screenshots, MCP image tools. These are **nested inside the `tool_result` block's `content` list**, and in a working session they are usually most of the images. `list-images`, `replace-images`, `analyze`, `strip-tools` and `persist-tools` all used to look only at top-level blocks: on 2026-11-10 `list-images` found 1 of 71 images in context.
 
 Images are keyed by **SHA256 of their decoded bytes** — the same image in two messages hits the same transcript, and identity is unambiguous across any CC session (not tied to claude.ai export formats).
 
 ### Workflow
 
-1. Run `list-images` to enumerate all image blocks with their sizes and SHA256 hashes.
+1. Run `list-images` to enumerate all image blocks: chain position, where each sits (`message` or `tool_result:<tool>`), dimensions, token cost, size and SHA256.
 2. Generate one transcript per unique hash (e.g. via Claude Code subagents with Read on the source image files; Claude's vision handles PNG/JPG/WebP natively). Save each as `<transcripts-dir>/<sha256>.txt` (UTF-8).
 3. Run `replace-images --dir <transcripts-dir>` to perform the surgery.
 
@@ -437,13 +452,15 @@ python3 <skill-dir>/scripts/stripper.py replace-images <session.jsonl> --dir ./i
 python3 <skill-dir>/scripts/stripper.py replace-images <session.jsonl> --dir ./image-transcripts --drop-missing
 ```
 
-Each replaced image becomes a text block: `<image sha256="..." media_type="...">\n{transcript}\n</image>`. Default behavior when a transcript is missing: **keep the original image** (pass `--drop-missing` to drop instead).
+Each replaced image becomes a text block carrying a `<persisted-image sha256="..." media_type="...">` marker; the transcript is copied to `<sessionId>/persisted/image/<sha256>.txt`. A nested image is replaced inside its `tool_result`. Default behavior when a transcript is missing: **keep the original image** (pass `--drop-missing` to drop instead; a result or message left empty gets `""` or an `[image removed]` text block, since the API rejects empty user content).
+
+`strip-tools` removes nested images along with their tool result. That includes `--keep-last-lines`: an image is not a line, so it is not kept.
 
 ## Compact Operation
 
 `compact --before N` splits the active chain at position N:
 - Pre-cut (0 to N-1): extracted to dialogue-only summary behind compact boundary
-- Post-cut (N onward): kept fully intact with fresh UUIDs and remapped chain
+- Post-cut (N onward): kept fully intact with fresh UUIDs, each record chained to the previous one *in chain order*. On-disk `parentUuid` is not chain order for records an older compact boundary preserved. Older compact boundaries are not copied: CC sends only what follows the last boundary, so a copy mid-chain would hide everything before it.
 
 Three fields MUST be correct or the session breaks silently:
 1. `parentUuid` -- unbroken chain to null root
@@ -456,7 +473,14 @@ Output is a new session file. Resume with `claude -r <session-id>`.
 
 - Tool content is the #1 context consumer (~60% typical)
 - Thinking blocks are sent to API and count in client-side estimates -- always strip them
-- **Image tokens are computed via Anthropic's `(w×h)/750` formula (capped at 1600), not chars/4.** A typical screenshot is 380–1600 tokens regardless of base64 byte size — the chars/4 heuristic over-counts images by 50–100×. `analyze` shows the corrected number and notes the discrepancy. Implementation in `lib/image_tokens.py`; supports PNG, JPEG, WebP (VP8/VP8L/VP8X), GIF.
+- **Image tokens use Anthropic's pixel formula, never chars/4:** `ceil(w/28) × ceil(h/28)`, after the image is downscaled to its model's tier.
+  - The **high-resolution** tier covers Claude 4.7 and later: Opus 4.7+, Sonnet 5/5.5, Haiku 5.5, Fable, Mythos. It allows ≤2,576 px on the long edge and ≤4,784 tokens per image.
+  - The **standard** tier covers older models. It allows ≤1,568 px and ≤1,568 tokens.
+  - The tier comes from the session's model; unknown models count as high-res.
+  - The old rule, `(w×h)/750` capped at 1,600, under-counted every image past ~1.2 MP by up to 3× on current models.
+  - Checked against real usage on a claude-opus-5-5 session: 69 image turns each cost the formula's figure plus ~40-90 tokens of overhead. A 2325×1300 frame cost 4,040 tokens; the formula says 3,948, the old rule said 1,600.
+  - chars/4 on base64 over-counts 20–100×. That matters beyond reporting: it feeds the gauge reset, and would pin the meter past the limit.
+  - Implementation is in `lib/image_tokens.py`, including a port of the docs' resize reference. It parses PNG, JPEG, WebP (VP8/VP8L/VP8X) and GIF.
 - `formatTranscript()` only strips orphaned (thinking-only messages) and trailing (last message) thinking -- the rest survives
 - **Wrapped thinking is auto-detected.** Any text block whose whole content is a single `<thinking>…</thinking>` or `<think>…</think>` span (e.g. from `convert_to_cli.py --flatten-thinking`, or from open-source models that emit `<think>` tags) is treated as a real thinking block by `analyze`, `show-thinking`, `strip-thinking`, `strip-all`, and `persist-thinking`. No flag needed.
 - Backups are created automatically and **enumerated** (`.bak`, `.bak.1`, `.bak.2`, …) — a fresh one per run, never skipped (use `--no-backup` to opt out)
@@ -466,6 +490,7 @@ Output is a new session file. Resume with `claude -r <session-id>`.
 - **Attachments are real context, not metadata** — CC re-expands each into a `<system-reminder>` on every request and never dedupes them. They are also `parentUuid` chain participants, so they cannot simply be deleted; `strip-attachments` re-parents their children. See the attachments section above.
 - **Every write is compact JSON, mode 0600, the way CC writes.** Claude Code's fast transcript scanner matches raw bytes such as `{"parentUuid":` and `"type":"last-prompt"`. A file written with Python's default `", "`/`": "` separators looks empty to it. Incident 2026-10-25 (CC 2.1.310): after a strip, the background-session dispatcher decided there was nothing to restore. It started a fresh conversation under the same id and moved the stripped file aside as `<id>.orphaned-<ts>-<rand>.jsonl`. A plain `claude -r` still loaded the file, because it parses fully. If you find such an `.orphaned-` file, it holds the real conversation; nothing was deleted.
 - **`last-prompt` records point at the resume leaf** (`leafUuid`). Removing a record re-points them at the nearest surviving ancestor, as it does for children.
+- **The chain is what CC loads, not what `parentUuid` alone reaches.** Records a compact boundary preserved are part of it (see "Compact boundaries can keep earlier messages"). If `analyze` reports far less than CC's own `/context`, check its COMPACTION section first.
 - **The request journal is not context.** Since CC 2.1.300, transcripts record every request (`api-request`, `api-request-blob`, `api-request-shape`; often 10-15% of the file), so a shared transcript can reproduce it. Resume rebuilds the request from the chain (verified: the first request after a swap starts with `keep: 0`), so stripping works regardless; `analyze` shows the journal as on-disk only.
 - No external dependencies -- Python 3.8+ stdlib only
 

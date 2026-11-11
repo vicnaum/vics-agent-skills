@@ -871,7 +871,7 @@ def main():
     # list-images
     p_list_images = subparsers.add_parser(
         "list-images",
-        help="List image blocks with SHA256 hashes (active chain)",
+        help="List image blocks (also inside tool results) with tokens and SHA256 hashes (active chain)",
     )
     p_list_images.add_argument("session", help="Path to session JSONL file")
     p_list_images.set_defaults(func=cmd_list_images)

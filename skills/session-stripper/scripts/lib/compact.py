@@ -7,7 +7,8 @@ import copy
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .chain import load_session, build_uuid_index, walk_active_chain, save_session, estimate_tokens
+from .chain import (load_session, build_uuid_index, walk_active_chain, save_session,
+                    estimate_tokens, is_compact_boundary)
 
 
 def extract_dialogue(chain_slice):
@@ -193,27 +194,25 @@ def compact_before(session_path, before_pos, dry_run=False, no_backup=False,
     }
     new_objects.append(summary)
 
-    # Lines 2+: intact messages from post-cut with new UUIDs
-    old_to_new = {}
-    for i, msg in enumerate(post_cut):
-        new_uuid = str(uuid.uuid4())
-        old_uuid = msg.get("uuid")
-        if old_uuid:
-            old_to_new[old_uuid] = new_uuid
+    # Lines 2+: intact messages from post-cut with new UUIDs.
+    #
+    # Older compact boundaries are not copied: Claude Code sends only what
+    # follows the LAST boundary in the conversation, so one landing mid-chain
+    # here would hide the summary and everything before it. (They carry no
+    # content; a relinked chain — see chain.compact_relink — can hold them.)
+    post_cut = [m for m in post_cut if not is_compact_boundary(m)]
 
+    prev_uuid = summary_uuid
     for i, msg in enumerate(post_cut):
         new_msg = copy.deepcopy(msg)
 
-        # Assign new UUID
-        old_uuid = msg.get("uuid")
-        new_msg["uuid"] = old_to_new.get(old_uuid, str(uuid.uuid4()))
-
-        # Remap parentUuid
-        if i == 0:
-            new_msg["parentUuid"] = summary_uuid
-        else:
-            old_parent = msg.get("parentUuid")
-            new_msg["parentUuid"] = old_to_new.get(old_parent, old_parent)
+        # Assign new UUID and chain it to the previous record IN CHAIN ORDER.
+        # On-disk parentUuid is not the chain order for records a compact
+        # boundary preserved (CC re-links those on load), so remapping it
+        # would leave them dangling in the new file.
+        new_msg["uuid"] = str(uuid.uuid4())
+        new_msg["parentUuid"] = prev_uuid
+        prev_uuid = new_msg["uuid"]
 
         # Set consistent sessionId and slug
         new_msg["sessionId"] = new_session_id

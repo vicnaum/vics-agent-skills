@@ -6,6 +6,9 @@ import re
 import shutil
 from pathlib import Path
 
+from .image_tokens import (DEFAULT_TIER, content_image_stats, image_payload_chars,
+                           iter_image_blocks, tier_for_model)
+
 
 # Matches a text block whose entire content (modulo surrounding whitespace) is a
 # single <thinking>...</thinking> or <think>...</think> span. Used to detect
@@ -55,23 +58,186 @@ def build_uuid_index(objects):
     return {obj["uuid"]: obj for obj in objects if "uuid" in obj}
 
 
-def walk_active_chain(objects, uuid_index=None):
-    """Walk parentUuid from the last non-sidechain leaf back to root, return in chronological order."""
+# ── Compact boundaries that preserve messages (CC >= 2.1.3xx) ─────────────
+#
+# A `/compact` no longer always throws the old conversation away. The boundary
+# record (`type: system, subtype: compact_boundary, parentUuid: null`) can carry
+# `compactMetadata.preservedMessages = {anchorUuid, uuids: [...]}` and/or
+# `compactMetadata.preservedSegment = {headUuid, anchorUuid, tailUuid}`: a run
+# of records from BEFORE the boundary that stays in the conversation verbatim.
+# On every load Claude Code splices them back in after the anchor (see
+# `compact_relink`), so they are sent to the model on every request, even
+# though no `parentUuid` on disk leads from the leaf to them.
+#
+# A walk that stops at the boundary's null parent misses all of them. Incident
+# 2026-11-10 (CC 2.1.322): a session at 913k tokens showed ~174k to `analyze`;
+# 3,122 preserved records (thinking, tool calls, 64 tool-result images) were
+# invisible, so `strip-all` freed almost nothing and the gauge snapped back to
+# 91% on the next turn.
+
+def is_compact_boundary(obj):
+    return (isinstance(obj, dict) and obj.get("type") == "system"
+            and obj.get("subtype") == "compact_boundary")
+
+
+def _resolve_preserved(meta, entries):
+    """The preserved list a boundary's metadata names: (uuids, anchor, source),
+    or None when CC cannot resolve it (mirrors CC's `uWo`).
+
+    `preservedMessages` wins when present: an explicit list in conversation
+    order. Otherwise `preservedSegment` is resolved by walking on-disk
+    parentUuid from tailUuid back to headUuid."""
+    pm = meta.get("preservedMessages")
+    if pm:
+        if not isinstance(pm, dict):
+            return None
+        return list(pm.get("uuids") or []), pm.get("anchorUuid"), "list"
+    seg = meta.get("preservedSegment")
+    if not isinstance(seg, dict):
+        return None
+    head = seg.get("headUuid")
+    seen = set()
+    out = []
+    cur = entries.get(seg.get("tailUuid"))
+    while cur is not None and cur.get("uuid") not in seen:
+        seen.add(cur["uuid"])
+        out.append(cur["uuid"])
+        if cur["uuid"] == head:
+            out.reverse()
+            return out, seg.get("anchorUuid"), "walk"
+        p = cur.get("parentUuid")
+        cur = entries.get(p) if p else None
+    return None
+
+
+def compact_relink(objects):
+    """How Claude Code relinks this transcript on load.
+
+    A faithful port of CC 2.1.322's transcript loader (minified `dWo`/`uWo`):
+
+    1. Only the LAST compact boundary in file order matters. If it carries
+       preserved records, they are chained in list order after the anchor:
+       uuids[0].parent = anchor, uuids[i].parent = uuids[i-1].
+    2. Every other record whose parent is the anchor (the new compact summary,
+       usually) is re-parented to the last preserved record.
+    3. Every record before the boundary that is not preserved is dropped, and
+       user/assistant records whose parent was dropped are re-parented to the
+       last preserved record.
+
+    CC gives up (relinks nothing, drops nothing) when the preserved list
+    cannot be resolved or names a uuid that is not in the file — and then the
+    walk from the leaf stops at the boundary, so EVERY preserved record
+    silently leaves the conversation. Mutations must therefore keep the lists
+    in sync with deletions (see `remove_objects_and_rewire`).
+
+    Returns a dict:
+        status     "none" (nothing to relink), "ok", or "broken"
+        boundary   uuid of the last compact boundary, or None
+        anchor     anchorUuid of the preserved run, or None
+        preserved  preserved uuids in conversation order ([] if none)
+        source     "list" (preservedMessages) or "walk" (preservedSegment)
+        parents    {uuid: effective parentUuid} overrides
+        dropped    uuids CC drops on load
+        missing    listed uuids absent from the file (status "broken")
+    """
+    entries = {}
+    for obj in objects:
+        u = obj.get("uuid") if isinstance(obj, dict) else None
+        if u:
+            entries[u] = obj  # first position, last value wins (a JS Map)
+
+    result = {"status": "none", "boundary": None, "anchor": None,
+              "preserved": [], "source": None, "parents": {},
+              "dropped": set(), "missing": []}
+
+    last_b = -1
+    pres_b = -1
+    meta = None
+    order = {}
+    for i, (u, obj) in enumerate(entries.items()):
+        order[u] = i
+        if is_compact_boundary(obj):
+            last_b = i
+            result["boundary"] = u
+            cm = obj.get("compactMetadata")
+            if isinstance(cm, dict) and (cm.get("preservedMessages")
+                                         or cm.get("preservedSegment")):
+                meta = cm
+                pres_b = i
+    if meta is None:
+        return result
+
+    preserved, anchor, source = [], None, None
+    if pres_b == last_b:
+        resolved = _resolve_preserved(meta, entries)
+        if resolved is None:
+            result["status"] = "broken"
+            return result
+        preserved, anchor, source = resolved
+    # (An OLDER boundary's preserved info is moot: CC drops everything before
+    # the last boundary, which has none.)
+
+    missing = [u for u in preserved if u not in entries]
+    if missing:
+        result.update(status="broken", anchor=anchor, preserved=preserved,
+                      source=source, missing=missing)
+        return result
+
+    parents = {}
+    if preserved:
+        prev = anchor
+        for u in preserved:
+            parents[u] = prev
+            prev = u
+        first, last = preserved[0], preserved[-1]
+        if anchor is not None:
+            for u, obj in entries.items():
+                if u != first and parents.get(u, obj.get("parentUuid")) == anchor:
+                    parents[u] = last
+
+    keep = set(preserved)
+    dropped = {u for u, i in order.items() if i < last_b and u not in keep}
+    if preserved and dropped:
+        last = preserved[-1]
+        for u, obj in entries.items():
+            if u in dropped or obj.get("type") not in ("user", "assistant"):
+                continue
+            p = parents.get(u, obj.get("parentUuid"))
+            if p is not None and p in dropped:
+                parents[u] = last
+
+    result.update(status="ok", anchor=anchor, preserved=preserved,
+                  source=source, parents=parents, dropped=dropped)
+    return result
+
+
+def effective_parent(obj, relink):
+    """parentUuid of `obj` as Claude Code sees it after `compact_relink`."""
+    u = obj.get("uuid")
+    if u in relink["parents"]:
+        return relink["parents"][u]
+    return obj.get("parentUuid")
+
+
+def walk_active_chain(objects, uuid_index=None, relink=None):
+    """Walk from the last non-sidechain leaf back to root, return in
+    chronological order — the conversation Claude Code loads and sends.
+
+    Follows parentUuid as CC sees it: records a compact boundary preserved are
+    spliced back in (`compact_relink`), and records CC drops on load are not
+    part of the chain.
+    """
     if uuid_index is None:
         uuid_index = build_uuid_index(objects)
+    if relink is None:
+        relink = compact_relink(objects)
+    dropped = relink["dropped"]
 
-    # Find children for each uuid
-    children = {}
-    for obj in objects:
-        parent = obj.get("parentUuid")
-        if parent is not None:
-            children.setdefault(parent, []).append(obj)
-
-    # Find the leaf: start from the last object and follow the non-sidechain path
-    # The last message in the file that is a user or assistant message is typically the leaf
+    # The leaf: the last user/assistant message in the file that CC keeps.
     leaf = None
     for obj in reversed(objects):
-        if obj.get("type") in ("user", "assistant") and not obj.get("isSidechain"):
+        if (obj.get("type") in ("user", "assistant") and not obj.get("isSidechain")
+                and obj.get("uuid") not in dropped):
             leaf = obj
             break
 
@@ -80,11 +246,16 @@ def walk_active_chain(objects, uuid_index=None):
 
     # Walk backwards from leaf to root
     chain = []
+    seen = set()
     current = leaf
     while current is not None:
+        u = current.get("uuid")
+        if u in seen:  # a cycle; CC stops and keeps the partial chain too
+            break
+        seen.add(u)
         chain.append(current)
-        parent_uuid = current.get("parentUuid")
-        if parent_uuid is None:
+        parent_uuid = effective_parent(current, relink)
+        if parent_uuid is None or parent_uuid in dropped:
             break
         current = uuid_index.get(parent_uuid)
 
@@ -164,8 +335,14 @@ def remove_objects_and_rewire(objects, uuids_to_remove, protect=None):
     """Remove objects by uuid and rewire parentUuid on descendants to skip them.
 
     When a message is dropped, any child pointing to it is re-parented to the
-    nearest surviving ancestor (walking up parentUuid). This keeps the active
-    chain unbroken so the API doesn't see dangling references.
+    nearest surviving ancestor (walking up parentUuid as Claude Code sees it,
+    i.e. after `compact_relink`). This keeps the active chain unbroken so the
+    API doesn't see dangling references.
+
+    Removed records are also pruned from every compact boundary's preserved
+    list, and a preserved segment's head/tail/anchor are moved to surviving
+    records: CC refuses the whole relink if one listed uuid is missing, and
+    then silently drops every preserved record from the conversation.
 
     `protect` is the set of uuids that must survive as chain stepping-stones
     even when asked to remove them — their payload is emptied instead. Defaults
@@ -192,6 +369,16 @@ def remove_objects_and_rewire(objects, uuids_to_remove, protect=None):
         return objects, 0, 0, anchored_count
 
     uuid_to_obj = {obj.get("uuid"): obj for obj in objects if obj.get("uuid")}
+    relink = compact_relink(objects)
+    # Segment orders must be walked before the loop below rewires parents.
+    seg_orders = {}
+    for obj in objects:
+        if not is_compact_boundary(obj):
+            continue
+        seg = (obj.get("compactMetadata") or {}).get("preservedSegment")
+        if isinstance(seg, dict) and any(seg.get(k) in uuids_to_remove
+                                         for k in ("headUuid", "tailUuid")):
+            seg_orders[obj.get("uuid")] = _segment_order(seg, uuid_to_obj)
 
     def find_surviving_ancestor(uuid):
         seen = set()
@@ -203,7 +390,7 @@ def remove_objects_and_rewire(objects, uuids_to_remove, protect=None):
             obj = uuid_to_obj.get(cur)
             if obj is None:
                 return None
-            cur = obj.get("parentUuid")
+            cur = effective_parent(obj, relink)
         return cur
 
     survivors = []
@@ -220,9 +407,71 @@ def remove_objects_and_rewire(objects, uuids_to_remove, protect=None):
         # that still exists, like any other child
         if obj.get("type") in ("last-prompt", "summary") and obj.get("leafUuid") in uuids_to_remove:
             obj["leafUuid"] = find_surviving_ancestor(obj["leafUuid"])
+        if is_compact_boundary(obj):
+            _prune_preserved(obj, uuids_to_remove, find_surviving_ancestor,
+                             seg_orders.get(obj.get("uuid"), []))
         survivors.append(obj)
 
     return survivors, len(uuids_to_remove), rewired, anchored_count
+
+
+def _segment_order(seg, uuid_to_obj):
+    """uuids of a preservedSegment in conversation order (head → tail), walked
+    on the ORIGINAL objects; [] if the walk does not reach the head."""
+    resolved = _resolve_preserved({"preservedSegment": seg}, uuid_to_obj)
+    return resolved[0] if resolved else []
+
+
+def _prune_preserved(boundary, removed, surviving_ancestor, seg_order):
+    """Keep a compact boundary's preserved-record references valid after
+    `removed` uuids are deleted. `seg_order` is its preservedSegment in
+    conversation order, walked before any rewiring. Rebinds (never mutates)
+    nested dicts, because dry runs hand us shallow copies that share them with
+    live data."""
+    cm = boundary.get("compactMetadata")
+    if not isinstance(cm, dict):
+        lp = boundary.get("logicalParentUuid")
+        if lp in removed:
+            boundary["logicalParentUuid"] = surviving_ancestor(lp)
+        return
+    new_cm = dict(cm)
+    changed = False
+
+    pm = cm.get("preservedMessages")
+    if isinstance(pm, dict):
+        new_pm = dict(pm)
+        uuids = pm.get("uuids")
+        if isinstance(uuids, list) and any(u in removed for u in uuids):
+            new_pm["uuids"] = [u for u in uuids if u not in removed]
+        if pm.get("anchorUuid") in removed:
+            new_pm["anchorUuid"] = surviving_ancestor(pm["anchorUuid"])
+        if new_pm != pm:
+            new_cm["preservedMessages"] = new_pm
+            changed = True
+
+    seg = cm.get("preservedSegment")
+    if isinstance(seg, dict) and any(seg.get(k) in removed
+                                     for k in ("headUuid", "tailUuid", "anchorUuid")):
+        new_seg = dict(seg)
+        order = [u for u in seg_order if u not in removed]
+        if seg.get("headUuid") in removed or seg.get("tailUuid") in removed:
+            if order:
+                new_seg["headUuid"], new_seg["tailUuid"] = order[0], order[-1]
+            else:
+                new_seg = None  # nothing of the segment survives
+        if new_seg is not None and seg.get("anchorUuid") in removed:
+            new_seg["anchorUuid"] = surviving_ancestor(seg["anchorUuid"])
+        if new_seg is None:
+            new_cm.pop("preservedSegment", None)
+        else:
+            new_cm["preservedSegment"] = new_seg
+        changed = True
+
+    if changed:
+        boundary["compactMetadata"] = new_cm
+    lp = boundary.get("logicalParentUuid")
+    if lp in removed:
+        boundary["logicalParentUuid"] = surviving_ancestor(lp)
 
 
 def _next_backup_path(path):
@@ -286,17 +535,62 @@ def compute_active_chain_tokens(objects, uuid_index=None):
     them (a `prompt_snapshot` attachment, CC >= 2.1.267): the latest snapshot
     on the chain is what every request sends. Older sessions have none, and
     the estimate then remains a floor, not the exact size.
+
+    Images are priced by Anthropic's pixel formula for the session model's
+    tier, never as base64 text: chars/4 on a screenshot's base64 reads 20-100x
+    too high, enough to pin the gauge past the context limit.
     """
     from .attachment_cost import envelope_rendered_chars, snapshot_chars
 
     chain = walk_active_chain(objects, uuid_index)
-    total_chars = sum(count_content_chars(obj)["total"] for obj in chain)
-    total_chars += sum(envelope_rendered_chars(obj) for obj in chain)
+    tier = tier_for_model(session_model(chain))
+    text_chars, image_tokens = chain_token_parts(chain, tier)
+    text_chars += sum(envelope_rendered_chars(obj) for obj in chain)
     snaps = [o for o in chain if o.get("type") == "attachment"
              and (o.get("attachment") or {}).get("type") == "prompt_snapshot"]
     if snaps:
-        total_chars += snapshot_chars(snaps[-1]["attachment"])
-    return estimate_tokens(total_chars)
+        text_chars += snapshot_chars(snaps[-1]["attachment"])
+    return estimate_tokens(text_chars) + image_tokens
+
+
+def session_model(chain):
+    """Model of the newest assistant record on the chain: the model the
+    session will continue on.
+
+    Claude Code writes local assistant records (API errors, "Prompt is too
+    long", interrupts) with the placeholder model "<synthetic>". They are not
+    a real model, so they are skipped."""
+    for obj in reversed(chain):
+        if obj.get("type") == "assistant":
+            msg = obj.get("message")
+            model = msg.get("model") if isinstance(msg, dict) else None
+            if model and not model.startswith("<"):
+                return model
+    return None
+
+
+def _obj_content(obj):
+    msg = obj.get("message") if isinstance(obj, dict) else None
+    return msg.get("content") if isinstance(msg, dict) else (
+        obj.get("content") if isinstance(obj, dict) else None)
+
+
+def obj_image_tokens(obj, tier=None):
+    """Token cost of every image in a record's content, top-level and nested
+    inside tool results, on `tier` (default: high-resolution)."""
+    return content_image_stats(_obj_content(obj), tier or DEFAULT_TIER)["tokens"]
+
+
+def chain_token_parts(objs, tier=None):
+    """(text_chars, image_tokens) for a run of records: text-like content to
+    be sized at chars/4, and images priced by the pixel formula."""
+    text_chars = 0
+    image_tokens = 0
+    for obj in objs:
+        cc = count_content_chars(obj)
+        text_chars += cc["total"] - cc["image"]
+        image_tokens += obj_image_tokens(obj, tier)
+    return text_chars, image_tokens
 
 
 def _context_fields_total(u):
@@ -417,7 +711,12 @@ def estimate_tokens(chars):
 
 
 def count_content_chars(obj):
-    """Count characters by block type in a message object's content field."""
+    """Count characters by block type in a message object's content field.
+
+    Images nested inside a tool_result count under "image", not
+    "tool_result": callers price the "image" bucket by the pixel formula, and
+    sizing a Read screenshot's base64 as tool output inflates it 20-100x.
+    """
     counts = {"tool_use": 0, "tool_result": 0, "thinking": 0, "text": 0, "image": 0, "other": 0, "total": 0}
     msg = obj.get("message", {}) if isinstance(obj, dict) else {}
     content = msg.get("content") if isinstance(msg, dict) else obj.get("content")
@@ -440,6 +739,12 @@ def count_content_chars(obj):
                     # Attribute wrapped <thinking>/<think> text blocks to the
                     # thinking bucket so they show up in analyze() output.
                     counts["thinking"] += char_count
+                elif block_type != "image" and isinstance(block.get("content"), list):
+                    nested = sum(image_payload_chars(b)
+                                 for b, _ in iter_image_blocks(block["content"]))
+                    bucket = block_type if block_type in counts else "other"
+                    counts[bucket] += char_count - nested
+                    counts["image"] += nested
                 elif block_type in counts:
                     counts[block_type] += char_count
                 else:

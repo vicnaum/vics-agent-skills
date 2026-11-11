@@ -202,9 +202,13 @@ def apply_pending(path, dry_run: bool = False, no_backup: bool = False,
         print("WARNING: no meta sidecar — skipping lineage check "
               "(snapshot predates it, or sidecar was deleted).")
 
-    # 3. health of what we're about to swap in
+    # 3. health of what we're about to swap in. A compact-boundary relink that
+    # was already broken in the original is reported, not fatal: the strip
+    # did not cause it, and refusing would block every strip of the session.
     from .analyze import health_check
-    if not health_check(str(pend)):
+    from .chain import compact_relink, load_session
+    orig_broken = compact_relink(load_session(orig))["status"] == "broken"
+    if not health_check(str(pend), allow_broken_relink=orig_broken):
         raise ApplyRefused(f"pending copy fails verify — not swapping: {pend}")
 
     stats = {

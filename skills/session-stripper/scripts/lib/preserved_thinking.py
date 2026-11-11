@@ -27,7 +27,8 @@ from __future__ import annotations
 
 import json
 
-from .chain import build_uuid_index, estimate_tokens, load_session, walk_active_chain
+from .chain import (build_uuid_index, estimate_tokens, load_session,
+                    session_model, walk_active_chain)
 
 # Models that run preserved thinking's history-editing check.
 BOUND_MODEL_PREFIXES = (
@@ -39,22 +40,10 @@ BOUND_MODEL_PREFIXES = (
 
 _THINKING_TYPES = ("thinking", "redacted_thinking")
 
-
-def session_model(chain):
-    """Model of the newest assistant record on the chain: the model the
-    session will continue on, which is the one that runs the check.
-
-    Claude Code writes local assistant records (API errors, "Prompt is too
-    long", interrupts) with the placeholder model "<synthetic>". They are not
-    a real model, so they are skipped: a session ending on one would otherwise
-    read as unbound and the check would stay silent."""
-    for obj in reversed(chain):
-        if obj.get("type") == "assistant":
-            msg = obj.get("message")
-            model = msg.get("model") if isinstance(msg, dict) else None
-            if model and not model.startswith("<"):
-                return model
-    return None
+# `session_model(chain)` (imported from chain, still importable from here):
+# the newest real model on the chain, skipping CC's "<synthetic>" records —
+# the model that runs the check. A session ending on a synthetic record would
+# otherwise read as unbound and the check would stay silent.
 
 
 def is_bound_model(model):

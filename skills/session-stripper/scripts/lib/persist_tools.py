@@ -9,9 +9,11 @@ from .chain import (
     load_session,
     resolve_range,
     save_session,
+    session_model,
     walk_active_chain,
     wrapped_thinking_text,
 )
+from .image_tokens import content_image_stats, tier_for_model
 from .persist_layout import persist_dir as _new_persist_dir, to_marker_path
 
 # Preview length for the new persist marker shape (matches persist_text/message).
@@ -422,6 +424,7 @@ def persist_tools_bulk(session_path, dry_run=False, no_backup=False,
 
     start, end = resolve_range(chain, from_pos, to_pos)
     target_uuids = {chain[i]["uuid"] for i in range(start, end + 1)}
+    tier = tier_for_model(session_model(chain))
 
     tool_id_to_name = _build_tool_use_id_to_name(objects)
     tool_name_set = set(tool_names) if tool_names else None
@@ -466,8 +469,11 @@ def persist_tools_bulk(session_path, dry_run=False, no_backup=False,
         "skipped_count": 0,
         "chars_saved": 0,
         "est_tokens_saved": 0,
+        "images_removed": 0,
+        "image_tokens_saved": 0,
         "persisted_tools": [],
     }
+    image_chars = 0  # serialized image chars inside chars_saved
 
     for item in eligible:
         block = item["block"]
@@ -507,6 +513,10 @@ def persist_tools_bulk(session_path, dry_run=False, no_backup=False,
 
         new_chars = len(replacement)
         chars_saved = max(0, original_chars - new_chars)
+        img = content_image_stats(content, tier)  # images the marker replaces
+        stats["images_removed"] += img["count"]
+        stats["image_tokens_saved"] += img["tokens"]
+        image_chars += min(img["chars"], chars_saved)
 
         if not dry_run:
             # Save original to file
@@ -528,13 +538,19 @@ def persist_tools_bulk(session_path, dry_run=False, no_backup=False,
             "chars_saved": chars_saved,
         })
 
-    stats["est_tokens_saved"] = estimate_tokens(stats["chars_saved"])
+    # Text at chars/4; images a tool returned by the pixel formula, not their
+    # base64 (which would claim 20-100x what the model was charged).
+    stats["est_tokens_saved"] = (estimate_tokens(stats["chars_saved"] - image_chars)
+                                 + stats["image_tokens_saved"])
 
     # Print summary
     print(f"Tool results persisted:   {stats['persisted_count']}")
     print(f"Already persisted (skip): {stats['skipped_count']}")
     print(f"Kept recent (last {keep_recent}):   {len(results) - len(eligible) if results else 0}")
     print(f"Characters saved:         {stats['chars_saved']:,}")
+    if stats["images_removed"]:
+        print(f"Images removed:           {stats['images_removed']}, "
+              f"~{stats['image_tokens_saved']:,} tokens ({tier.name} tier)")
     print(f"Est. tokens saved:        {stats['est_tokens_saved']:,}")
 
     if stats["persisted_tools"]:
