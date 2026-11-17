@@ -1839,16 +1839,24 @@ trust_dir() { # cli dir -> pre-accept that CLI's folder-trust prompt for dir (rc
 
 # A trust dialog is answered by moving the menu cursor onto its "Yes" option
 # and confirming THAT — never by pressing Enter on whatever is preselected.
-TRUST_GATE_RE='trust this folder|do you trust|Yes, I trust|trust the (files|contents)|allow Codex to work in this folder'
+TRUST_GATE_RE='trust this folder|do you trust|Yes, I trust|one you trust|trust the (files|contents)|allow Codex to work in this folder'
 THEME_GATE_RE='Choose the text style|Select your theme'
 
+# Menu option lines: optional box border, optional cursor, optional index
+# ("1." — Claude Code 2.1 hides indexes, Codex shows them), then Yes/No. A
+# shell-prompt glyph (❯ in pure/starship) on the launch line above the
+# dialog is not an option line, so it never counts as the menu cursor.
+TRUST_OPT_PRE='^[[:space:]│|]*'
+TRUST_OPT_IDX='[[:space:]]*([0-9]+[.)][[:space:]]*)?'
+trust_yes_line() { # screen-text -> 1-based line of the "Yes" option, rc 1 if none
+  local n; n=$(printf '%s\n' "$1" | grep -nE "${TRUST_OPT_PRE}(❯|›|>)?${TRUST_OPT_IDX}Yes" | head -n1 | cut -d: -f1)
+  [ -n "$n" ] && echo "$n"
+}
 trust_choice() { # screen-text -> "cursor-line yes-line" (1-based), rc 1 if the menu can't be read
   local cur yes
-  # numbered menu options only: a shell prompt glyph (❯ in pure/starship)
-  # on the launch line above the dialog must not count as the menu cursor
-  cur=$(printf '%s\n' "$1" | grep -nE '^[[:space:]]*(❯|›|>)[[:space:]]*[0-9]+[.)][[:space:]]' | head -n1 | cut -d: -f1)
-  yes=$(printf '%s\n' "$1" | grep -nE '^[[:space:]]*(❯|›|>)?[[:space:]]*[0-9]+[.)][[:space:]]*Yes' | head -n1 | cut -d: -f1)
-  [ -n "$cur" ] && [ -n "$yes" ] || return 1
+  cur=$(printf '%s\n' "$1" | grep -nE "${TRUST_OPT_PRE}(❯|›|>)${TRUST_OPT_IDX}(Yes|No)" | head -n1 | cut -d: -f1)
+  yes=$(trust_yes_line "$1") || return 1
+  [ -n "$cur" ] || return 1
   echo "$cur $yes"
 }
 
@@ -2080,7 +2088,7 @@ APPLESCRIPT
   local ttypath i try landed=0
   case "$sb" in
     tmux)  ttypath=$(tmux display -p -t "$sa" '#{pane_tty}');;
-    iterm) ttypath=$(agent_tty iterm "$sa");;
+    iterm) ttypath=$(unset _TERM_LIST; agent_tty iterm "$sa");;   # live lookup: a new pane isn't in any snapshot
   esac
   for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22; do   # up to ~45s
     if [ -n "$ttypath" ]; then
@@ -2102,7 +2110,10 @@ APPLESCRIPT
     # first-launch gates appear before the input box exists. A trust dialog
     # (should be pre-empted by trust_dir) is answered by selecting its "Yes"
     # option explicitly — its default is "No, exit", so a bare Enter quits.
-    if printf '%s' "$scr" | grep -qiE "$TRUST_GATE_RE"; then
+    # (a --prompt that itself mentions folder trust is echoed on the launch
+    # line: without a "Yes" option on screen that is not a dialog)
+    if printf '%s' "$scr" | grep -qiE "$TRUST_GATE_RE" \
+       && { trust_yes_line "$raw" >/dev/null || ! printf '%s' "$task" | grep -qiE "$TRUST_GATE_RE"; }; then
       [ "$try" -le 2 ] && accept_trust_gate "$sb" "$sa" \
         || die "spawn: a folder-trust dialog is blocking the new agent in $sb pane $sa and couldn't be answered safely — trust $dir yourself (start the CLI there once and pick 'Yes, I trust'), then answer the dialog in that pane"
       sleep 3

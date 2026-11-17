@@ -221,9 +221,11 @@ cmd_spawn child --tmux --cmd claude --no-trust --dir "$WORK"
 echo 1 > "$HOME/cur"
 term_screen() {
   if [ -e "$HOME/accepted" ]; then echo 'You are a fresh agent'
-  else local c; c=$(cat "$HOME/cur"); echo ' Do you trust the files in this folder?'
-    if [ "$c" = 1 ]; then echo ' ❯ 1. No, exit'; echo '   2. Yes, I trust this folder'
-    else echo '   1. No, exit'; echo ' ❯ 2. Yes, I trust this folder'; fi; fi
+  else local c; c=$(cat "$HOME/cur"); echo '❯ claude "You are a fresh agent"'
+    # Claude Code 2.1 shape: indexes hidden, "No, exit" listed and focused first
+    echo ' Quick safety check: Is this a project you created or one you trust?'
+    if [ "$c" = 1 ]; then echo ' ❯ No, exit'; echo '   Yes, I trust this folder'
+    else echo '   No, exit'; echo ' ❯ Yes, I trust this folder'; fi; fi
 }
 term_enter() { echo enter >> "$TRACE"; [ "$(cat "$HOME/cur" 2>/dev/null)" = 2 ] && touch "$HOME/accepted"; return 0; }
 term_type() { echo type >> "$TRACE"; }
@@ -235,6 +237,31 @@ cmd_spawn child --tmux --cmd claude --no-trust --dir "$WORK"
         self.assertIn('Kickoff delivered', r.stdout)
         # launch line + Enter, then Down onto "Yes" BEFORE the dialog's Enter
         self.assertEqual(self.trace.read_text().splitlines(), ['type', 'enter', 'key down', 'enter'])
+
+    def test_prompt_mentioning_trust_is_not_a_dialog(self):
+        r = self.shell(r'''
+tmux() { case "$1" in new-session) echo %5;; display) echo /dev/mock;; esac; }
+term_type() { echo type >> "$TRACE"; }; term_enter() { echo enter >> "$TRACE"; }
+term_key() { echo "key $3" >> "$TRACE"; }
+term_screen() { echo 'You are a fresh agent. Your task: check "do you trust this folder" wording'; }
+tty_has_cli() { return 0; }
+cmd_spawn child --tmux --cmd claude --no-trust --dir "$WORK" --prompt 'check "do you trust this folder" wording'
+''')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('Kickoff delivered', r.stdout)
+        self.assertEqual(self.trace.read_text().splitlines(), ['type', 'enter'])
+
+    def test_unrecognised_launch_command_still_launches(self):
+        r = self.shell(r'''
+tmux() { case "$1" in new-session) echo %5;; display) echo /dev/mock;; esac; }
+term_type() { echo "type $3" >> "$TRACE"; }; term_enter() { :; }
+term_screen() { echo 'You are a fresh agent'; }
+tty_has_cli() { return 0; }
+cmd_spawn child --tmux --cmd somewrapper --dir "$WORK"
+''')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(self.trace.read_text().startswith('type somewrapper\n'))
+        self.assertFalse((self.home / '.claude.json').exists())
 
     def test_spawn_pretrusts_before_launch(self):
         r = self.shell(r'''
