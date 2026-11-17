@@ -47,9 +47,12 @@
 #   agent-chat key <name> <key...>          send keys/shortcuts: escape (stop current work), enter,
 #                                           ctrl-c, tab, shift-tab, up/down/left/right, ctrl-b/o/r/t/v...
 #                                           e.g. remote slash command: type <n> "/compact" + key <n> enter
-#   agent-chat spawn <name> [--dir <path>] [--prompt "task"] [--cmd "claude ..."] [--tab|--pane|--bg] [--tmux]
+#   agent-chat spawn <name> [--dir <path>] [--prompt "task"] [--cmd "claude ..."] [--tab|--pane|--below|--bg] [--of <agent|pane>] [--tmux] [--no-trust]
 #                                           launch a NEW agent: new iTerm window, --tab = tab in your window,
-#                                           --pane = split next to you (or tmux with --tmux / headless),
+#                                           --pane = split next to you, --below = split under you,
+#                                           --of <agent|pane-id> = split that pane instead of yours
+#                                           (or tmux with --tmux / headless); pre-trusts --dir for
+#                                           claude/codex first (--no-trust skips),
 #                                           --bg = Claude Code background session (no window at all),
 #                                           reusing this session CLI flags; it registers itself as <name>
 #   agent-chat respawn <name> [--prompt "task"] [--report-to <name>] [--dry-run] [--no-wait]
@@ -1760,35 +1763,165 @@ bg_launch() {
   echo "$job"
 }
 
-cmd_spawn() { # <name> [--dir d] [--cmd "claude ..."] [--prompt "task"] [--tab|--pane|--bg] [--tmux]
-  local name="" dir="$PWD" cmd="" task="" force_tmux=0 place="window"
+# ---------- folder trust (pre-accepted so spawn never meets a trust dialog) ----------
+#
+# Claude Code's "trust this folder" dialog now DEFAULTS to "No, exit", so
+# pressing Enter on it quits the CLI. spawn therefore records the trust up
+# front, in the CLI's own config, for the exact folder it launches in (trust
+# inherited from a parent folder does not suppress the dialog). Backups are
+# kept once per file: ~/.claude.json.bak-agentchat, config.toml.bak-agentchat.
+
+trust_claude() { # abs-dir -> ensure ~/.claude.json projects[dir].hasTrustDialogAccepted = true
+  local f="$HOME/.claude.json" d="$1" tmp
+  [ ! -L "$f" ] || { echo "agent-chat: $f is a symlink — not pre-trusting $d" >&2; return 1; }
+  if [ -e "$f" ]; then
+    $JQ -e 'type == "object"' "$f" >/dev/null 2>&1 \
+      || { echo "agent-chat: $f is not a JSON object — not pre-trusting $d" >&2; return 1; }
+    [ "$($JQ -r --arg d "$d" '.projects[$d].hasTrustDialogAccepted // false' "$f")" = true ] && return 0
+    [ -e "$f.bak-agentchat" ] || cp -p "$f" "$f.bak-agentchat" || return 1
+  fi
+  tmp=$(mktemp "$f.agentchat.XXXXXX") || return 1   # same dir: atomic mv; mktemp makes it 0600
+  if { if [ -e "$f" ]; then cat "$f"; else echo '{}'; fi; } | $JQ --arg d "$d" \
+       '.projects = (.projects // {}) | .projects[$d] = ((.projects[$d] // {}) + {hasTrustDialogAccepted: true})' > "$tmp" \
+     && [ -s "$tmp" ]; then
+    mv "$tmp" "$f"
+  else
+    rm -f "$tmp"; echo "agent-chat: could not update $f — not pre-trusting $d" >&2; return 1
+  fi
+}
+
+trust_codex_one() { # abs-dir -> ensure [projects."dir"] trust_level = "trusted" in Codex's config.toml
+  local cfgdir="${CODEX_HOME:-$HOME/.codex}" d="$1" f hdr state tmp
+  f="$cfgdir/config.toml"
+  case "$d" in *'"'*|*'\'*) echo "agent-chat: path needs TOML escaping — not pre-trusting $d" >&2; return 1;; esac
+  hdr="[projects.\"$d\"]"
+  mkdir -p "$cfgdir" || return 1
+  [ -e "$f" ] || : > "$f" || return 1
+  state=$(awk -v h="$hdr" '
+    { line = $0; sub(/[ \t]+$/, "", line) }
+    line == h { intab = 1; found = 1; next }
+    /^[ \t]*\[/ { intab = 0 }
+    intab && /^[ \t]*trust_level[ \t]*=/ { tl = $0 }
+    END { if (!found) print "absent"; else if (tl == "") print "notl"; else if (tl ~ /"trusted"/) print "trusted"; else print "other" }' "$f")
+  case "$state" in
+    trusted) return 0;;
+    other) echo "agent-chat: $f sets a non-trusted trust_level for $d — leaving it" >&2; return 1;;
+    absent)
+      # some other spelling of the same key (inline table, quoted key under [projects])
+      if grep -qF "\"$d\"" "$f"; then echo "agent-chat: $f mentions $d in a form spawn doesn't edit — leaving it" >&2; return 1; fi;;
+  esac
+  [ -e "$f.bak-agentchat" ] || cp -p "$f" "$f.bak-agentchat" || return 1
+  tmp=$(mktemp "$f.agentchat.XXXXXX") || return 1
+  if [ "$state" = absent ]; then
+    { cat "$f"; [ ! -s "$f" ] || [ -z "$(tail -c1 "$f")" ] || echo; [ ! -s "$f" ] || echo
+      printf '%s\ntrust_level = "trusted"\n' "$hdr"; } > "$tmp"
+  else
+    awk -v h="$hdr" '{ print; line = $0; sub(/[ \t]+$/, "", line); if (line == h) print "trust_level = \"trusted\"" }' "$f" > "$tmp"
+  fi
+  if [ -s "$tmp" ]; then chmod "$(stat -f '%Lp' "$f" 2>/dev/null || stat -c '%a' "$f")" "$tmp" 2>/dev/null; mv "$tmp" "$f"
+  else rm -f "$tmp"; return 1; fi
+}
+
+trust_dir() { # cli dir -> pre-accept that CLI's folder-trust prompt for dir (rc 1 = not done; spawn goes on)
+  local d root rc=0
+  d=$(cd "$2" 2>/dev/null && pwd -P) || return 1   # the CLI sees the physical path (getcwd)
+  case "$1" in
+    claude) trust_claude "$d";;
+    codex)
+      # Codex keys trust by the git root when the folder is inside a repo
+      trust_codex_one "$d" || rc=1
+      root=$(git -C "$d" rev-parse --show-toplevel 2>/dev/null) && [ -n "$root" ] && [ "$root" != "$d" ] \
+        && { trust_codex_one "$root" || rc=1; }
+      return "$rc";;
+    *) return 0;;
+  esac
+}
+
+# A trust dialog is answered by moving the menu cursor onto its "Yes" option
+# and confirming THAT — never by pressing Enter on whatever is preselected.
+TRUST_GATE_RE='trust this folder|do you trust|Yes, I trust|trust the (files|contents)|allow Codex to work in this folder'
+THEME_GATE_RE='Choose the text style|Select your theme'
+
+trust_choice() { # screen-text -> "cursor-line yes-line" (1-based), rc 1 if the menu can't be read
+  local cur yes
+  # numbered menu options only: a shell prompt glyph (❯ in pure/starship)
+  # on the launch line above the dialog must not count as the menu cursor
+  cur=$(printf '%s\n' "$1" | grep -nE '^[[:space:]]*(❯|›|>)[[:space:]]*[0-9]+[.)][[:space:]]' | head -n1 | cut -d: -f1)
+  yes=$(printf '%s\n' "$1" | grep -nE '^[[:space:]]*(❯|›|>)?[[:space:]]*[0-9]+[.)][[:space:]]*Yes' | head -n1 | cut -d: -f1)
+  [ -n "$cur" ] && [ -n "$yes" ] || return 1
+  echo "$cur $yes"
+}
+
+accept_trust_gate() { # backend addr -> selects the "Yes, trust" option and confirms it; rc 1 if it can't be proved
+  local i scr pos cur yes
+  for i in 1 2 3 4 5 6; do
+    scr=$(term_screen "$1" "$2" 2>/dev/null) || return 1
+    pos=$(trust_choice "$scr") || return 1
+    read -r cur yes <<< "$pos"
+    if [ "$cur" = "$yes" ]; then term_enter "$1" "$2" >/dev/null; return 0; fi
+    if [ "$yes" -gt "$cur" ]; then term_key "$1" "$2" down >/dev/null || return 1
+    else term_key "$1" "$2" up >/dev/null || return 1; fi
+    sleep 1
+  done
+  return 1
+}
+
+cli_gone() { # tty-path -> rc 0 when the pane is back at a shell prompt with no agent CLI in it
+  [ -n "$1" ] && tty_fg_shell "$1" && ! tty_has_cli "$1" any
+}
+
+spawn_target() { # agent-name | iTerm session id | tmux pane id -> "backend addr" of an existing pane
+  local t="$1" term
+  if [ ! -e "$REG/$t.json" ]; then
+    case "$t" in %[0-9]*) echo "tmux $t"; return 0;; esac
+    if printf '%s' "$t" | grep -Eq '^([A-Za-z0-9]+:)?[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$'; then
+      echo "iterm ${t#*:}"; return 0   # iTerm session UUID, optionally w0t0p0:-prefixed
+    fi
+  fi
+  term=$(agent_term "$t") || return 1
+  case "$term" in bg\ *) die "spawn: '$t' is a background session — it has no pane to split";; esac
+  echo "$term"
+}
+
+cmd_spawn() { # <name> [--dir d] [--cmd "claude ..."] [--prompt "task"] [--tab|--pane|--below|--bg] [--of <agent|pane>] [--tmux] [--no-trust]
+  local name="" dir="$PWD" cmd="" task="" force_tmux=0 place="window" split="vertical" of="" pretrust=1
   while [ $# -gt 0 ]; do
     case "$1" in
       --dir) dir="$2"; shift 2;;
       --cmd) cmd="$2"; shift 2;;
       --prompt) task="$2"; shift 2;;
       --tab) place="tab"; shift;;
-      --pane) place="pane"; shift;;
+      --pane) place="pane"; split="vertical"; shift;;
+      --below) place="pane"; split="horizontal"; shift;;
+      --of) [ -n "${2:-}" ] || die "spawn: --of needs an agent name or pane id"; of="$2"; shift 2;;
       --bg) place="bg"; shift;;
       --tmux) force_tmux=1; shift;;
+      --no-trust) pretrust=0; shift;;
       -*) die "spawn: unknown arg '$1'";;
       *) [ -n "$name" ] && die "spawn: one name only"; name="$1"; shift;;
     esac
   done
-  [ -n "$name" ] || die 'usage: agent-chat spawn <name> [--dir <path>] [--prompt "task"] [--cmd "claude ..."] [--tab|--pane|--bg] [--tmux]'
+  [ -n "$name" ] || die 'usage: agent-chat spawn <name> [--dir <path>] [--prompt "task"] [--cmd "claude ..."] [--tab|--pane|--below|--bg] [--of <agent|pane-id>] [--tmux] [--no-trust]'
   printf '%s' "$name" | grep -Eq '^[a-z0-9][a-z0-9_-]{0,31}$' || die "invalid agent name '$name'"
   [ -d "$dir" ] || die "no such directory: $dir"
   [ "$place" != bg ] || [ "$force_tmux" = 0 ] || die "spawn: --bg and --tmux are different placements — pick one"
+  if [ -n "$of" ]; then
+    [ "$place" = window ] && place="pane"   # --of alone = split it side by side
+    [ "$place" = pane ] || die "spawn: --of only goes with --pane or --below"
+  fi
 
   # default launch command: reuse this session's own CLI flags (minus session
   # selectors), so e.g. --dangerously-skip-permissions carries over
   [ -n "$cmd" ] || cmd=$(spawner_cmd)
+  local cli; cli=$(cli_of_cmd "$cmd")
 
   local kickoff="You are a fresh agent. First, register on the local agent chat: agent-chat register $name — then check in with: agent-chat read."
   [ -n "$task" ] && kickoff="$kickoff Your task: $(printf '%s' "$task" | tr '\r\n' '  ')"
 
   if [ "$place" = bg ]; then
-    [ "$(cli_of_cmd "$cmd")" = claude ] || die "spawn --bg starts a Claude Code background session; '$cmd' isn't claude"
+    [ "$cli" = claude ] || die "spawn --bg starts a Claude Code background session; '$cmd' isn't claude"
+    [ "$pretrust" = 0 ] || trust_dir claude "$dir" \
+      || echo "agent-chat: WARNING: couldn't pre-trust $dir — a background session there may stall on the trust prompt" >&2
     local job
     job=$(bg_launch "$dir" "$cmd --bg -n $(sq "$name") $(sq "$kickoff")") || exit 1
     echo "Spawned '$name' as Claude Code background session $job (dir: $dir) — no window; humans: claude attach $job"
@@ -1801,24 +1934,35 @@ cmd_spawn() { # <name> [--dir d] [--cmd "claude ..."] [--prompt "task"] [--tab|-
   # popups such as Codex's security notice swallow typed text, and the retries
   # below would pile keystrokes into the new window)
   local argkick=0
-  case "$(cli_of_cmd "$cmd")" in codex|claude) argkick=1;; esac
+  case "$cli" in codex|claude) argkick=1;; esac
 
-  local sb sa own_cli own_sid own_tb="" own_ta="" own_src own
-  # Relative placement needs the caller's verified pane, never the daemon's
-  # inherited terminal or whichever window happens to be frontmost.
-  if [ "$place" != window ]; then
+  local sb sa own_cli own_sid own_tb="" own_ta="" own_src own what="--$place"
+  [ "$split" = horizontal ] && what="--below"
+  # Relative placement needs a verified pane: the caller's own (never the
+  # daemon's inherited terminal or whichever window happens to be frontmost),
+  # or the --of target's, resolved like screen/type resolve an agent.
+  if [ -n "$of" ]; then
+    own=$(spawn_target "$of") || die "spawn: can't locate a pane for --of '$of' — nothing created"
+    read -r own_tb own_ta <<< "$own"
+    [ "$force_tmux" = 0 ] || [ "$own_tb" = tmux ] || die "spawn: --tmux --of needs a tmux pane; '$of' is $own_tb"
+  elif [ "$place" != window ]; then
     own=$(self_identity) || die "spawn: relative placement requires an unambiguous caller session"
     read -r own_cli own_sid <<< "$own"
     read -r own_tb own_ta own_src <<< "$(detect_term "$own_cli" "$own_sid" "")"
-    [ -n "$own_tb" ] && [ "$own_tb" != none ] || die "spawn: can't prove the caller's pane for --$place; enable Codex thread-id titles or use a new window"
-    [ "$force_tmux" = 0 ] || [ "$own_tb" = tmux ] || die "spawn: --tmux --$place requires the caller to be in tmux"
+    [ -n "$own_tb" ] && [ "$own_tb" != none ] || die "spawn: can't prove the caller's pane for $what; enable Codex thread-id titles or use a new window"
+    [ "$force_tmux" = 0 ] || [ "$own_tb" = tmux ] || die "spawn: --tmux $what requires the caller to be in tmux"
   fi
   if [ "$force_tmux" = 1 ] || [ "$own_tb" = tmux ] || { [ -z "$own_tb" ] && ! osascript -e 'tell application "iTerm2" to count windows' >/dev/null 2>&1; }; then
     command -v tmux >/dev/null || die "tmux not available and iTerm unreachable"
     sb="tmux"
     if [ "$own_tb" = tmux ]; then
       if [ "$place" = "pane" ]; then
-        sa=$(tmux split-window -P -F '#{pane_id}' -t "$own_ta" -c "$dir")
+        # -h = side by side (like iTerm's vertical split), -v = below
+        if [ "$split" = horizontal ]; then
+          sa=$(tmux split-window -v -P -F '#{pane_id}' -t "$own_ta" -c "$dir")
+        else
+          sa=$(tmux split-window -h -P -F '#{pane_id}' -t "$own_ta" -c "$dir")
+        fi
       else
         sa=$(tmux new-window -P -F '#{pane_id}' -t "$own_ta" -c "$dir")
       fi
@@ -1847,18 +1991,26 @@ return out
 APPLESCRIPT
  ) || die "spawn: cannot snapshot iTerm sessions — nothing created"
     myid="$own_ta"
+    if [ -n "$of" ] && ! printf '%s\n' "$existing" | grep -qxF "$myid"; then
+      die "spawn: --of '$of' resolves to iTerm session $myid, which doesn't exist — nothing created"
+    fi
     case "$place" in
       pane)
-        # split the spawner's own pane (object-based: no positional window refs)
-        sa=$(osascript - "$myid" <<'APPLESCRIPT'
+        # split the target pane (object-based: no positional window refs)
+        sa=$(osascript - "$myid" "$split" <<'APPLESCRIPT'
 on run argv
   set myId to item 1 of argv
+  set splitDir to item 2 of argv
   tell application "iTerm2"
     repeat with w in windows
       repeat with t in tabs of w
         repeat with s in sessions of t
           if (id of s as text) is equal to myId then
-            tell s to set newSess to (split vertically with default profile)
+            if splitDir is "horizontal" then
+              tell s to set newSess to (split horizontally with default profile)
+            else
+              tell s to set newSess to (split vertically with default profile)
+            end if
             return id of newSess
           end if
         end repeat
@@ -1913,34 +2065,54 @@ APPLESCRIPT
     term_enter "$sb" "$sa" >/dev/null || die "spawn: directory command Enter failed"
   fi
 
+  # record the folder as trusted BEFORE the CLI starts: Claude Code's trust
+  # dialog defaults to "No, exit", so it must not appear at all
+  if [ "$pretrust" = 1 ] && ! trust_dir "$cli" "$dir"; then
+    echo "agent-chat: WARNING: couldn't pre-trust $dir for $cli — a trust dialog may appear" >&2
+  fi
+
   if [ "$argkick" = 1 ]; then term_type "$sb" "$sa" "$cmd $(sq "$kickoff")" >/dev/null || die "spawn: launch text failed"
   else term_type "$sb" "$sa" "$cmd" >/dev/null || die "spawn: launch text failed"; fi
   term_enter "$sb" "$sa" >/dev/null || die "spawn: launch Enter failed"
 
   # wait for the CLI process, then deliver the kickoff with verify-and-retry:
   # input typed during TUI startup (MCP servers still loading) gets swallowed
-  local ttypath deadline try landed=0
+  local ttypath i try landed=0
   case "$sb" in
     tmux)  ttypath=$(tmux display -p -t "$sa" '#{pane_tty}');;
-    iterm) ttypath="";;
+    iterm) ttypath=$(agent_tty iterm "$sa");;
   esac
-  deadline=$((SECONDS + 45))
-  while [ "$SECONDS" -lt "$deadline" ]; do
-    if [ -n "$ttypath" ] && tty_has_cli "$ttypath" any; then break; fi
-    [ -z "$ttypath" ] && [ "$SECONDS" -ge $((deadline - 37)) ] && break   # iterm: fixed ~8s boot wait
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22; do   # up to ~45s
+    if [ -n "$ttypath" ]; then
+      tty_has_cli "$ttypath" any && break
+      # back at the shell after a grace period: exited or never started —
+      # the check below fails loudly instead of waiting out the full timeout
+      [ "$i" -ge 4 ] && cli_gone "$ttypath" && break
+    elif [ "$i" -gt 4 ]; then break   # no tty: fixed ~8s boot wait
+    fi
     sleep 2
   done
-  local scr
+  local scr raw gone_msg="spawn: the CLI is not running in the new $sb pane $sa (it exited, or never started) — no keys sent; look: agent-chat screen, or the pane itself"
   for try in 1 2 3 4; do
     sleep $((try * 4))
-    scr=$(term_screen "$sb" "$sa" 2>/dev/null | tr -d '\n')
-    # first-launch gate prompts appear before the input box exists and must be
-    # cleared with Enter (accept default), NOT by typing the kickoff into them:
-    #   "trust this folder" (new dir), "Yes, I trust", theme picker, etc.
-    if printf '%s' "$scr" | grep -qiE "trust this folder|do you trust|Yes, I trust|Choose the text style|Select your theme"; then
-      term_enter "$sb" "$sa" >/dev/null
+    # never type into a bare shell: if the CLI exited, stop here
+    cli_gone "$ttypath" && die "$gone_msg"
+    raw=$(term_screen "$sb" "$sa" 2>/dev/null)
+    scr=$(printf '%s' "$raw" | tr -d '\n')
+    # first-launch gates appear before the input box exists. A trust dialog
+    # (should be pre-empted by trust_dir) is answered by selecting its "Yes"
+    # option explicitly — its default is "No, exit", so a bare Enter quits.
+    if printf '%s' "$scr" | grep -qiE "$TRUST_GATE_RE"; then
+      [ "$try" -le 2 ] && accept_trust_gate "$sb" "$sa" \
+        || die "spawn: a folder-trust dialog is blocking the new agent in $sb pane $sa and couldn't be answered safely — trust $dir yourself (start the CLI there once and pick 'Yes, I trust'), then answer the dialog in that pane"
       sleep 3
       continue   # re-inspect next iteration before sending the kickoff
+    fi
+    # theme / text-style pickers: their preselected default is fine
+    if printf '%s' "$scr" | grep -qiE "$THEME_GATE_RE"; then
+      term_enter "$sb" "$sa" >/dev/null
+      sleep 3
+      continue
     fi
     if [ "$argkick" = 1 ]; then   # given on the command line: only check it arrived, never retype
       printf '%s' "$scr" | grep -qE "fresh +agent" && { landed=1; break; }

@@ -42,7 +42,7 @@ class FixtureCase(unittest.TestCase):
         self.home = Path(self.tmp.name)
         self.env = os.environ.copy()
         for key in ('CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID', 'OPENCODE_SESSION_ID',
-                    'TMUX', 'TMUX_PANE', 'ITERM_SESSION_ID'):
+                    'TMUX', 'TMUX_PANE', 'ITERM_SESSION_ID', 'CODEX_HOME'):
             self.env.pop(key, None)
         self.trace = self.home / 'trace'
         self.trace.touch()
