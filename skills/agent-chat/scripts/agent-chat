@@ -37,7 +37,9 @@
 #   agent-chat who                          list registered agents and their rooms
 #   agent-chat status [<name>]              live state of an agent: busy|idle|waiting|dead|stopped|offline
 #                                           (Claude Code's own session record first; else title glyph +
-#                                           hook fallback + process liveness)
+#                                           hook fallback + process liveness); "idle (bg shell ...)" =
+#                                           Claude says busy/shell but sits at its prompt while a
+#                                           background shell runs (woken and idle-alerted like idle)
 #   agent-chat nudge <name> [text] [--force] wake it: Claude Code inbox socket (no typing), else type a
 #                                           wake-up line + Enter into its terminal (refuses while someone
 #                                           types in that pane; --force overrides)
@@ -62,11 +64,12 @@
 #                                           session in the SAME pane that re-registers as <name>; refuses
 #                                           unless the pane provably still holds that agent (no override),
 #                                           and refuses a busy agent unless --force-busy
-#   agent-chat watch <name...> [--interval 60] [--idle-alert MIN] [--respawn] [--report-to <name>]
+#   agent-chat watch <name...> [--interval 60] [--idle-alert MIN] [--busy-alert MIN] [--respawn] [--report-to <name>]
 #                                           blocking watchdog for an orchestrator's BACKGROUND shell: exits
 #                                           with a report when an agent is dead, filter-tripped, errored,
-#                                           usage-limited, has stuck input or idles too long (--respawn
-#                                           replaces dead/filter-tripped ones itself); then re-arm it
+#                                           usage-limited, has stuck input, idles too long or (--busy-alert)
+#                                           stays busy too long (--respawn replaces dead/filter-tripped
+#                                           ones itself); then re-arm it in the same turn
 #   agent-chat unregister [<name>]          leave the chat (default: self)
 #   agent-chat web [port]                   local web viewer (default :8787): channels, live
 #                                           messages, people with status + unread counts
@@ -422,6 +425,9 @@ cmd_send() {
       waiting)
         echo "  → $name is blocked on a prompt/dialog — NOT typing (would hit a button). It'll see the message when it resumes. Inspect: agent-chat screen $name";;
       idle)
+        # (false busy: its record says busy/shell only because a background
+        # shell runs — it sits at its prompt, so it is woken like any idle agent)
+        case "$src" in "bg shell"*) echo "  → $name: Claude reports busy, but it is idle at its prompt (background shell running) — waking it";; esac
         nudge_request "$name" "$from";;
       dead|offline|stopped)
         echo "  → $name is $state ($src) — message stored; it'll be delivered when that session restarts and re-registers";;
@@ -1321,22 +1327,68 @@ cc_state() {
   st=$(cc_field "$1" 5); wf=$(cc_field "$1" 6)
   cc_is_bg "$1" && src="claude, background job $(cc_field "$1" 4)"
   case "$st" in
-    busy|shell) printf 'busy\t%s\n' "$src";;    # shell: a tool command is running
+    # shell: a command is running — possibly only a BACKGROUND one
+    # (run_in_background) while the session sits idle at its prompt; agent_state
+    # checks the screen for that "false busy" case (cc_bg_shell_idle)
+    busy|shell) printf 'busy\t%s\n' "$src";;
     waiting)    printf 'waiting\t%s%s\n' "$src" "${wf:+, waiting for $wf}";;
     idle)       printf 'idle\t%s\n' "$src";;
     *)          printf 'unknown\t%s reports status "%s"\n' "$src" "$st";;
   esac
 }
 
+# screen_working <screen-text> — rc 0 when a CLI is mid-turn: Claude Code and
+# Codex both show 'esc to interrupt' (spinner line or footer) only while working.
+# The one test every guard uses (nudge, watch, respawn, false-busy check).
+screen_working() { printf '%s' "$1" | grep -q 'esc to interrupt'; }
+
+# screen_bg_shell_idle <screen-text> -> "N shell(s)" when a Claude Code screen is
+# idle at its prompt while background shells run: a ❯ prompt line, no working
+# marker near or below it, and the footer (lines after the LAST ❯ line) shows
+# '· N shell(s)'. rc 1 otherwise — anything unclear stays busy.
+screen_bg_shell_idle() {
+  local region shells
+  # the prompt, the 3 lines above it (spinner line) and everything below it
+  region=$(printf '%s\n' "$1" | awk '{ l[NR] = $0 } /^❯/ { p = NR }
+    END { if (!p) exit 1; for (i = (p > 3 ? p - 3 : 1); i <= NR; i++) print l[i] }') || return 1
+  [ -n "$region" ] && ! screen_working "$region" || return 1
+  shells=$(printf '%s\n' "$1" | awk '/^❯/ { s = "" ; seen = 1; next } seen { s = s "\n" $0 } END { printf "%s", s }' \
+           | grep -oE '(^|· )[0-9]+ shells?( |·|$)' | tail -n1 | grep -oE '[0-9]+ shells?')
+  [ -n "$shells" ] || return 1
+  printf '%s\n' "$shells"
+}
+
+# cc_bg_shell_idle <name> <record> -> why, when a Claude Code session whose own
+# record says busy/shell is really idle at its prompt with background shells
+# running (the record keeps saying "shell" for as long as one runs). Needs a
+# pane to look at; a background session (no screen) is never reclassified.
+cc_bg_shell_idle() {
+  local term tb ta scr shells
+  cc_is_bg "$2" && return 1
+  term=$(resolve_term "$1" 2>/dev/null) || return 1
+  read -r tb ta <<< "$term"
+  { [ -n "$ta" ] && [ "$tb" != bg ]; } || return 1
+  scr=$(term_screen "$tb" "$ta" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 25)
+  shells=$(screen_bg_shell_idle "$scr") || return 1
+  printf 'claude reports "%s", but its prompt is idle: no spinner, footer shows %s\n' "$(cc_field "$2" 5)" "$shells"
+}
+
 # agent_state <name> -> prints "STATE\tSOURCE"
 # STATE: busy | idle | waiting | dead | stopped | offline | unknown | unlocated
 # (unlocated = alive or not, there is no terminal we could check or type into;
 #  stopped = a Claude Code background session that isn't running — resumable)
+# A Claude agent idle at its prompt while a background shell runs is
+# "idle\tbg shell — ..." (status prints `idle  (bg shell — ...)`): the state
+# word stays idle so every caller wakes/alerts it like any idle agent.
 agent_state() {
-  local name="$1" cli api=0 term rc tb="" ta="" tty g title hstate hepoch age st rec
+  local name="$1" cli api=0 term rc tb="" ta="" tty g title hstate hepoch age st rec why
   cli=$(reg_get "$name" cli); [ -n "$cli" ] || cli=claude
   if [ "$cli" = claude ] && rec=$(cc_holder "$(reg_get "$name" session_id)"); then
-    cc_state "$rec"; return
+    st=$(cc_state "$rec")
+    if [ "${st%%$'\t'*}" = busy ] && why=$(cc_bg_shell_idle "$name" "$rec"); then
+      printf 'idle\tbg shell — %s\n' "$why"; return
+    fi
+    printf '%s\n' "$st"; return
   fi
   if [ "$(reg_get "$name" term_backend)" = bg ]; then
     ta=$(reg_get "$name" term_addr)
@@ -1571,7 +1623,7 @@ nudge_blocker() {
     echo "someone is typing in its pane (focused, last key ${idle}s ago)"; return
   fi
   a=$(screen_tail "$1" "$2")
-  printf '%s' "$a" | grep -q 'esc to interrupt' && { echo "it is working (spinner on screen)"; return; }
+  screen_working "$a" && { echo "it is working (spinner on screen)"; return; }
   sleep "$NUDGE_SETTLE"; b=$(screen_tail "$1" "$2")
   [ "$a" = "$b" ] || echo "its screen is changing (someone typing?)"
 }
@@ -2272,7 +2324,7 @@ cmd_respawn() ( # <name> [--prompt "task"] [--cmd "codex ..."] [--report-to <nam
     if [ "$force_busy" = 0 ]; then
       local scr
       scr=$(term_screen "$tb" "$ta" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 25)
-      if [ "$(glyph_state "$title")" = busy ] || printf '%s' "$scr" | grep -q 'esc to interrupt'; then
+      if [ "$(glyph_state "$title")" = busy ] || screen_working "$scr"; then
         die "respawn: '$name' looks BUSY — refusing (--force-busy if truly stuck)"
       fi
     fi
@@ -2423,8 +2475,13 @@ respawn_bg() {
 #   error   — stream disconnected / retry limit / bad status
 #   limit   — usage limit hit (a respawn would not help)
 #   paste   — a pasted prompt stuck unsent in the input box
-#   idle    — idle longer than --idle-alert minutes (it may have just stopped)
+#   idle    — idle longer than --idle-alert minutes (it may have just stopped);
+#             includes a Claude agent idle at its prompt while a background
+#             shell runs (its record says "shell"/busy: the false-busy case)
+#   busy    — busy without a break for longer than --busy-alert minutes
 #   offline — its pane was closed / it is gone
+# idle and busy are reported once per spell (the signature carries the
+# spell's start), so a re-armed watch does not repeat them.
 
 WATCH_DIR="$BASE/watch"
 
@@ -2432,7 +2489,7 @@ WATCH_DIR="$BASE/watch"
 # A working screen ('esc to interrupt') is never classified.
 watch_classify() {
   local s="$1" m
-  printf '%s' "$s" | grep -q 'esc to interrupt' && return 0
+  screen_working "$s" && return 0
   m=$(printf '%s' "$s" | grep -E "^[[:space:]]?ⓘ +This content can[^ ]{1,3}t be shown" | tail -n1)
   if [ -n "$m" ] && printf '%s' "$s" | grep -q "Apply for Daybreak"; then printf 'filter\t%s\n' "$m"; return 0; fi
   m=$(printf '%s' "$s" | grep -iE "You.ve hit your usage limit|Goal hit usage limits" | tail -n1)
@@ -2444,24 +2501,25 @@ watch_classify() {
   return 0
 }
 
-cmd_watch() { # <name...> [--interval S] [--idle-alert MIN] [--respawn] [--report-to <name>]
-  local names="" interval=60 idle_min=0 respawn=0 report="" argv="$*"
+cmd_watch() { # <name...> [--interval S] [--idle-alert MIN] [--busy-alert MIN] [--respawn] [--report-to <name>]
+  local names="" interval=60 idle_min=0 busy_min=0 respawn=0 report="" argv="$*"
   while [ $# -gt 0 ]; do
     case "$1" in
       --interval) interval="$2"; shift 2;;
       --idle-alert) idle_min="$2"; shift 2;;
+      --busy-alert) busy_min="$2"; shift 2;;
       --respawn) respawn=1; shift;;
       --report-to) report="$2"; shift 2;;
       -*) die "watch: unknown arg '$1'";;
       *) [ -e "$REG/$1.json" ] || die "watch: no agent named '$1' is registered"; names="$names $1"; shift;;
     esac
   done
-  [ -n "$names" ] || die 'usage: agent-chat watch <name...> [--interval 60] [--idle-alert MIN] [--respawn] [--report-to <name>]'
+  [ -n "$names" ] || die 'usage: agent-chat watch <name...> [--interval 60] [--idle-alert MIN] [--busy-alert MIN] [--respawn] [--report-to <name>]'
   if [ -z "$report" ]; then report=$(resolve_name 2>/dev/null) || report=""; fi
   mkdir -p "$WATCH_DIR"
-  echo "[$(date '+%T')] watching:$names (every ${interval}s$([ "$respawn" = 1 ] && echo ', auto-respawn on dead/filter')$([ "$idle_min" -gt 0 ] && echo ", idle alert ${idle_min}m"))"
+  echo "[$(date '+%T')] watching:$names (every ${interval}s$([ "$respawn" = 1 ] && echo ', auto-respawn on dead/filter')$([ "$idle_min" -gt 0 ] && echo ", idle alert ${idle_min}m")$([ "$busy_min" -gt 0 ] && echo ", busy alert ${busy_min}m"))"
 
-  local n st state why sid scr cls kind line sig prev pend events="" hstate hepoch=0 out tb ta rout rrc blind=0
+  local n st state why sid scr cls kind line sig prev pend events="" hstate hepoch=0 since bgsh=0 out tb ta rout rrc blind=0
   while :; do
     date +%s > "$WATCH_DIR/heartbeat"
     # no trustworthy view of the terminals: judge nothing this poll (a failed
@@ -2483,12 +2541,26 @@ Re-arm (as a background shell again): agent-chat watch $argv"
       st=$(agent_state "$n"); state="${st%%$'\t'*}"; why="${st#*$'\t'}"
       sid=$(reg_get "$n" session_id)
       kind=""; line=""
+      # spell clocks: when this busy spell / this idle-with-background-shell
+      # spell was first seen (cleared the moment the state changes)
+      [ "$state" = busy ] || rm -f "${WATCH_DIR:?}/${n:?}.busy-since"
+      bgsh=0
+      if [ "$state" = idle ] && [ "${why#bg shell}" != "$why" ]; then
+        bgsh=1; [ -s "$WATCH_DIR/$n.bgshell-since" ] || date +%s > "$WATCH_DIR/$n.bgshell-since"
+      else
+        rm -f "${WATCH_DIR:?}/${n:?}.bgshell-since"
+      fi
       case "$state" in
         dead)    kind=dead;;
         offline) kind=offline;;
         stopped) kind=stopped;;
         unlocated) kind=unlocated; line="$why";;
-        busy) ;;
+        busy)
+          if [ "$busy_min" -gt 0 ]; then
+            [ -s "$WATCH_DIR/$n.busy-since" ] || date +%s > "$WATCH_DIR/$n.busy-since"
+            since=$(cat "$WATCH_DIR/$n.busy-since")
+            [ $(( $(date +%s) - since )) -ge $(( busy_min * 60 )) ] && { kind=busy; line="$since"; }
+          fi;;
         *)
           tb=""; ta=""
           read -r tb ta <<< "$(resolve_term "$n" 2>/dev/null)"
@@ -2497,10 +2569,16 @@ Re-arm (as a background shell again): agent-chat watch $argv"
             cls=$(watch_classify "$scr")
             if [ -n "$cls" ]; then kind="${cls%%$'\t'*}"; line="${cls#*$'\t'}"; fi
           fi
-          if [ -z "$kind" ] && [ "$idle_min" -gt 0 ] && [ "$state" = idle ] && [ -f "$STATUS/$n" ]; then
-            read -r hstate hepoch < "$STATUS/$n"
-            if [ "$hstate" = idle ] && [ $(( $(date +%s) - hepoch )) -ge $(( idle_min * 60 )) ]; then
-              kind=idle; line="$hepoch"
+          if [ -z "$kind" ] && [ "$idle_min" -gt 0 ] && [ "$state" = idle ]; then
+            # idle since: the hook's Stop stamp; for an idle prompt with a
+            # background shell (no stamp, or a stale busy one) when first seen so
+            hstate=""; hepoch=0
+            [ -f "$STATUS/$n" ] && read -r hstate hepoch < "$STATUS/$n"
+            since=""
+            if [ "$hstate" = idle ]; then since="$hepoch"
+            elif [ "$bgsh" = 1 ]; then since=$(cat "$WATCH_DIR/$n.bgshell-since"); fi
+            if [ -n "$since" ] && [ $(( $(date +%s) - since )) -ge $(( idle_min * 60 )) ]; then
+              kind=idle; line="$since"
             fi
           fi;;
       esac
@@ -2527,7 +2605,8 @@ Re-arm (as a background shell again): agent-chat watch $argv"
         error)   out="ERROR — $(printf '%s' "$line" | sed 's/^[[:space:]]*//' | cut -c1-160)";;
         limit)   out="USAGE LIMIT — a respawn won't help until it resets";;
         paste)   out="STUCK INPUT — a pasted prompt sits unsent in its input box";;
-        idle)    out="IDLE for $(( ($(date +%s) - hepoch) / 60 ))m — it may have stopped without reporting";;
+        idle)    out="IDLE for $(( ($(date +%s) - line) / 60 ))m$([ "$bgsh" = 1 ] && echo ' (background shell running; Claude reports it busy)') — it may have stopped without reporting";;
+        busy)    out="BUSY for $(( ($(date +%s) - line) / 60 ))m without a break — may be stuck or looping (look: agent-chat screen $n)";;
       esac
       if [ "$respawn" = 1 ] && { [ "$kind" = dead ] || [ "$kind" = filter ]; }; then
         rout=$( (cmd_respawn "$n" --no-wait ${report:+--report-to "$report"}) 2>&1 ); rrc=$?

@@ -24,6 +24,8 @@ agent-chat peek <room> [N]       # read any room without joining (no cursor chan
 agent-chat log [N] [--room <r>]  # room history (default: your project room)
 agent-chat who                   # registered agents, their home rooms and memberships
 agent-chat status [<name>]       # live state: busy | idle | waiting | dead | stopped | offline | unlocated
+                                 # ("idle (bg shell ...)": Claude says busy but sits at its prompt
+                                 # while a background shell runs — treated as idle everywhere)
 agent-chat nudge <name> [text]   # wake it: Claude inbox socket, else type a line + Enter (waits while someone types there; --force)
 agent-chat type <name> "text"    # type into that agent's input box WITHOUT submitting
 agent-chat screen <name> [N]     # live snapshot of that agent's visible terminal
@@ -44,10 +46,11 @@ agent-chat respawn <name> [--prompt "task"] [--dry-run] [--no-wait] [--report-to
                                  # agent: claude stop + a fresh background session) that re-registers
                                  # as <name>. Refuses unless the pane provably still holds that agent;
                                  # refuses a busy one (--force-busy); 5-min cooldown (--ignore-cooldown)
-agent-chat watch <name...> [--interval 60] [--idle-alert MIN] [--respawn] [--report-to <name>]
+agent-chat watch <name...> [--interval 60] [--idle-alert MIN] [--busy-alert MIN] [--respawn] [--report-to <name>]
                                  # blocking fleet watchdog for an orchestrator's BACKGROUND shell:
                                  # exits with a report when an agent is dead / filter-tripped /
-                                 # errored / usage-limited / has stuck input / idles too long
+                                 # errored / usage-limited / has stuck input / idles too long /
+                                 # (--busy-alert) stays busy too long — re-arm it in the same turn
 agent-chat unregister [<name>]   # leave the chat
 agent-chat web [port]            # local live web viewer (default :8787) — channels, messages, people
 agent-chat setup-codex [--title-id]  # one-time: wire hooks into OpenAI Codex CLI (cross-CLI chat);
@@ -104,10 +107,12 @@ Two robustness measures, both learned the hard way: (1) a **safety assert** — 
 
 Always try `--dry-run` first: it prints the exact pane, pids and launch line. Log: `~/.claude/agent-chat/respawn.log`.
 
-**`watch <name...>`** is a watchdog designed to run as the orchestrator's **background shell** (OpenCode `shell` with `background: true`; Claude Code `run_in_background`). It polls every `--interval` seconds and **exits** as soon as something needs attention, printing a report — the harness then wakes the orchestrator with that output automatically (no polling, no chat message needed). Handle it, then re-arm (the report ends with the exact command). Each condition is reported once per session, so re-arming doesn't re-fire. Detected:
+**`watch <name...>`** is a watchdog designed to run as the orchestrator's **background shell** (OpenCode `shell` with `background: true`; Claude Code `run_in_background`). It polls every `--interval` seconds and **exits** as soon as something needs attention, printing a report — the harness then wakes the orchestrator with that output automatically (no polling, no chat message needed). Handle it, then re-arm (the report ends with the exact command). Each condition is reported once per session, so re-arming doesn't re-fire.
+
+**Re-arm discipline:** a watch exits once per condition and then watches nothing. Re-arm it **in the same turn** you handle the report — a turn that ends without re-arming leaves the fleet unwatched. `idle` is reported once per idle spell (the spell's start is part of the signature): a re-armed watch stays quiet about an agent still idle in that spell, and fires again only after it has worked and gone idle again. `busy` (`--busy-alert`) is likewise once per busy spell. Detected:
 
 - `dead` (pane at a shell prompt: the CLI exited/crashed) and `filter` (the unindented `ⓘ This content can't be shown` block with its `Apply for Daybreak` line on an idle screen — an agent merely printing the phrase in tool output doesn't match) — with `--respawn` these are replaced in place automatically, then reported;
-- `error` (stream disconnected / retry limit / bad status), `limit` (usage limit), `paste` (a `[Pasted Content …]` stuck in the input box), `idle` (idle longer than `--idle-alert` minutes — the agent may have stopped without reporting), `offline` (pane closed), `unlocated` (cannot prove which pane to observe) — reported only; the orchestrator decides.
+- `error` (stream disconnected / retry limit / bad status), `limit` (usage limit), `paste` (a `[Pasted Content …]` stuck in the input box), `idle` (idle longer than `--idle-alert` minutes — the agent may have stopped without reporting; this includes the false-busy `idle (bg shell)` case below, timed from its last `Stop` hook stamp or else from when watch first saw it, and the line says `background shell running`), `busy` (busy without a break for longer than `--busy-alert` minutes; report-only), `offline` (pane closed), `unlocated` (cannot prove which pane to observe) — reported only; the orchestrator decides.
 
 `agent-chat status` alone is not a trip detector: a content-gated Codex is idle with a plain title, so it reads `unknown`/`idle`, never `dead`. A watchdog that treats `unknown` as a failure floods false alarms. `unlocated` is different: it reports lost observation and never triggers auto-respawn. Restart existing background watches after updating this script; they retain their loaded implementation until restarted.
 
@@ -128,6 +133,7 @@ That leaves a fully idle peer, which has to be **woken**:
 `agent-chat status [<name>]` resolves an agent's real state, and `send`/nudge uses it automatically: a DM (or `--nudge`) **nudges only an idle agent**, tells you a busy one will get it at its next turn boundary, refuses to type at a peer blocked on a permission dialog, and warns if the recipient's window is dead/offline (message still stored for restart). Resolution is layered so it survives crashes and interrupts:
 
 0. **Claude Code agents:** the live session record states `busy` (or `shell`, a tool command running), `idle` or `waiting` itself, for pane and background sessions alike. This needs no terminal and no AppleScript. A background agent without one is `stopped`.
+   **False busy:** the record keeps saying `shell` (sometimes `busy`) for as long as a *background* shell (`run_in_background`, e.g. a `watch`) runs — even after the turn ended and the agent sits idle at its prompt. Taken at face value, `send` would defer the message to a turn boundary that never comes and `watch` would never raise an idle alert. So for a busy/shell record of a Claude agent **in a pane**, agent-chat looks at its screen: a `❯` prompt line, no working marker (`esc to interrupt`, the same test nudge's guard uses) on the spinner line or below the prompt, and a footer (below the last `❯`) showing `· N shell(s)` → it reports `idle  (bg shell — …)`. The state word stays `idle`, so `send --to` / `--nudge` wake it like any idle agent (inbox socket, else the guarded typed nudge) and `watch --idle-alert` times it. Anything unclear stays `busy`. A background session (`claude --bg`) has no screen and is never reclassified.
 1. **Terminal reachable?** iTerm session / tmux pane gone → `offline`.
 2. **The agent's own CLI alive on its tty?** (`claude`, `codex` or `opencode`, per its registration.) No → `dead` (crashed/`/exit`ed).
 3. **OpenCode only:** its server reports the session's state outright (running → `busy`, pending permission/question → `waiting`, else `idle`).
@@ -148,6 +154,7 @@ Terminal-typing gotcha (why this works): TUIs like Claude Code run with **bracke
 
 - **Chat is a bulletin board, not a pager.** Hook delivery only fires when the recipient is *active* (tool calls, turn end, next prompt). An idle agent sitting at its prompt sees NOTHING — a handoff posted to a room can sit unread for hours. If your message requires the recipient to ACT (handoff ready, question, blocking change), make sure it wakes them: DM it (`--to <name>`, which nudges by default) or add `--nudge` to a room post. Writing "@name" inside the message text does nothing — it's just text.
 - Register only when the user asks; pick a short role name.
+- **Subagents share your identity.** A subagent (Task/Agent tool) of a registered Claude session runs with the same `$CLAUDE_CODE_SESSION_ID`, so to agent-chat it *is* you: its `agent-chat read`, its tool calls (PostToolUse hook delivery) and anything it sends consume or speak for your chat mail. Mail it eats is gone from your view. Keep chat traffic in the main session; tell subagents not to run `agent-chat read`/`send` against real agents.
 - Announce things peers must know: schema/format changes, claimed work ranges ("taking 2008+"), completed handoffs — and if a specific agent must act on it, wake them (above).
 - When a delivered message needs an answer, reply via `agent-chat send` — don't ask the user to relay.
 - Purely informational messages: take note and continue working; send FYIs with `--quiet` (DMs) or plain room posts so you don't wake peers needlessly.
